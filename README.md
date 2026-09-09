@@ -89,6 +89,52 @@ Wayfinder is **not a sandbox**. Run it under a dedicated, least-privileged accou
 
 Loopback is the default, with SDK host-header validation for loopback bindings. Any supplied browser Origin header is rejected. **Remote use requires encrypted transport**, normally HTTPS terminated by a standard reverse proxy. Bearer authentication does not make plaintext networking safe. Limit access to the backend listener, ensure the proxy preserves authorization, and do not expose a plaintext backend directly. No custom TLS stack or external service is required.
 
+## HTTPS reverse proxy
+
+Run the proxy on the same machine and network namespace as Wayfinder, keeping `WAYFINDER_HOST=127.0.0.1` and `WAYFINDER_PORT=3000`. Expose only the proxy publicly, not port 3000. Replace `wayfinder.example.com` with your domain and point its DNS at the proxy. Clients must connect to `https://wayfinder.example.com/mcp` and send their bearer header over HTTPS.
+
+The proxy **must rewrite the upstream `Host` header** to `127.0.0.1:3000`. The SDK's localhost guard accepts only `localhost`, `127.0.0.1`, or `[::1]` (with an optional port); forwarding `Host: wayfinder.example.com` results in a rejection even with valid authentication. Rewriting Host lets the public hostname terminate at the proxy while preserving the backend's DNS-rebinding protection. Do not disable Host validation.
+
+### Caddy
+
+Use this Caddyfile. Caddy obtains and renews the domain's HTTPS certificate automatically; allow its certificate validation traffic (normally ports 80 and 443).
+
+```caddyfile
+wayfinder.example.com {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up Host 127.0.0.1:3000
+    }
+}
+```
+
+Caddy forwards the client's `Authorization` header by default. See [Caddy reverse proxy headers](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers) and [automatic HTTPS](https://caddyserver.com/docs/automatic-https).
+
+### nginx
+
+Place this server block in nginx's `http` context. Provision a trusted certificate for your domain, replace the certificate paths below, and arrange renewal and nginx reloads.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name wayfinder.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/wayfinder.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/wayfinder.example.com/privkey.pem;
+
+    location = /mcp {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host 127.0.0.1:3000;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 360s;
+    }
+}
+```
+
+The Authorization directive preserves the client's bearer header; do not substitute a shared token at the proxy. The read timeout allows the default maximum command duration plus overhead; increase it if you raise `WAYFINDER_MAX_TIMEOUT_MS`. See [nginx proxy directives](https://nginx.org/en/docs/http/ngx_http_proxy_module.html). Both examples terminate TLS at the proxy and use plaintext only on loopback.
+
 ## Implementation
 
 The official MCP SDK provides Streamable HTTP handling and tool schemas. `src/server.ts` connects the handler to Node HTTP; `src/auth.ts` owns bearer verification; `src/exec.ts` owns command execution; `src/config.ts` validates configuration; `src/index.ts` starts and stops the process. There is no application session storage or persistent shell state.

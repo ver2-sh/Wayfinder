@@ -4,10 +4,10 @@ import { createWayfinder } from './server.ts';
 try {
   const config = loadConfig();
   const app = createWayfinder(config);
-  app.http.on('error', () => {
-    console.error('Wayfinder could not listen. Check the configured host and port.');
+  app.http.on('error', (error: NodeJS.ErrnoException) => {
+    console.error(`Wayfinder could not listen (${error.code ?? 'UNKNOWN'}). Check the configured host and port.`);
     process.exitCode = 1;
-    void app.close();
+    void app.close().catch(() => { console.error('Wayfinder shutdown failed.'); process.exitCode = 1; });
   });
   app.http.listen(config.port, config.host, () => {
     const host = config.host.includes(':') ? `[${config.host}]` : config.host;
