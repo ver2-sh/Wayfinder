@@ -619,7 +619,8 @@ impl Network {
         let mut tasks = JoinSet::new();
         let mut interval = tokio::time::interval(Duration::from_secs(3));
         let background = self.clone();
-        let sync_task = tokio::spawn(async move {
+        let mut background_tasks = JoinSet::new();
+        background_tasks.spawn(async move {
             loop {
                 tokio::select! {_=background.shutdown.cancelled()=>break,_=interval.tick()=>{let _=background.synchronize().await;}}
             }
@@ -627,8 +628,8 @@ impl Network {
         loop {
             tokio::select! {_=self.shutdown.cancelled()=>break,Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},accepted=listener.accept()=>{let (stream,_)=accepted?;let Ok(permit)=slots.clone().try_acquire_owned()else{drop(stream);continue;};let network=self.clone();tasks.spawn(async move{let _permit=permit;let setup=tokio::time::timeout(Duration::from_secs(5),async{let mut ch=Channel::accept(stream,&network.identity).await?;let req=ch.receive::<Request>().await?;Ok::<_,anyhow::Error>((ch,req))}).await;let Ok(Ok((mut ch,req)))=setup else{return;};let response=match network.handle(&mut ch,req).await{Ok(r)=>r,Err(e)=>Response::Error(e.to_string())};let _=tokio::time::timeout(Duration::from_secs(5),ch.send(&response)).await;});}}
         }
-        sync_task.abort();
-        let _ = sync_task.await;
+        background_tasks.abort_all();
+        while background_tasks.join_next().await.is_some() {}
         // Cancellation reaches executions first; bound shutdown even for incomplete admin traffic.
         let _ = tokio::time::timeout(Duration::from_secs(3), async {
             while tasks.join_next().await.is_some() {}

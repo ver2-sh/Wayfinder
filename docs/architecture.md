@@ -2,7 +2,7 @@
 
 ## Composition
 
-The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds all three listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The Ratatui process is disposable and independent.
+The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds all three listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
 
 | Crate | Responsibility |
 | --- | --- |

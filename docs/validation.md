@@ -37,7 +37,20 @@ Passed:
 15. Restart retained B; it reconciles C's removal made while B was offline.
 16. Attach the real Ratatui client through a PTY at 80×24; quit it and confirm A's daemon/control endpoint remains alive.
 
-All temporary daemon processes were terminated and reaped in cleanup, all allocated listener ports were checked closed, and the temporary runtime directories were removed. The live checkout's original service and tunnel were not stopped or restarted. The original commit `1f4d37c` remains the branch HEAD; the Rust implementation preserves its routing behavior.
+All temporary daemon processes were terminated and reaped in cleanup, all allocated listener ports were checked closed, and the temporary runtime directories were removed. The live checkout's original service and tunnel were not stopped or restarted. The Rust implementation preserves the routing behavior of the original commit `1f4d37c`.
+
+## TUI-managed lifecycle (2026-09-10)
+
+Passed formatting, workspace check, Clippy with warnings denied, release build, and diff whitespace checks. Temporary smoke drivers outside the repository used isolated private directories and a real 120×24 PTY; no repository test code was added.
+
+- Q, Ctrl-C keypress, and SIGINT exit a TUI-owned daemon with its listeners closed, descriptor removed, and directory lock released.
+- The same exits leave an external daemon healthy and its descriptor unchanged. `status` and `control` remain usable.
+- Standalone daemons shut down cleanly on SIGINT and SIGTERM.
+- Malformed configuration/identity and occupied MCP/peer ports return the original startup error without opening the TUI or leaving listeners/locks behind.
+- Stale and malformed control descriptors allow a fresh owned daemon to start. Terminal initialization failure also cleans up the owned daemon.
+- A held directory lock with no control endpoint fails within the bounded startup period. Delayed publication of an external daemon's descriptor is retried successfully without taking ownership.
+
+All smoke processes were reaped and temporary runtime directories removed. These lifecycle checks were run on Linux; other platforms remain unvalidated.
 
 ## Limits of this validation
 
