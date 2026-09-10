@@ -42,11 +42,14 @@ export function createWayfinder(config: Config) {
   const loopback = ['localhost', '127.0.0.1', '::1'].includes(config.host);
   const nodeHandler = toNodeHandler(handler);
   const http = createServer((req, res) => {
+    // Reject unknown paths before auth so OAuth/PRMD probes (and any other
+    // non-MCP request) get a clean 404 instead of a 401 with a text body that
+    // breaks JSON-expecting discovery clients. Only /mcp is auth-protected.
+    if (req.url !== '/mcp') { res.writeHead(404).end('Not found'); return; }
     if (!authenticate(req, res)) return;
     if (loopback && !validateHost(req, res)) return;
     // This endpoint is for direct MCP clients, not browser pages.
     if (req.headers.origin) { res.writeHead(403).end('Browser origins are not supported'); return; }
-    if (req.url !== '/mcp') { res.writeHead(404).end('Not found'); return; }
     if (shutdown.signal.aborted) { res.writeHead(503).end('Shutting down'); return; }
     void nodeHandler(req, res).catch(() => {
       if (!res.headersSent) res.writeHead(500).end('MCP request failed');
