@@ -1,6 +1,7 @@
-node_modules/
-dist/
+/target/
 .env
 .env.*
-!.env.example
 *.log
+# Ignored artifacts from the old live checkout are deliberately left untouched.
+/node_modules/
+/dist/
