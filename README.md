@@ -1,103 +1,124 @@
 # Project Wayfinder
 
-Wayfinder is a self-hosted, authenticated MCP bridge that executes shell commands on the machine running it, as the operating-system user running it.
+Wayfinder is a self-hosted Rust daemon that exposes two MCP tools: `nodes` and `exec`. Each installation executes commands as its own OS account and can route requests directly to linked Wayfinder nodes. Any member can be the MCP entry point. There is no permanent leader, web dashboard, cloud account, hosted relay, or telemetry.
 
 ```text
-MCP client → authenticated Streamable HTTP → Wayfinder exec → local shell → host OS
+AI client → authenticated MCP → selected Wayfinder node → fresh local shell
+                                     │
+                             authenticated Noise peers
+                                     │
+                         other Wayfinder nodes and shells
+
+wayfinder tui → private loopback control API → persistent daemon
 ```
 
-It is deliberately not a server-management framework. There are no file, Git, service, SSH, fleet, or workflow APIs, no persistent terminal sessions, and no web UI. Use ordinary shell commands for host operations. There is no mandatory hosted relay, vendor account, or telemetry service.
+This grants arbitrary shell access as the daemon's account. It is not a sandbox. Use a dedicated, least-privileged OS account with only the files and network access you intend to grant. A command can read anything that account can read, including Wayfinder's own private files; credential separation does not protect against an authorized shell client or a compromised member.
 
-## Run locally
+## Build and run
 
-Use Node.js 24 LTS (or Node.js 26) and npm.
+Use a current stable Rust toolchain and Cargo. Linux is the validated platform; Unix process groups provide ordinary descendant cleanup. Windows uses `cmd.exe` and best-effort `taskkill /T /F`; Windows and macOS have not been smoke-validated.
 
 ```sh
-npm ci
+cargo build --release
+cargo fmt --check
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+./target/release/wayfinder init --name norted
+./target/release/wayfinder daemon
 ```
 
-Copy `.env.example` to `.env`. Replace the token placeholder with a cryptographically random value; this command generates one:
+Initialization prints the application-data directory. On Linux this defaults to `$XDG_DATA_HOME/wayfinder` or `~/.local/share/wayfinder`. Other platforms use their OS application-data location. All commands accept `--data-dir PATH` for an explicit private directory. No repository `.env` is read or required.
+
+In another terminal, under the same account:
 
 ```sh
-node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+./target/release/wayfinder tui
 ```
 
-Keep the token private. `.env` is ignored by Git. Shell-provided environment variables take precedence over `.env`.
+The TUI attaches to an existing daemon. `Q`, Ctrl+C, normal exit, and handled errors restore the terminal; closing the TUI leaves the daemon alive. Run `wayfinder daemon` under your OS service supervisor for unattended operation. A daemon holds an exclusive directory lock; two daemons cannot share one identity directory. SIGINT/SIGTERM shut down its listeners and cancel commands.
+
+## Link machines
+
+All members must have directly reachable advertised peer addresses. No NAT traversal, automatic discovery, VPN, or relay is included. Noise encrypts linking and permanent peer traffic; peer endpoints are IP addresses with ports, including bracketed IPv6.
+
+Initialize each machine with its own **unique name**, directory, and identity. For example, on A:
 
 ```sh
-npm run dev       # run TypeScript; restart on changes
-npm run build     # compile into dist/
-npm start         # run the compiled server
+wayfinder init --name norted \
+  --peer-listen 192.168.1.10:3001 \
+  --peer-advertise 192.168.1.10:3001
+wayfinder daemon
 ```
 
-The default endpoint is `http://127.0.0.1:3000/mcp`. Ctrl+C shuts down the server and terminates active commands. SIGTERM is also handled where the OS supports it.
+On B, use its own address and name:
 
-## Configuration
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `WAYFINDER_TOKEN` | Required | Random bearer token, at least 32 characters; the example placeholder is rejected |
-| `WAYFINDER_HOST` | `127.0.0.1` | Listen address |
-| `WAYFINDER_PORT` | `3000` | Listen port, 1–65535 |
-| `WAYFINDER_TIMEOUT_MS` | `30000` | Default command timeout in milliseconds |
-| `WAYFINDER_MAX_TIMEOUT_MS` | `300000` | Maximum accepted timeout in milliseconds |
-
-Timeouts must be positive integers, with the default no greater than the maximum. The maximum cannot exceed 2,147,483,647 milliseconds. Missing or invalid authentication configuration prevents startup. Changing the token requires restarting the process.
-
-## Connect a client
-
-Configure a client supporting MCP Streamable HTTP with the `/mcp` URL and this header on every request:
-
-```text
-Authorization: Bearer <your-token>
+```sh
+wayfinder init --name storage \
+  --peer-listen 192.168.1.11:3001 \
+  --peer-advertise 192.168.1.11:3001
+wayfinder daemon
 ```
 
-The client discovers and calls the single `exec` tool through the official MCP protocol. Configure its request timeout to exceed the command timeout plus network overhead. This scaffold uses a configured bearer secret, without OAuth discovery or interactive login. Browser-origin requests are rejected; use a client that can make direct HTTP requests and supply authorization headers.
+The MCP listener stays at `127.0.0.1:3000` on both machines. Permit the peer port between the intended machines.
 
-## `exec` contract
+1. Open A's TUI. Press `N`, enter a network name, and press Enter.
+2. Press `A` to generate an invitation. Press `C` to copy it using the terminal's OSC 52 clipboard support. If the terminal does not permit clipboard access, use the private CLI operation below to obtain the single-line invitation.
+3. Transfer the invitation privately to B. In B's TUI, press `J`, paste it, and press Enter. Wayfinder authenticates the introducing node against the invitation's key pin before displaying the discovered network and introducer.
+4. Press `Y` to join. Within a few seconds both TUIs show the same membership. Each node's reachability observations may differ.
+5. Add C through either member using the same workflow. Every member can introduce nodes; the creator has no special role.
 
-| Input | Meaning |
+Invitations contain a 256-bit one-use secret, network ID, introducing node identity/endpoint, and expiry. They expire in ten minutes, are consumed on successful membership admission, and are invalidated when the introducing daemon restarts. Generating a new invitation does not cancel older unexpired invitations. Invitations contain neither MCP credentials nor node private keys. Check clocks if an invitation is rejected as expired.
+
+Use arrow keys and Enter for node details. `R` removes a selected remote node after `Y` confirmation. Remove this machine through another member. Removal revokes **future peer admission on members that know the removal**; it does not undo commands already accepted. Read the [consistency and revocation guarantees](docs/architecture.md#membership-consistency-and-revocation) before using removal across disconnected machines.
+
+## MCP client setup
+
+Explicitly obtain this node's MCP token for your client:
+
+```sh
+wayfinder token
+```
+
+Keep the output private. Configure a Streamable HTTP client with `http://127.0.0.1:3000/mcp` and `Authorization: Bearer <token>` on every request. The server uses the [official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk), locked to the Cargo.lock dependency graph. The SDK handles initialization, tool discovery, protocol negotiation, JSON responses and SSE where required. This deployment uses stateless requests and configured bearer authentication, not OAuth discovery. Unknown paths, including OAuth discovery probes, return clean 404 responses before authentication.
+
+`nodes` returns stable IDs, unique names, the entry-node flag `local`, and `reachable` (last successful membership exchange). It does not disclose endpoints, peer keys, or secrets. Reachability is an observation, not a guarantee that the next request will succeed.
+
+`exec` accepts:
+
+| Field | Meaning |
 | --- | --- |
-| `command` | Required nonempty shell command, passed unchanged |
-| `cwd` | Optional working directory; defaults to the Wayfinder process directory |
-| `timeout` | Optional positive integer milliseconds, bounded by configuration |
-| `env` | Optional string-to-string environment overrides, merged with the server environment |
+| `command` | Required nonempty shell command, at most 64 KiB, no NUL |
+| `target` | Optional stable node ID or unique name; omitted means the entry node |
+| `cwd` | Optional working directory on the selected host |
+| `timeout` | Optional milliseconds, 1–300000; default 30000 |
+| `env` | Optional string map of environment overrides |
 
-Commands use the platform shell (`/bin/sh` on Unix; `ComSpec`/`cmd.exe` on Windows). Shell syntax therefore depends on the host. Standard input is closed; interactive commands and persistent shells are unsupported. Environment and working-directory changes do not persist between calls.
-
-Results appear as MCP `structuredContent` and matching JSON text:
+The result is both MCP `structuredContent` and matching JSON text:
 
 ```json
 {
+  "target": "<selected node's stable ID>",
   "stdout": "hello\n",
   "stderr": "",
   "exitCode": 0,
   "signal": null,
-  "timedOut": false
+  "timedOut": false,
+  "error": null
 }
 ```
 
-`exitCode` is the real shell exit code, or `null` when unavailable (for example, a spawn error or Unix signal termination). `signal` records a termination signal when reported by Node. Spawn errors, cancellation, and output-limit failures add an `error` string. Nonzero or missing exit codes, timeouts, and execution errors set MCP `isError: true`. A command's stdout and stderr remain separate and are decoded as UTF-8.
+The shell is `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Stdin is closed, shells are fresh, and cwd/environment changes do not persist. The default cwd is the daemon's working directory. `WAYFINDER_*` environment variables from the launching process are excluded; explicit request overrides are still honored. Wayfinder does not place stored credentials or keys into its process environment.
 
-Each output stream is limited to 1 MiB to bound buffered output. Exceeding a limit terminates the command, returns the captured prefix, and explicitly reports truncation as an error. Timeouts kill the process group on Unix and use Windows `taskkill /T /F` to kill the command tree. These mechanisms handle ordinary shell descendants, but cannot contain deliberately detached processes or commands that escape their original process tree. Do not use this version for launching background services. Forced shutdown of Wayfinder itself cannot guarantee child cleanup.
+Each output stream is buffered up to 1 MiB and decoded as UTF-8 with replacement for invalid bytes. Output overflow kills the process group and reports truncation. Timeouts, cancellation, spawn failures, nonzero exits and Unix signals remain explicit. MCP `isError` reflects unsuccessful results. Disconnecting a stateless HTTP request cancels its execution; a routed request closes its peer connection, which cancels the target command. Termination handles ordinary descendants, not deliberately detached processes. Forced daemon termination cannot guarantee cleanup.
 
-## Security model
+There are at most 16 local executions and 64 inbound peer connections per node. Capacity exhaustion fails explicitly. Commands and output are not logged. There is no automatic retry or fallback. If a connection fails after dispatch, the execution outcome may be unknown: inspect the target before retrying an operation with side effects.
 
-Wayfinder authenticates clients; the OS account authorizes machine capabilities. A valid token grants arbitrary shell execution with that account's access, including access to files, network, and inherited environment. Authentication uses constant-time comparison of fixed-length token hashes and runs before the MCP handler on every HTTP request. Credentials and commands are not logged by Wayfinder.
+## Expose one MCP entry point
 
-Wayfinder is **not a sandbox**. Run it under a dedicated, least-privileged account with only the access you intend to grant. There is no application command allowlist, filesystem policy, privilege escalation helper, or per-user permission layer. Concurrent authenticated requests can execute concurrently; this is not a resource-isolation service.
+Keep the backend on loopback and expose **only the chosen node's MCP endpoint** through HTTPS or an encrypted tunnel. The backend rejects browser Origin headers and validates Host to prevent DNS rebinding. The proxy must preserve Authorization and rewrite Host to the loopback backend. Do not inject a shared bearer at the proxy.
 
-Loopback is the default, with SDK host-header validation for loopback bindings. Any supplied browser Origin header is rejected. **Remote use requires encrypted transport**, normally HTTPS terminated by a standard reverse proxy. Bearer authentication does not make plaintext networking safe. Limit access to the backend listener, ensure the proxy preserves authorization, and do not expose a plaintext backend directly. No custom TLS stack or external service is required.
-
-## HTTPS reverse proxy
-
-Run the proxy on the same machine and network namespace as Wayfinder, keeping `WAYFINDER_HOST=127.0.0.1` and `WAYFINDER_PORT=3000`. Expose only the proxy publicly, not port 3000. Replace `wayfinder.example.com` with your domain and point its DNS at the proxy. Clients must connect to `https://wayfinder.example.com/mcp` and send their bearer header over HTTPS.
-
-The proxy **must rewrite the upstream `Host` header** to `127.0.0.1:3000`. The SDK's localhost guard accepts only `localhost`, `127.0.0.1`, or `[::1]` (with an optional port); forwarding `Host: wayfinder.example.com` results in a rejection even with valid authentication. Rewriting Host lets the public hostname terminate at the proxy while preserving the backend's DNS-rebinding protection. Do not disable Host validation.
-
-### Caddy
-
-Use this Caddyfile. Caddy obtains and renews the domain's HTTPS certificate automatically; allow its certificate validation traffic (normally ports 80 and 443).
+For example, with Caddy on that machine:
 
 ```caddyfile
 wayfinder.example.com {
@@ -107,36 +128,48 @@ wayfinder.example.com {
 }
 ```
 
-Caddy forwards the client's `Authorization` header by default. See [Caddy reverse proxy headers](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers) and [automatic HTTPS](https://caddyserver.com/docs/automatic-https).
+Use `https://wayfinder.example.com/mcp` in the client. Keep upstream response timeouts above 310 seconds and disable response buffering where necessary. A tunnel must provide encrypted remote transport and the same Host rewrite. Never expose the private control listener. Other members' MCP ports do not need exposure; the selected gateway routes over authenticated Noise connections.
 
-### nginx
+## Configuration and private control
 
-Place this server block in nginx's `http` context. Provision a trusted certificate for your domain, replace the certificate paths below, and arrange renewal and nginx reloads.
+`init` writes private `config.json`, `identity.json`, and `state.json`. The configuration has a version, node name, `mcp_listen`, `mcp_token`, `peer_listen`, and `peer_advertise`. Defaults are `127.0.0.1:3000` for MCP and `127.0.0.1:3001` for peers. Binding public or LAN interfaces requires explicit configuration. Peer encryption does not encrypt a directly exposed HTTP MCP listener.
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name wayfinder.example.com;
+Edit configuration only while that daemon is stopped. Restart to change MCP configuration or rotate its bearer. Linked node names, peer keys and advertised endpoints are immutable in this first schema: remove the old node and initialize a fresh identity/directory for a changed descriptor. Do not copy an identity directory to another machine. Keep private backups; missing or malformed identity/state fails startup rather than silently replacing the node.
 
-    ssl_certificate /etc/letsencrypt/live/wayfinder.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/wayfinder.example.com/privkey.pem;
+The daemon publishes `control.json` with an ephemeral loopback address and a separate random credential. The TUI reads this descriptor; it receives no execution/network managers. The descriptor is atomically replaced on startup and removed at graceful shutdown. A stale descriptor after a crash does not restart the daemon. MCP credentials cannot authorize control, and control credentials cannot authorize MCP. On Unix directories are mode 0700 and private files 0600; insecure file modes are rejected. Windows users must restrict the directory's ACL to the daemon account; Unix permission enforcement has no Windows equivalent here.
 
-    location = /mcp {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host 127.0.0.1:3000;
-        proxy_set_header Authorization $http_authorization;
-        proxy_set_header Connection "";
-        proxy_buffering off;
-        proxy_read_timeout 360s;
-    }
-}
+For terminal automation of **Wayfinder administration**, `status` and `control` use the same private API as the TUI. Control reads one operation from stdin; it has no shell-execution operation:
+
+```sh
+wayfinder status
+printf '%s\n' '{"op":"create","name":"Home"}' | wayfinder control
+printf '%s\n' '{"op":"invite","ttl":600}' | wayfinder control
 ```
 
-The Authorization directive preserves the client's bearer header; do not substitute a shared token at the proxy. The read timeout allows the default maximum command duration plus overhead; increase it if you raise `WAYFINDER_MAX_TIMEOUT_MS`. See [nginx proxy directives](https://nginx.org/en/docs/http/ngx_http_proxy_module.html). Both examples terminate TLS at the proxy and use plaintext only on loopback.
+Other operations are `details` (`id`), `preview` / `join` (`invitation`), and `remove` (`id`, `confirm: true`). Invitation-bearing JSON belongs on stdin, not in process arguments or shell history. The TUI provides the normal interactive workflow.
 
-## Implementation
+## Dedicated service account
 
-The official MCP SDK provides Streamable HTTP handling and tool schemas. `src/server.ts` connects the handler to Node HTTP; `src/auth.ts` owns bearer verification; `src/exec.ts` owns command execution; `src/config.ts` validates configuration; `src/index.ts` starts and stops the process. There is no application session storage or persistent shell state.
+Install the built binary somewhere the service account cannot modify, such as `/usr/local/bin/wayfinder`. Initialize its private application-data directory as that account. A minimal Linux systemd unit can use:
 
-Licensed under Apache-2.0; see [LICENSE](LICENSE).
+```ini
+[Unit]
+Description=Wayfinder node
+After=network.target
+
+[Service]
+User=wayfinder
+Group=wayfinder
+WorkingDirectory=/var/lib/wayfinder
+ExecStart=/usr/local/bin/wayfinder --data-dir /var/lib/wayfinder daemon
+Restart=on-failure
+UMask=0077
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Provision `/var/lib/wayfinder` for that account and initialize it before starting the unit. Attach the TUI as the same account with the same `--data-dir`. Grant only intended OS permissions; do not run as root merely for convenience. The local supervisor controls Wayfinder's lifecycle; Wayfinder has no service-management API.
+
+See [architecture and limitations](docs/architecture.md) and [validation record](docs/validation.md). Apache-2.0; see [LICENSE](LICENSE).
