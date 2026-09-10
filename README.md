@@ -9,7 +9,7 @@ AI client → authenticated MCP → selected Wayfinder node → fresh local shel
                                      │
                          other Wayfinder nodes and shells
 
-wayfinder tui → private loopback control API → persistent daemon
+wayfinder tui → private loopback control API → daemon
 ```
 
 This grants arbitrary shell access as the daemon's account. It is not a sandbox. Use a dedicated, least-privileged OS account with only the files and network access you intend to grant. A command can read anything that account can read, including Wayfinder's own private files; credential separation does not protect against an authorized shell client or a compromised member.
@@ -30,13 +30,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Initialization prints the application-data directory. On Linux this defaults to `$XDG_DATA_HOME/wayfinder` or `~/.local/share/wayfinder`. Other platforms use their OS application-data location. All commands accept `--data-dir PATH` for an explicit private directory. No repository `.env` is read or required.
 
-In another terminal, under the same account:
+For interactive use, run under the same account:
 
 ```sh
 ./target/release/wayfinder tui
 ```
 
-The TUI attaches to an existing daemon. `Q`, Ctrl+C, normal exit, and handled errors restore the terminal; closing the TUI leaves the daemon alive. Run `wayfinder daemon` under your OS service supervisor for unattended operation. A daemon holds an exclusive directory lock; two daemons cannot share one identity directory. SIGINT/SIGTERM shut down its listeners and cancel commands.
+The TUI attaches to a live daemon for the selected data directory, or automatically starts a temporary daemon if none is running. `Q`, Ctrl+C, normal exit, and handled errors restore the terminal and stop only a daemon started by this TUI. An independently running daemon remains running. `wayfinder daemon` explicitly runs the persistent foreground daemon; use it under your OS service supervisor for unattended operation. A daemon holds an exclusive directory lock; two daemons cannot share one identity directory. SIGINT/SIGTERM shut down its listeners and cancel commands.
 
 ## Link machines
 
@@ -136,7 +136,7 @@ Use `https://wayfinder.example.com/mcp` in the client. Keep upstream response ti
 
 Edit configuration only while that daemon is stopped. Restart to change MCP configuration or rotate its bearer. Linked node names, peer keys and advertised endpoints are immutable in this first schema: remove the old node and initialize a fresh identity/directory for a changed descriptor. Do not copy an identity directory to another machine. Keep private backups; missing or malformed identity/state fails startup rather than silently replacing the node.
 
-The daemon publishes `control.json` with an ephemeral loopback address and a separate random credential. The TUI reads this descriptor; it receives no execution/network managers. The descriptor is atomically replaced on startup and removed at graceful shutdown. A stale descriptor after a crash does not restart the daemon. MCP credentials cannot authorize control, and control credentials cannot authorize MCP. On Unix directories are mode 0700 and private files 0600; insecure file modes are rejected. Windows users must restrict the directory's ACL to the daemon account; Unix permission enforcement has no Windows equivalent here.
+The daemon publishes `control.json` with an ephemeral loopback address and a separate random credential. The TUI reads this descriptor; it receives no execution/network managers. The descriptor is atomically replaced on startup and removed at graceful shutdown. The TUI verifies control API liveness; a stale descriptor after a crash does not count as a running daemon. MCP credentials cannot authorize control, and control credentials cannot authorize MCP. On Unix directories are mode 0700 and private files 0600; insecure file modes are rejected. Windows users must restrict the directory's ACL to the daemon account; Unix permission enforcement has no Windows equivalent here.
 
 For terminal automation of **Wayfinder administration**, `status` and `control` use the same private API as the TUI. Control reads one operation from stdin; it has no shell-execution operation:
 

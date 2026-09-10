@@ -1,4 +1,4 @@
-//! A terminal client of the private control API. The daemon outlives this process.
+//! A terminal client of the private control API. Lifecycle is managed by the caller.
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -29,17 +29,20 @@ fn safe(s: &str) -> String {
         .filter(|c| !c.is_control() || *c == '\n')
         .collect()
 }
-pub async fn run(client: Client) -> Result<()> {
+pub async fn run(client: Client, stops_daemon_on_exit: bool) -> Result<()> {
     let mut status = client.status().await?;
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init()?;
     let _restore = Restore;
     crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste)?;
     let mut invitation = String::new();
     let mut selected = ListState::default().with_selected(Some(0));
     let mut mode = Mode::Browse;
     let mut input = String::new();
-    let mut message =
-        String::from("Select a node for details. Q closes this TUI; the daemon keeps running.");
+    let mut message = String::from(if stops_daemon_on_exit {
+        "Select a node for details. Q closes this TUI and stops its daemon."
+    } else {
+        "Select a node for details. Q closes this TUI; the daemon keeps running."
+    });
     let mut refreshed = Instant::now();
     'ui: loop {
         terminal.draw(|f|{

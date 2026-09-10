@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use std::{
+    fs::File,
     io::{self, Read},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::Duration,
 };
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -34,7 +36,7 @@ enum Command {
     },
     /// Run the persistent daemon in the foreground (suitable for an OS service).
     Daemon,
-    /// Attach a Ratatui client to an already running daemon.
+    /// Attach to a live daemon, or run one until this TUI exits.
     Tui,
     /// Show daemon status through the private control interface.
     Status,
@@ -80,13 +82,24 @@ async fn run() -> Result<()> {
             atomic_write(&data.join("config.json"), &c)?;
             println!("Initialized {}", data.display());
         }
-        Command::Daemon => daemon(data).await?,
+        Command::Daemon => {
+            let lock = lock_dir(&data)?;
+            let shutdown = CancellationToken::new();
+            let runner = daemon(data, lock, shutdown.clone());
+            tokio::pin!(runner);
+            let signal = tokio::select! {
+                result = &mut runner => return result,
+                result = stop_signal() => result,
+            };
+            shutdown.cancel();
+            combine_results(signal, runner.await)?;
+        }
         Command::Token => {
             let c: Config = read_private(&data.join("config.json"))?;
             c.validate()?;
             println!("{}", c.mcp_token);
         }
-        Command::Tui => wayfinder_tui::run(wayfinder_api::Client::attach(&data)?).await?,
+        Command::Tui => tui(data).await?,
         Command::Status => {
             let client = wayfinder_api::Client::attach(&data)?;
             println!("{}", serde_json::to_string_pretty(&client.status().await?)?);
@@ -106,20 +119,101 @@ async fn run() -> Result<()> {
     }
     Ok(())
 }
+// Probe the authenticated API, never just the discovery file. Bound stale endpoints.
+async fn live_client(data: &Path) -> Result<wayfinder_api::Client> {
+    let client = wayfinder_api::Client::attach(data)?;
+    tokio::time::timeout(Duration::from_millis(500), client.status())
+        .await
+        .context("Daemon control status timed out")??;
+    Ok(client)
+}
+
+async fn wait_for_control(data: &Path) -> Result<wayfinder_api::Client> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(client) = live_client(data).await {
+                return client;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("Daemon control interface was not ready within 5 seconds")
+}
+
+fn combine_results(result: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("Daemon cleanup also failed: {cleanup:#}")))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+async fn tui(data: PathBuf) -> Result<()> {
+    let signal = stop_signal();
+    tokio::pin!(signal);
+    let existing = tokio::select! {
+        result = live_client(&data) => result,
+        result = &mut signal => return result,
+    };
+    let lock = match existing {
+        Ok(client) => {
+            return tokio::select! {
+                result = wayfinder_tui::run(client, false) => result,
+                result = &mut signal => result,
+            };
+        }
+        Err(_) => match lock_dir(&data) {
+            Ok(lock) => lock,
+            Err(error) => {
+                // Another starter may hold the lock before publishing discovery.
+                // Never start services or change its descriptor in this case.
+                let client = tokio::select! {
+                    result = wait_for_control(&data) => result.with_context(|| format!("Cannot start daemon: {error:#}"))?,
+                    result = &mut signal => return result,
+                };
+                return tokio::select! {
+                    result = wayfinder_tui::run(client, false) => result,
+                    result = &mut signal => result,
+                };
+            }
+        },
+    };
+    let shutdown = CancellationToken::new();
+    let mut runner = tokio::spawn(daemon(data.clone(), lock, shutdown.clone()));
+    let session = async {
+        let client = wait_for_control(&data).await?;
+        wayfinder_tui::run(client, true).await
+    };
+    let result = tokio::select! {
+        result = &mut runner => {
+            return result.context("Daemon task failed")?
+                .and_then(|()| anyhow::bail!("Daemon stopped while the TUI was running"));
+        }
+        result = session => result,
+        result = &mut signal => result,
+    };
+    shutdown.cancel();
+    combine_results(
+        result,
+        runner.await.context("Daemon task failed").and_then(|r| r),
+    )
+}
+
 struct DescriptorCleanup(PathBuf);
 impl Drop for DescriptorCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
-async fn daemon(data: PathBuf) -> Result<()> {
-    let _lock = lock_dir(&data)?;
+async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Result<()> {
     let config: Config = read_private(&data.join("config.json"))
         .context("Initialize first with wayfinder init --name NAME")?;
     config.validate()?;
     let identity: Identity = read_private(&data.join("identity.json"))
         .context("Durable identity is missing or invalid; restore this node's private backup")?;
-    let shutdown = CancellationToken::new();
     let network = wayfinder_network::Network::new(
         config.clone(),
         identity,
@@ -153,7 +247,7 @@ async fn daemon(data: PathBuf) -> Result<()> {
         "Wayfinder daemon listening: MCP {}, peers {}",
         config.mcp_listen, config.peer_listen
     );
-    let outcome = tokio::select! {r=services.join_next()=>match r{Some(Ok(r))=>r,Some(Err(e))=>Err(e.into()),None=>Ok(())},r=stop_signal()=>r};
+    let outcome = tokio::select! {r=services.join_next()=>match r{Some(Ok(r))=>r,Some(Err(e))=>Err(e.into()),None=>Ok(())},_=shutdown.cancelled()=>Ok(())};
     shutdown.cancel();
     let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(r) = services.join_next().await {
@@ -164,10 +258,15 @@ async fn daemon(data: PathBuf) -> Result<()> {
     .await;
     services.abort_all();
     while services.join_next().await.is_some() {}
-    if let Ok(r) = drained {
-        r?;
-    }
-    outcome
+    let cleanup = drained
+        .context("Daemon services did not stop within 5 seconds")
+        .and_then(|r| r);
+    let cleanup = combine_results(
+        cleanup,
+        std::fs::remove_file(data.join("control.json"))
+            .context("Cannot remove daemon control descriptor"),
+    );
+    combine_results(outcome, cleanup)
 }
 async fn stop_signal() -> Result<()> {
     #[cfg(unix)]
