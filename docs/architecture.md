@@ -14,7 +14,7 @@ The Tokio composition root is `crates/wayfinder`. It loads private state under a
 | `wayfinder-tui` | Terminal frontend using only the private API client |
 | `wayfinder` | CLI, initialization, daemon startup/shutdown, TUI attachment |
 
-There is no web dashboard, shell session store, filesystem API, central inventory, telemetry, coordinator, or cloud dependency. Every retained member has the same administrative authority. Any member can introduce another node and be an MCP gateway. Hosts remain responsible for shell capabilities and OS access control.
+There is no web dashboard, shell session store, filesystem API, central inventory, telemetry, coordinator, or cloud dependency. Every retained member has the same administrative authority. Any member can introduce another node and be an MCP gateway. Hosts remain responsible for shell capabilities and OS access control. External reverse proxies and tunnel providers remain outside the Wayfinder trust/configuration model: provider credentials, organization or tenant selectors, and control-plane lifecycle must be handled by the integration layer rather than added to the daemon.
 
 ## Request paths
 

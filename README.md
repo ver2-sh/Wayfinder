@@ -128,7 +128,7 @@ wayfinder.example.com {
 }
 ```
 
-Use `https://wayfinder.example.com/mcp` in the client. Keep upstream response timeouts above 310 seconds and disable response buffering where necessary. A tunnel must provide encrypted remote transport and the same Host rewrite. Never expose the private control listener. Other members' MCP ports do not need exposure; the selected gateway routes over authenticated Noise connections.
+Use `https://wayfinder.example.com/mcp` in the client. Keep upstream response timeouts above 310 seconds and disable response buffering where necessary. A tunnel must provide encrypted remote transport and the same Host rewrite. Provider-specific tunnel credentials, organization/tenant selection, and control-plane authentication belong in that tunnel integration, not in Wayfinder; configure required provider context explicitly rather than relying on implicit account state. Never expose the private control listener. Other members' MCP ports do not need exposure; the selected gateway routes over authenticated Noise connections.
 
 ## Configuration and private control
 
