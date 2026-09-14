@@ -1,90 +1,23 @@
 //! OS-local application sessions, independent of administration and MCP.
 use crate::{Network, services::read_json};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::json;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::{fs::File, path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{
-    net::{UnixListener, UnixStream},
+    io::{AsyncRead, AsyncWrite},
     task::JoinSet,
 };
 
-/// Machine-wide contract; an explicit XDG runtime isolates source-development instances.
-pub fn socket_path() -> Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run"));
-    ensure!(runtime.is_absolute(), "Runtime directory must be absolute");
-    Ok(runtime.join("wayfinder/app.sock"))
-}
-pub struct Endpoint {
-    listener: UnixListener,
-    path: PathBuf,
-    _lock: File,
-}
-impl Endpoint {
-    pub fn bind() -> Result<Self> {
-        let path = socket_path()?;
-        let dir = path.parent().context("Missing runtime directory")?;
-        let uid = std::fs::metadata("/proc/self")?.uid();
-        let runtime = dir.parent().context("Missing runtime parent")?;
-        if !runtime.exists() {
-            std::fs::create_dir(runtime)?;
-            std::fs::set_permissions(runtime, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let metadata = std::fs::symlink_metadata(runtime)?;
-        ensure!(
-            metadata.is_dir()
-                && (metadata.uid() == uid || metadata.uid() == 0)
-                && metadata.mode() & 0o022 == 0,
-            "Runtime parent must be owned by root or the daemon and not writable by others"
-        );
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let metadata = std::fs::symlink_metadata(dir)?;
-        ensure!(
-            metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o027 == 0,
-            "Application directory must be daemon-owned, not group-writable and inaccessible to others"
-        );
-        // Only the daemon can change directory entries. The setgid bit makes the
-        // socket inherit the provisioned application group, independent of umask.
-        let shared = metadata.mode() & 0o050 == 0o050;
-        ensure!(
-            !shared || metadata.mode() & 0o2000 != 0,
-            "Shared application directory must have setgid enabled"
-        );
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(dir.join("daemon.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .context("A daemon already owns this application endpoint")?;
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(
-            &path,
-            std::fs::Permissions::from_mode(if shared { 0o660 } else { 0o600 }),
-        )?;
-        Ok(Self {
-            listener,
-            path,
-            _lock: lock,
-        })
-    }
-}
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{Endpoint, socket_path};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::Endpoint;
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
@@ -103,22 +36,17 @@ enum Operation {
     },
 }
 impl Network {
-    pub async fn serve_applications(self: Arc<Self>, endpoint: Endpoint) -> Result<()> {
+    pub async fn serve_applications(self: Arc<Self>, mut endpoint: Endpoint) -> Result<()> {
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-                accepted = endpoint.listener.accept() => {
-                    let (stream, _) = accepted?;
-                    // Linux checks socket write permission against the connecting process's
-                    // effective UID and supplementary groups. Do not reimplement group
-                    // admission via race-prone /proc or account-database lookups.
-                    let uid = stream.peer_cred()?.uid();
+                accepted = endpoint.accept() => {
+                    let (stream, owner) = accepted?;
                     if tasks.len() >= 64 { continue; }
                     let network = self.clone();
                     tasks.spawn(async move {
-                        let owner = format!("{uid}:{}", wayfinder_core::random_secret());
                         tokio::select! {
                             _ = network.shutdown.cancelled() => {},
                             _ = network.application_session(stream, &owner) => {},
@@ -131,7 +59,11 @@ impl Network {
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
-    async fn application_session(&self, mut stream: UnixStream, owner: &str) -> Result<()> {
+    async fn application_session(
+        &self,
+        mut stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        owner: &str,
+    ) -> Result<()> {
         loop {
             let op: Operation = read_json(&mut stream).await?;
             if let Operation::OpenService { target, service } = op {
@@ -198,7 +130,10 @@ impl Network {
     }
 }
 
-async fn write_reply(stream: &mut UnixStream, value: &serde_json::Value) -> Result<()> {
+async fn write_reply(
+    stream: &mut (impl AsyncWrite + Unpin),
+    value: &serde_json::Value,
+) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let bytes = serde_json::to_vec(value)?;
     ensure!(bytes.len() <= 128 * 1024, "Application reply too large");

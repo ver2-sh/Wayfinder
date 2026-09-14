@@ -1,11 +1,12 @@
-# Dynamic local applications (Linux)
+# Dynamic local applications (Linux and Windows)
 
 Both `wayfinder daemon` and a daemon started by `wayfinder tui` automatically
-expose a generic Unix domain socket. Applications discover it, register while
+expose a generic local endpoint: a Unix domain socket on Linux or a named pipe
+on Windows. Applications discover it, register while
 running, and reconnect when the daemon restarts. No application configuration,
 service catalogue, descriptor file or daemon restart is needed to install an app.
 
-## Discovery and authorization
+## Linux discovery and authorization
 
 The installed machine-wide endpoint is `/run/wayfinder/app.sock`. Its directory
 is owned by the daemon account and the generic `wayfinder-apps` group, mode 2750;
@@ -60,8 +61,37 @@ is generic OS environment, not application/service configuration.
 The application API gives no access to private files, keys, membership
 administration or command execution. It has a separate decoder and listener from
 MCP, private administration and encrypted peer networking. No MCP bearer or admin
-credential is provided or accepted. Linux is validated; other platforms keep
-unrelated functionality but do not expose this dynamic application transport.
+credential is provided or accepted. macOS does not expose this dynamic application transport.
+
+## Windows discovery and authorization
+
+Native Windows 11 uses `\\.\pipe\wayfinder-app-v1`, with no WSL or TCP
+application listener. Run Wayfinder and its applications under the same Windows
+account. The pipe has an explicit protected DACL granting only that daemon
+account and LocalSystem full access; no Everyone, Anonymous, Authenticated Users
+or general Administrators grant is added. Windows enforces remote-client
+rejection as well as the ACL. Knowing the pipe name does not authorize another
+account. Clients should verify the pipe owner is their account or LocalSystem.
+
+Same-account processes share an OS trust boundary: this policy does not isolate
+applications from other files accessible to that account. The application API
+itself neither reads nor requires access to private Wayfinder state or control
+credentials. Separate Windows application accounts/groups are not provisioned.
+
+Only one daemon can own the production pipe. First-instance creation fails if
+that name already exists; a listening instance is retained between sessions.
+Each admitted connection gets a random, nonpersistent owner identity and uses
+the same framing, session cleanup and limits as Linux. Session ownership does
+not introduce an application authentication secret.
+
+Start `wayfinder.exe init --name gaming-pc` once, then `wayfinder.exe daemon` in
+PowerShell under the intended account. Configure reachable peer listen/advertise
+addresses during initialization as described in the README; use
+`wayfinder.exe tui` for the normal invitation/join flow. Native Windows and Ubuntu
+use the same TCP/Noise membership and peer-service protocols. Windows service
+installation is outside this implementation; foreground launch needs no service
+manager. Private state directory ACL provisioning remains the operator's
+responsibility.
 
 ## Wire contract
 
@@ -79,9 +109,9 @@ identify version 1. Requests are sequential on a session.
   `{"value":{"version":1,"registered":true}}`.
 - `{"op":"unregister_service","service":"echo.private.v1"}` returns
   `{"value":{"unregistered":true}}`. Only the owning session may unregister.
-- On a separate socket, `{"op":"open_service","target":"<full stable ID>",
+- On a separate local connection, `{"op":"open_service","target":"<full stable ID>",
   "service":"echo.private.v1"}` returns `{"version":1,"ready":true}`, then the
-  socket becomes an application byte stream. A rejected open returns
+  connection becomes an application byte stream. A rejected open returns
   `{"error":"..."}` and closes. Other operation failures use the same error shape.
 
 Service names are opaque: 1–96 lowercase ASCII letters, digits, dots, hyphens or
@@ -94,7 +124,7 @@ unbounded tasks or buffers. Applications should bound their own incoming work.
 
 ## Registration lifetime
 
-A successful registration belongs to its live local socket session. Repeating
+A successful registration belongs to its live local application session. Repeating
 an identical registration on that session is harmless. Another session cannot
 replace it, even with the same application credential. No registration is saved
 or replicated. The TUI's Services view is read-only observation of live names.
@@ -136,7 +166,7 @@ retry, failover or stream resumption. Admin/MCP credentials remain independent.
 
 ## Runnable example and validation
 
-After linking two machines normally, run `python3 examples/echo_app.py` beside
+On Linux, after linking two machines normally, run `python3 examples/echo_app.py` beside
 each daemon. It dynamically registers `echo.private.v1`, echoes bytes, and
 reconnects automatically. Its socket helper and framing functions demonstrate
 opening services without any private state access.
@@ -163,3 +193,12 @@ Workspace formatting/check/Clippy/tests passed. A transient systemd unit also
 verified 2750 runtime-directory permissions and inherited socket group under a
 0077 umask. These are real linked processes on one Linux host, not a claimed
 physical multi-machine test.
+
+### Native Windows implementation validation
+
+The Linux workspace formatting, check, Clippy and tests pass after introducing
+the named-pipe endpoint. The existing separate-account real-process suite passes
+all 51 assertions against the rebuilt Linux binary, including cleanup and restart
+recovery. Only a Linux Rust target is installed on the validation host: Windows
+compilation, ACL/runtime behavior and physical Ubuntu ↔ Windows federation have
+not been executed. Validate those on Windows before deployment.

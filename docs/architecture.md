@@ -2,7 +2,7 @@
 
 ## Composition
 
-The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds MCP, peer, private administration and Unix application listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
+The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds MCP, peer, private administration and OS-local application listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -28,10 +28,10 @@ Connection establishment failure means nothing was dispatched. Connection loss a
 
 ## Identity and transport
 
-**Peer services:** live Unix application session → ephemeral named loopback endpoint;
-Unix service open → exact stable node ID → existing pinned Noise and membership
+**Peer services:** live local application session → ephemeral named loopback endpoint;
+Local service open → exact stable node ID → existing pinned Noise and membership
 admission → registered application preface → bounded bidirectional byte stream.
-The automatic application socket is separate from MCP, administration and peer
+The automatic application endpoint (Linux Unix socket / Windows named pipe) is separate from MCP, administration and peer
 networking. Registrations belong to live sessions and are removed on disconnect.
 Both daemon and TUI startup expose the same interface. No application metadata,
 persistent service configuration or replicated service catalogue is maintained.
