@@ -23,8 +23,9 @@ impl Endpoint {
         let sid = account_sid()?;
         // Protected DACL: no inherited/broad grants. Same-account processes are
         // one trust boundary; LocalSystem may also connect and administer it.
-        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)\0")
+        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GA;;;SY)")
             .encode_utf16()
+            .chain(std::iter::once(0))
             .collect();
         let listener = create(&sddl, true).context("Cannot own Wayfinder application pipe")?;
         Ok(Self { listener, sddl })
