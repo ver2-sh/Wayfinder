@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-WAYFINDER_DIR="${NORTED_REPOS_DIR:-/srv/norted/repos}/project-wayfinder"
+ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
+WAYFINDER_DIR="${WAYFINDER_REPO_DIR:-$ROOT}"
 UNIT_NAME="wayfinder.service"
 UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
 GLOBAL_LINK="/usr/local/bin/wayfinder"
@@ -42,9 +42,12 @@ Commands:
   logs      Follow service logs
   disable   Stop and disable the service
   remove    Stop, disable, remove the systemd unit and global command
+  services  Configure/list/remove application services (forwarded to CLI)
+  tui       Open the terminal interface (forwarded to CLI)
+  init, daemon, control, token and --data-dir are also forwarded to the CLI.
 
 Environment:
-  NORTED_REPOS_DIR    Repository root (default: /srv/norted/repos)
+  WAYFINDER_REPO_DIR  Repository directory (default: this script directory)
   WAYFINDER_DATA_DIR  Explicit Wayfinder private data directory passed to the
                       service as --data-dir (default: the service account's
                       OS application-data directory, e.g. ~/.local/share/wayfinder)
@@ -57,7 +60,7 @@ EOF
 require_wayfinder() {
   [[ -d "$WAYFINDER_DIR" && -f "$WAYFINDER_DIR/Cargo.toml" ]] || {
     echo "Wayfinder repository not found at ${WAYFINDER_DIR}." >&2
-    echo "Clone it there, or set NORTED_REPOS_DIR." >&2
+    echo "Clone it there, or set WAYFINDER_REPO_DIR." >&2
     exit 1
   }
 }
@@ -271,6 +274,18 @@ EOF
 
 cmd="${1:-}"
 case "$cmd" in
+  init|daemon|tui|services|control|token|--data-dir|--data-dir=*|--version)
+    require_wayfinder
+    app_args=("$@")
+    explicit_data=false
+    for arg in "$@"; do
+      case "$arg" in --data-dir|--data-dir=*) explicit_data=true ;; esac
+    done
+    if [[ -n "${WAYFINDER_DATA_DIR:-}" && "$explicit_data" == false ]]; then
+      app_args=(--data-dir "$WAYFINDER_DATA_DIR" "${app_args[@]}")
+    fi
+    exec "$BINARY" "${app_args[@]}"
+    ;;
   install)
     install_unit
     ;;

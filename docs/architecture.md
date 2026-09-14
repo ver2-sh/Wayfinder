@@ -28,11 +28,12 @@ Connection establishment failure means nothing was dispatched. Connection loss a
 
 ## Identity and transport
 
-**Peer services:** private control registration → leased named loopback endpoint;
+**Peer services:** scoped application capability registration → leased named loopback endpoint;
 private authenticated service open → exact stable node ID → existing pinned Noise
 and membership admission → registered application preface → bounded bidirectional
 byte stream. The extra service-open listener is loopback only and is published in
-`control.json`. There is no application-specific metadata in Wayfinder. See the
+a separate service-scoped capability descriptor. Both daemon and TUI startup load
+the persistent configured service set. There is no application-specific metadata in Wayfinder. See the
 [complete version-1 contract](peer-services.md) for frames, limits, cancellation,
 credential handling and failure semantics. The per-request JSON limits below
 apply to setup/RPC messages; admitted service payloads use bounded stream records.

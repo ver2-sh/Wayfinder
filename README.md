@@ -14,7 +14,7 @@ wayfinder tui → private loopback control API → daemon
 
 Local applications can also expose [named private peer services](docs/peer-services.md)
 using a separate, service-scoped application capability published with
-`daemon --peer-service SERVICE=/absolute/capability.json`. Applications need no
+`services add SERVICE --capability /absolute/capability.json`. Applications need no
 access to the private administration descriptor or Wayfinder state directory.
 An authenticated local client opens a named service on a full stable peer node
 ID; Wayfinder streams bytes through the existing Noise transport to that peer's
@@ -34,7 +34,7 @@ cargo fmt --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
-./target/release/wayfinder init --name norted
+./target/release/wayfinder init --name server
 ./target/release/wayfinder daemon
 ```
 
@@ -55,7 +55,7 @@ All members must have directly reachable advertised peer addresses. No NAT trave
 Initialize each machine with its own **unique name**, directory, and identity. For example, on A:
 
 ```sh
-wayfinder init --name norted \
+wayfinder init --name server \
   --peer-listen 192.168.1.10:3001 \
   --peer-advertise 192.168.1.10:3001
 wayfinder daemon

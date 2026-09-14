@@ -15,6 +15,9 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+pub mod applications;
+pub use applications::*;
+
 pub const VERSION: u32 = 1;
 pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 pub const PROLOGUE: &[u8] = b"wayfinder-peer-v1";
