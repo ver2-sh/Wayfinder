@@ -43,6 +43,8 @@ pub async fn run(client: Client, stops_daemon_on_exit: bool) -> Result<()> {
     } else {
         "Select a node for details. Q closes this TUI; the daemon keeps running."
     });
+    let mut applications = false;
+    let mut service_text = String::new();
     let mut refreshed = Instant::now();
     'ui: loop {
         terminal.draw(|f|{
@@ -50,12 +52,16 @@ pub async fn run(client: Client, stops_daemon_on_exit: bool) -> Result<()> {
  let title=format!("Wayfinder     Network: {}\n{}",status.network_name.as_deref().unwrap_or("Standalone"),status.network_id.as_deref().unwrap_or("Create a network with N or join with J"));
  f.render_widget(Paragraph::new(title).block(Block::bordered()),areas[0]);
  let rows:Vec<ListItem>=status.nodes.iter().map(|n|ListItem::new(format!("{} {:<20} {:<15} {}",if n.reachable{"●"}else{"○"},safe(&n.name),if n.local{"This machine"}else{""},if n.reachable{"Reachable"}else{"Offline / unknown"}))).collect();
+ if applications {
+ f.render_widget(Paragraph::new(service_text.clone()).wrap(Wrap{trim:false}).block(Block::bordered().title("Applications / Services")),areas[1]);
+ } else {
  f.render_stateful_widget(List::new(rows).block(Block::bordered().title("Nodes")).highlight_style(Style::default().fg(Color::Cyan)).highlight_symbol("› "),areas[1],&mut selected);
+ }
  let reachable=status.nodes.iter().filter(|n|!n.local&&n.reachable).count();let peers=status.nodes.iter().filter(|n|!n.local).count();
  f.render_widget(Paragraph::new(format!("MCP  {}  Listening / bearer required\nPeers  {}  {reachable} / {peers} reachable{}",status.mcp_listen,status.peer_listen,if status.conflict{"   MEMBERSHIP CONFLICT — peer execution blocked"}else{""})).block(Block::bordered().title("Connections")),areas[2]);
  let text=match &mode{Mode::Browse=>safe(&message),Mode::Create=>format!("Create network — enter a name, then Enter. Esc cancels.\n{input}"),Mode::Join=>format!("Paste invitation, then Enter to authenticate the inviter. Esc cancels.\n{input}"),Mode::ConfirmJoin(_)=>format!("{}\nJoin this network? Y confirms; Esc cancels.",safe(&message)),Mode::Remove(id)=>format!("Remove node {id}?\nThis revokes peer access after membership propagates. Y confirms; Esc cancels.")};
  f.render_widget(Paragraph::new(text).wrap(Wrap{trim:false}).block(Block::bordered().title("Network administration")),areas[3]);
- f.render_widget(Paragraph::new("↑↓ Select  Enter Details  A Add  R Remove  N Create  J Join  S Settings
+ f.render_widget(Paragraph::new("↑↓ Select  Enter Details  A Add  R Remove  N Create  J Join  S Settings  V Services
 C Copy invite (OSC 52)  Q Quit"),areas[4]);
  })?;
         if event::poll(Duration::from_millis(100))? {
@@ -125,6 +131,12 @@ C Copy invite (OSC 52)  Q Quit"),areas[4]);
                                 }
                             }
                         }
+                        KeyCode::Char('v') => {
+                            applications = !applications;
+                            if applications {
+                                action = Some(Operation::Applications);
+                            }
+                        }
                         KeyCode::Char('s') => {
                             message = format!(
                                 "Node: {}\nAdvertised peer endpoint: {}\nMembership revision: {}\nMCP authentication enabled; credentials are never shown here. Listener settings live in config.json; changing them requires a daemon restart. Linked descriptors are immutable.",
@@ -180,6 +192,7 @@ C Copy invite (OSC 52)  Q Quit"),areas[4]);
                     },
                 }
                 if let Some(op) = action {
+                    let is_applications = matches!(op, Operation::Applications);
                     let preview = matches!(op, Operation::Preview { .. });
                     match client.call(op).await {
                         Ok(value) => {
@@ -187,6 +200,40 @@ C Copy invite (OSC 52)  Q Quit"),areas[4]);
                                 invitation = i.to_owned();
                             }
                             message = serde_json::to_string_pretty(&value)?;
+                            if is_applications {
+                                service_text.clear();
+                                for service in value["configured"].as_array().into_iter().flatten()
+                                {
+                                    let active = value["active"]
+                                        .as_array()
+                                        .is_some_and(|items| items.contains(service));
+                                    service_text.push_str(&format!(
+                                        "{} · {}\n{}\n",
+                                        service["service"].as_str().unwrap_or(""),
+                                        if active {
+                                            "local capability active"
+                                        } else {
+                                            "pending daemon restart"
+                                        },
+                                        service["capability"].as_str().unwrap_or("")
+                                    ));
+                                }
+                                if service_text.is_empty() {
+                                    service_text = "No configured application services.".into();
+                                }
+                                for service in value["active"].as_array().into_iter().flatten() {
+                                    if !value["configured"]
+                                        .as_array()
+                                        .is_some_and(|items| items.contains(service))
+                                    {
+                                        service_text.push_str(&format!(
+                                            "\n{} · removal pending daemon restart\n",
+                                            service["service"].as_str().unwrap_or("")
+                                        ));
+                                    }
+                                }
+                                message = "Configure with CLI:\nwayfinder services add SERVICE --capability /absolute/path [--group GID]\nwayfinder services remove SERVICE\nRestart daemon to apply changes. V returns to nodes.".into();
+                            }
                             mode = if preview {
                                 Mode::ConfirmJoin(input.clone())
                             } else {

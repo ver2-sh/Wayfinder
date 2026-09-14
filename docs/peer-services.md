@@ -8,29 +8,49 @@ own authorization within the trusted membership boundary.
 
 ## Local contract
 
-The administrator starts Wayfinder with an explicit application capability:
+The administrator configures each service once:
 
 ```sh
-wayfinder daemon --peer-service example.service.v1=/run/wayfinder-app/example.json
+wayfinder services add example.service.v1 --capability /var/lib/wayfinder-app/example.json
+wayfinder services list
+wayfinder daemon
+# Or: wayfinder tui
+wayfinder services remove example.service.v1
 ```
 
-The parent directory must already exist, and the absolute descriptor path must
-be outside Wayfinder's private data directory. The option is repeatable for
-separate services. The daemon writes a 0600 descriptor with `version: 1`,
-`service`, loopback `address` and `service_address`, and a random 256-bit
-`credential`. Grant the application read access only to this file (for example,
-transfer file ownership to its dedicated account); keep the parent writable only
-by the Wayfinder administrator. Use equivalent restricted Windows ACLs.
-No access to the private Wayfinder directory is needed. Reapply the file grant
-after daemon restart; the capability is ephemeral and clients reread the path.
-Normal shutdown removes it; remove a stale descriptor explicitly after a crash.
+Create the capability parent directory first, outside Wayfinder's private data
+directory, writable only by the administrator. Use an absolute, dedicated file
+path. Configuration is local and persistent, managed by the CLI without editing
+private JSON. Up to 32 arbitrary application-owned names are supported. Add and
+remove apply at the next daemon restart; removal revokes existing access when
+that daemon stops. `services list` distinguishes configured from active services.
+In the TUI, V inspects service configuration and active capability destinations.
+The optional systemd wrapper forwards `services` and `tui` to the application CLI,
+using its configured data directory. A TUI that starts its own daemon loads exactly the same configured services as
+`wayfinder daemon`; closing that TUI stops its daemon and application access.
+Attaching to a persistent daemon leaves it running when the TUI closes.
 
-This credential is cryptographically separate from both administration and MCP.
-It authorizes only its exact service name for registration and opening. It cannot
-create/join/invite/remove membership, execute shell commands, or read identity,
-configuration, MCP bearer or durable state. `/control` remains the private,
-high-privilege TUI/CLI administration contract. Norted Link is an application
-protocol over this generic transport; Wayfinder has no Norted-specific behavior.
+For a dedicated Unix application account, use `--group GID` with a dedicated
+application group. The daemon publishes mode 0640 with that group on every start;
+otherwise it publishes mode 0600 for its own account. The daemon account must be
+allowed to assign the group. Give the application traversal access to the parent,
+but no write access. No repeated chmod/chown is needed. On Windows, restrict the
+parent's inherited ACL to the daemon and intended application account; group IDs
+are Unix-only. Windows ACL deployment has not been validated.
+
+The descriptor contains `version: 1`, `service`, loopback `address` and
+`service_address`, and a random 256-bit `credential`. Publication uses a fresh
+private file, sets the configured group/permissions, then atomically replaces the
+destination. Credentials rotate at restart; clients must reread the selected path
+when connecting or retrying discovery. Clean shutdown removes the descriptor;
+startup replaces one left by a crash. Configuration and group grants persist.
+
+The application receives no access to Wayfinder's private directory. Its
+credential is separate from administration and MCP and authorizes only its exact
+service name for registration and opening. It cannot create/join/invite/remove
+membership, execute shell commands, or read identity, configuration, MCP bearer
+or durable state. `/control` remains the separate administrator-only TUI/CLI API.
+Configured services are never replicated or classified in node discovery.
 
 POST `{"op":"status"}` to `http://<address>/peer-service` with
 `Authorization: Bearer <credential>`, a loopback Host and no Origin. Its `value`

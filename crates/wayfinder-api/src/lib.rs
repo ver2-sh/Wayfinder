@@ -17,34 +17,13 @@ use wayfinder_network::Network;
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
-    RegisterService {
-        service: String,
-        address: std::net::SocketAddr,
-        credential: String,
-    },
-    UnregisterService {
-        service: String,
-        credential: String,
-    },
-    Details {
-        id: String,
-    },
-    Create {
-        name: String,
-    },
-    Invite {
-        ttl: Option<u64>,
-    },
-    Preview {
-        invitation: String,
-    },
-    Join {
-        invitation: String,
-    },
-    Remove {
-        id: String,
-        confirm: bool,
-    },
+    Applications,
+    Details { id: String },
+    Create { name: String },
+    Invite { ttl: Option<u64> },
+    Preview { invitation: String },
+    Join { invitation: String },
+    Remove { id: String, confirm: bool },
 }
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
@@ -55,6 +34,8 @@ pub struct Reply {
 struct Api {
     network: Arc<Network>,
     credential: String,
+    data: std::path::PathBuf,
+    applications: Vec<ApplicationService>,
 }
 pub fn allowed_host(req: &Request) -> bool {
     let host = req
@@ -84,7 +65,16 @@ async fn guard(State(api): State<Api>, req: Request, next: Next) -> Response {
     next.run(req).await
 }
 async fn control(State(api): State<Api>, Json(op): Json<Operation>) -> Json<Reply> {
-    let result = dispatch(&api.network, op).await;
+    let result = if matches!(op, Operation::Applications) {
+        application_services(&api.data).map(|configured| {
+            serde_json::json!({
+                "configured": configured, "active": api.applications,
+                "changes": "Configuration changes apply at daemon restart"
+            })
+        })
+    } else {
+        dispatch(&api.network, op).await
+    };
     Json(match result {
         Ok(v) => Reply {
             value: Some(v),
@@ -98,23 +88,7 @@ async fn control(State(api): State<Api>, Json(op): Json<Operation>) -> Json<Repl
 }
 async fn dispatch(network: &Network, op: Operation) -> Result<serde_json::Value> {
     match op {
-        Operation::RegisterService {
-            service,
-            address,
-            credential,
-        } => {
-            network
-                .register_service(service, address, credential)
-                .await?;
-            Ok(serde_json::json!({"version": 1, "lease_seconds": 60}))
-        }
-        Operation::UnregisterService {
-            service,
-            credential,
-        } => {
-            network.unregister_service(service, credential).await?;
-            Ok(serde_json::json!({"unregistered": true}))
-        }
+        Operation::Applications => unreachable!("handled by local administration"),
         Operation::Status => Ok(serde_json::to_value(network.status().await)?),
         Operation::Details { id } => Ok(serde_json::to_value(network.details(&id).await?)?),
         Operation::Create { name } => {
@@ -136,7 +110,13 @@ async fn dispatch(network: &Network, op: Operation) -> Result<serde_json::Value>
         }
     }
 }
-pub async fn serve(listener: TcpListener, network: Arc<Network>, credential: String) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    network: Arc<Network>,
+    credential: String,
+    data: std::path::PathBuf,
+    applications: Vec<ApplicationService>,
+) -> Result<()> {
     ensure!(
         listener.local_addr()?.ip().is_loopback(),
         "Control must bind loopback"
@@ -144,6 +124,8 @@ pub async fn serve(listener: TcpListener, network: Arc<Network>, credential: Str
     let api = Api {
         network: network.clone(),
         credential,
+        data,
+        applications,
     };
     let app = Router::new()
         .route("/control", post(control))
