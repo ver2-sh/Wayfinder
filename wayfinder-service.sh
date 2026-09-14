@@ -42,7 +42,7 @@ Commands:
   logs      Follow service logs
   disable   Stop and disable the service
   remove    Stop, disable, remove the systemd unit and global command
-  services  Configure/list/remove application services (forwarded to CLI)
+  services  Observe live application services (forwarded to CLI)
   tui       Open the terminal interface (forwarded to CLI)
   init, daemon, control, token and --data-dir are also forwarded to the CLI.
 
@@ -127,13 +127,12 @@ update_wayfinder() {
   echo
   build_wayfinder
   echo
-  "${SUDO[@]}" systemctl restart "$UNIT_NAME"
-  "${SUDO[@]}" systemctl is-active --quiet "$UNIT_NAME"
+  install_unit --built
   echo "Wayfinder updated and restarted."
 }
 
 install_unit() {
-  build_wayfinder
+  if [[ "${1:-}" != --built ]]; then build_wayfinder; fi
 
   local run_user run_group home_dir tmp_unit backup_unit
   local old_unit_exists=0 old_active=0 old_enabled=0 rollback_needed=0
@@ -159,6 +158,9 @@ install_unit() {
     echo "  sudo -u ${run_user} ${exec_start/daemon/init --name NAME}" >&2
   fi
 
+  # Shared OS contract; membership grants application transport only.
+  getent group wayfinder-apps >/dev/null || "${SUDO[@]}" groupadd --system wayfinder-apps
+
   tmp_unit="$(mktemp)"
   backup_unit="$(mktemp)"
   trap 'rm -f "$tmp_unit" "$backup_unit"' RETURN
@@ -172,7 +174,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=${run_user}
-Group=${run_group}
+Group=wayfinder-apps
+RuntimeDirectory=wayfinder
+RuntimeDirectoryMode=2750
 WorkingDirectory=${WAYFINDER_DIR}
 Environment=HOME=${home_dir}
 ExecStart=${exec_start}

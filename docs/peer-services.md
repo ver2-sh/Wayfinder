@@ -7,25 +7,61 @@ service catalogue, descriptor file or daemon restart is needed to install an app
 
 ## Discovery and authorization
 
-The socket is `$XDG_RUNTIME_DIR/wayfinder/app.sock`. Without XDG_RUNTIME_DIR it is
-`/run/user/<uid>/wayfinder/app.sock` when that user directory exists; otherwise it
-is `/tmp/wayfinder-<uid>/wayfinder/app.sock`. The fallback is created automatically.
-Applications and Wayfinder run under the same OS account and runtime environment.
-A distinct XDG_RUNTIME_DIR can isolate multiple daemon instances for testing.
-The socket location is independent of the private `--data-dir`.
+The installed machine-wide endpoint is `/run/wayfinder/app.sock`. Its directory
+is owned by the daemon account and the generic `wayfinder-apps` group, mode 2750;
+the socket inherits that group and has mode 0660. Applications run as separate
+accounts with supplementary membership in `wayfinder-apps`. Linux checks socket
+write permission against the connecting process's credentials, including its
+supplementary groups. Wayfinder records the peer UID alongside the random session
+identity. No account-database lookup or per-application rule is needed.
 
-The runtime parent must be owned by the daemon user and not writable by others.
-The application directory is owner-only (0700), the socket is 0600, and accepted
-connections must have the daemon's UID according to Unix peer credentials. A
-separate directory lock prevents two daemons from claiming the same application
-endpoint. Restart removes a stale socket only after acquiring that lock.
+Only the daemon can create/remove entries in the endpoint directory. Application
+group members cannot replace the socket or impersonate the daemon there. Clients
+should validate directory/socket ownership and restrictive modes, then verify
+that SO_PEERCRED identifies the directory owner. Endpoint discovery reads no
+private state. A directory lock prevents simultaneous daemon ownership; stale
+sockets are removed only after acquiring it.
 
-This is an OS-account boundary, not a sandbox between mutually hostile processes
-sharing an account. The application API gives no access to private files, keys,
-membership administration or command execution. It has a separate decoder and
-listener from MCP, private administration and encrypted peer networking. No MCP
-bearer or admin credential is provided or accepted. Linux is validated; dynamic
-application transport on Windows/macOS is unsupported in this iteration.
+`wayfinder-service.sh install` (and `update`) creates `wayfinder-apps` and uses
+systemd `RuntimeDirectory=wayfinder`, `RuntimeDirectoryMode=2750`, and
+`Group=wayfinder-apps`. Private state remains mode 0700 with files 0600 and umask
+0077; group membership grants no access to it. The installer retains the repository
+owner as its service account; provision the checkout for the intended daemon
+account before installation. Keep the daemon and applications
+under distinct UIDs when isolation matters. Do not grant application accounts the
+daemon's UID, private directories, administrative descriptors or credentials.
+
+An application service installer can provision the generic group if absent and
+use `SupplementaryGroups=wayfinder-apps`. For an interactive application account,
+the one-time OS provisioning is `sudo usermod -aG wayfinder-apps APP_USER`, followed
+by a new login. Group removal takes effect for new processes: stop existing
+application processes/sessions when revoking access. All authorized applications
+share the same limited interface; this is not isolation between group members.
+
+For manual source use without systemd, provision the endpoint once per boot:
+
+```sh
+sudo groupadd --system wayfinder-apps # only if absent
+sudo install -d -o WAYFINDER_USER -g wayfinder-apps -m 2750 /run/wayfinder
+```
+
+Alternatively, explicitly set `XDG_RUNTIME_DIR` for isolated development instances;
+the endpoint is then `$XDG_RUNTIME_DIR/wayfinder/app.sock`. The runtime parent must
+be owned by root or the daemon and not writable by others. A missing application
+directory is created owner-only (0700, socket 0600), suitable for same-account
+development. For separate-account development, provision that directory as 2750
+with the generic access group and a traversable, protected runtime parent. Use
+the same explicit runtime environment in daemon and application. Clients select
+a provisioned `$XDG_RUNTIME_DIR/wayfinder` directory when present, otherwise the
+machine endpoint; an ordinary login runtime directory alone does not override
+the machine endpoint. This override
+is generic OS environment, not application/service configuration.
+
+The application API gives no access to private files, keys, membership
+administration or command execution. It has a separate decoder and listener from
+MCP, private administration and encrypted peer networking. No MCP bearer or admin
+credential is provided or accepted. Linux is validated; other platforms keep
+unrelated functionality but do not expose this dynamic application transport.
 
 ## Wire contract
 
@@ -106,5 +142,24 @@ reconnects automatically. Its socket helper and framing functions demonstrate
 opening services without any private state access.
 
 Run `cargo build -p wayfinder` then `python3 tests/dynamic_apps.py` for isolated
-real-process validation of encrypted bidirectional echo, third-node absence,
+real-process validation (run as root to drop to distinct test UIDs) of encrypted
+bidirectional echo, private-file denial, unauthorized-UID denial, third-node absence,
 registration ownership, crash/restart cleanup, reconnection and API separation.
+
+### Separate-account validation (2026-09-14)
+
+The real-process suite passed 51 assertions with daemon UID 61001, application
+UID 61002 and supplementary application GID 61003. UID 61004 without that group
+was denied. No mount namespace concealed private state. Tests confirmed all four
+private files remain 0600 behind a 0700 directory and cannot be read by the
+application UID. Application connections exercised sanitized observation,
+arbitrary registration, encrypted bidirectional echo, exact targeting, forbidden
+operation rejection, separate MCP/admin credentials, ownership, crash cleanup,
+application restart and daemon restart recovery. Root runs the test driver only
+to provision and drop credentials; connection file descriptors are established
+by the application UID before being handed to the driver.
+
+Workspace formatting/check/Clippy/tests passed. A transient systemd unit also
+verified 2750 runtime-directory permissions and inherited socket group under a
+0077 umask. These are real linked processes on one Linux host, not a claimed
+physical multi-machine test.

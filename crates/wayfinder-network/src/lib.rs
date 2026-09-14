@@ -1,4 +1,5 @@
 //! Symmetric direct peer routing; signed membership histories, no elected hub.
+#[cfg(target_os = "linux")]
 pub mod applications;
 pub mod services;
 mod transport;

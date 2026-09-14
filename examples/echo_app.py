@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A generic reconnecting application. Run under the local daemon's OS account."""
+"""A generic reconnecting application. Run as an authorized local application account."""
 import json
 import os
 from pathlib import Path
@@ -12,11 +12,10 @@ import time
 SERVICE = "echo.private.v1"
 
 def socket_path():
-    uid = os.getuid()
-    base = os.environ.get("XDG_RUNTIME_DIR")
-    if base is None:
-        base = f"/run/user/{uid}" if Path(f"/run/user/{uid}").is_dir() else f"/tmp/wayfinder-{uid}"
-    return str(Path(base) / "wayfinder/app.sock")
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", "/run"))
+    if not (runtime / "wayfinder").is_dir():
+        runtime = Path("/run")
+    return str(runtime / "wayfinder/app.sock")
 
 def read_exact(stream, size):
     data = b""

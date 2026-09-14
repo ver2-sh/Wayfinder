@@ -32,6 +32,8 @@ cargo fmt --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
+# Personal source-development endpoint (service installation uses /run/wayfinder).
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wayfinder-$(id -u)}"
 ./target/release/wayfinder init --name server
 ./target/release/wayfinder daemon
 ```
@@ -167,7 +169,9 @@ After=network.target
 
 [Service]
 User=wayfinder
-Group=wayfinder
+Group=wayfinder-apps
+RuntimeDirectory=wayfinder
+RuntimeDirectoryMode=2750
 WorkingDirectory=/var/lib/wayfinder
 ExecStart=/usr/local/bin/wayfinder --data-dir /var/lib/wayfinder daemon
 Restart=on-failure
@@ -178,6 +182,6 @@ KillMode=control-group
 WantedBy=multi-user.target
 ```
 
-Provision `/var/lib/wayfinder` for that account and initialize it before starting the unit. Attach the TUI as the same account with the same `--data-dir`. Grant only intended OS permissions; do not run as root merely for convenience. The local supervisor controls Wayfinder's lifecycle; Wayfinder has no service-management API.
+Create the generic `wayfinder-apps` group (see [local application access](docs/peer-services.md)). Provision `/var/lib/wayfinder` mode 0700 for that account and initialize it before starting the unit. Attach the TUI as the same account with the same `--data-dir`. Grant only intended OS permissions; do not run as root merely for convenience. The local supervisor controls Wayfinder's lifecycle; Wayfinder has no service-management API.
 
 See [architecture and limitations](docs/architecture.md) and [validation record](docs/validation.md). Apache-2.0; see [LICENSE](LICENSE).

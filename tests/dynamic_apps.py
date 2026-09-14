@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real processes and encrypted peers; build wayfinder before running this test."""
+import array
 import importlib.util
 import json
 import os
@@ -20,6 +21,16 @@ spec.loader.exec_module(echo)
 BINARY = REPO / "target/debug/wayfinder"
 processes = []
 checks = []
+SEPARATE = os.geteuid() == 0
+DAEMON_UID, APP_UID, APP_GID, DENIED_UID = 61001, 61002, 61003, 61004
+
+def identity(application=False):
+    if not SEPARATE:
+        return {}
+    return dict(user=APP_UID if application else DAEMON_UID,
+                group=APP_UID if application else DAEMON_UID,
+                extra_groups=[APP_GID])
+
 
 def check(name, value):
     assert value, name
@@ -44,7 +55,7 @@ def port():
         return s.getsockname()[1]
 
 def spawn(args, env):
-    p = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(args, env=env, **identity(args[0] == sys.executable), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     processes.append(p)
     return p
 
@@ -61,7 +72,26 @@ def control(node, op, token=None):
 def connect(node):
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(5)
-    s.connect(str(node["run"] / "wayfinder/app.sock"))
+    path = str(node["run"] / "wayfinder/app.sock")
+    if SEPARATE:
+        # Establish the connection as the application UID, then transfer its fd
+        # to the test driver. SO_PEERCRED remains the application identity.
+        parent, child = socket.socketpair()
+        code = """import socket,sys,array
+c=socket.socket(fileno=int(sys.argv[1]));s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[2])
+c.sendmsg([b'x'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[s.fileno()]))])
+"""
+        p = subprocess.Popen([sys.executable, "-c", code, str(child.fileno()), path],
+                             pass_fds=[child.fileno()], **identity(True))
+        child.close()
+        _, ancillary, _, _ = parent.recvmsg(1, socket.CMSG_SPACE(4))
+        p.wait(timeout=5)
+        parent.close()
+        assert p.returncode == 0 and ancillary
+        fd = array.array('i'); fd.frombytes(ancillary[0][2])
+        s.close(); s = socket.socket(fileno=fd[0]); s.settimeout(5)
+    else:
+        s.connect(path)
     return s
 
 def active(node):
@@ -78,15 +108,24 @@ def start_daemon(node):
 
 try:
     with tempfile.TemporaryDirectory(prefix="wayfinder-apps-") as tmp:
+        Path(tmp).chmod(0o755)
         nodes = []
         for name in ("a", "b", "c"):
             root = Path(tmp) / name
             root.mkdir()
             node = {"data": root / "private", "run": root / "run", "mcp": port()}
             node["run"].mkdir(mode=0o700)
+            if SEPARATE:
+                os.chown(root, DAEMON_UID, DAEMON_UID)
+                os.chown(node["run"], DAEMON_UID, DAEMON_UID)
+                node["run"].chmod(0o755)
+                app_dir = node["run"] / "wayfinder"
+                app_dir.mkdir()
+                os.chown(app_dir, DAEMON_UID, APP_GID)
+                app_dir.chmod(0o2750)
             node["env"] = dict(os.environ, XDG_RUNTIME_DIR=str(node["run"]))
             subprocess.run([str(BINARY), "--data-dir", str(node["data"]), "init", "--name", name,
-                            "--mcp-listen", f'127.0.0.1:{node["mcp"]}', "--peer-listen", f"127.0.0.1:{port()}"], check=True, capture_output=True)
+                            "--mcp-listen", f'127.0.0.1:{node["mcp"]}', "--peer-listen", f"127.0.0.1:{port()}"], check=True, capture_output=True, **identity())
             start_daemon(node)
             node["id"] = control(node, {"op": "status"})["node"]["id"]
             nodes.append(node)
@@ -100,7 +139,7 @@ try:
             node["app"] = spawn([sys.executable, str(REPO / "examples/echo_app.py")], node["env"])
             wait(lambda: echo.SERVICE in active(node))
             check("no application configuration persisted", not (node["data"] / "services.json").exists())
-            check("socket permissions", (node["run"] / "wayfinder/app.sock").stat().st_mode & 0o777 == 0o600)
+            check("socket permissions", (node["run"] / "wayfinder/app.sock").stat().st_mode & 0o777 == (0o660 if SEPARATE else 0o600))
         for source, target in ((a, b), (b, a)):
             s, reply = open_service(source, target)
             with s:
@@ -115,7 +154,7 @@ try:
         s, reply = open_service(a, c)
         s.close()
         check("ordinary member has no service", "error" in reply)
-        for op in ({"op": "create", "name": "forbidden"}, {"op": "exec", "command": "true"}, {"op": "details", "id": a["id"]}):
+        for op in ({"op": "create", "name": "forbidden"}, {"op": "exec", "command": "true"}, {"op": "details", "id": a["id"]}, {"op":"join","invitation":"x"}, {"op":"invite"}, {"op":"remove","id":a["id"]}, {"op":"mcp"}):
             with connect(a) as s:
                 echo.send(s, op)
                 check("application decoder excludes administration", s.recv(1) == b"")
@@ -132,25 +171,29 @@ try:
         with connect(a) as s:
             echo.send(s, {"op":"open_service", "service":echo.SERVICE, "target":"0" * 64})
             check("unknown exact target rejected", "error" in echo.receive(s))
-        if os.geteuid() == 0:
-            # Independently exercise peer credentials after relaxing test socket permissions.
-            Path(tmp).chmod(0o711)
-            a["run"].chmod(0o711)
-            (a["run"] / "wayfinder").chmod(0o711)
+        if SEPARATE:
             app_socket = a["run"] / "wayfinder/app.sock"
-            app_socket.chmod(0o666)
             code = """import socket,sys
-s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1])
-try:
- s.sendall(b'\\x00\\x00\\x00\\x0f'+b'{"op":"status"}');assert s.recv(1)==b''
-except (ConnectionResetError,BrokenPipeError):pass
+s=socket.socket(socket.AF_UNIX)
+try:s.connect(sys.argv[1])
+except PermissionError:sys.exit(0)
+sys.exit(1)
 """
-            rejected = subprocess.run([sys.executable, "-c", code, str(app_socket)], user=65534, group=65534, extra_groups=[], capture_output=True)
-            check("different UID rejected by peer credentials", rejected.returncode == 0)
-            app_socket.chmod(0o600)
-            (a["run"] / "wayfinder").chmod(0o700)
-            a["run"].chmod(0o700)
-            Path(tmp).chmod(0o700)
+            denied = subprocess.run([sys.executable, "-c", code, str(app_socket)],
+                                    user=DENIED_UID, group=DENIED_UID, extra_groups=[])
+            check("unauthorized UID denied by kernel", denied.returncode == 0)
+            for node in (a,b):
+                check("private directory owner-only", node["data"].stat().st_mode & 0o777 == 0o700)
+                for name in ("identity.json", "config.json", "state.json", "control.json"):
+                    file = node["data"] / name
+                    check(name + " owner-only", file.stat().st_mode & 0o777 == 0o600)
+                    code = """import sys
+try:open(sys.argv[1]).read()
+except PermissionError:sys.exit(0)
+sys.exit(1)
+"""
+                    denied = subprocess.run([sys.executable, "-c", code, str(file)], **identity(True))
+                    check("application UID cannot read " + name, denied.returncode == 0)
         with connect(a) as s:
             echo.send(s, {"op": "register_service", "service": echo.SERVICE, "address": "127.0.0.1:12345", "credential": "a" * 64})
             check("another session cannot take over", "error" in echo.receive(s))
