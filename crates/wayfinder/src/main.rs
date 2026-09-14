@@ -237,7 +237,7 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
     atomic_write(&data.join("control.json"), &descriptor)?;
     let _cleanup = DescriptorCleanup(data.join("control.json"));
     let mut services = JoinSet::new();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         let applications = wayfinder_network::applications::Endpoint::bind()?;
         services.spawn(network.clone().serve_applications(applications));

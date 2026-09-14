@@ -3086,6 +3086,7 @@ dependencies = [
  "tokio-util",
  "wayfinder-core",
  "wayfinder-exec",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

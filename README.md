@@ -13,7 +13,7 @@ wayfinder tui → private loopback control API → daemon
 ```
 
 Local applications expose [named private peer services](docs/peer-services.md)
-through the automatic Unix application socket. Live sessions register arbitrary
+through the automatic Linux Unix socket or Windows named pipe. Live sessions register arbitrary
 service names; no application-specific setup or descriptor file is required.
 Applications list generic nodes and open a named service on an exact stable node
 ID over the existing authenticated Noise transport. Registration disappears on
@@ -24,7 +24,7 @@ This grants arbitrary shell access as the daemon's account. It is not a sandbox.
 
 ## Build and run
 
-Use a current stable Rust toolchain and Cargo. Linux is the validated platform; Unix process groups provide ordinary descendant cleanup. Dynamic local application transport is Linux-only in this iteration. Windows/macOS are unsupported for this interface.
+Use a current stable Rust toolchain and Cargo. Linux is the validated platform; Unix process groups provide ordinary descendant cleanup. Dynamic local applications support Linux and native Windows 11 (no WSL); macOS remains unsupported for this interface. Windows applications run under the daemon account; see the [pipe ACL and native launch instructions](docs/peer-services.md#windows-discovery-and-authorization). Ubuntu and Windows use the same invitation and TCP/Noise peer network.
 
 ```sh
 cargo build --release
