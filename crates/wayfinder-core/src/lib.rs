@@ -408,8 +408,18 @@ pub struct Status {
 #[serde(deny_unknown_fields)]
 pub struct ControlDescriptor {
     pub version: u32,
-    pub service_address: SocketAddr,
     pub address: SocketAddr,
+    pub credential: String,
+}
+
+/// Ephemeral, service-scoped application capability; contains no admin authority.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerServiceDescriptor {
+    pub version: u32,
+    pub service: String,
+    pub address: SocketAddr,
+    pub service_address: SocketAddr,
     pub credential: String,
 }
 

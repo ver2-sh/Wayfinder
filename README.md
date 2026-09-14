@@ -12,7 +12,10 @@ AI client → authenticated MCP → selected Wayfinder node → fresh local shel
 wayfinder tui → private loopback control API → daemon
 ```
 
-Local applications can also expose [named private peer services](docs/peer-services.md).
+Local applications can also expose [named private peer services](docs/peer-services.md)
+using a separate, service-scoped application capability published with
+`daemon --peer-service SERVICE=/absolute/capability.json`. Applications need no
+access to the private administration descriptor or Wayfinder state directory.
 An authenticated local client opens a named service on a full stable peer node
 ID; Wayfinder streams bytes through the existing Noise transport to that peer's
 registered loopback endpoint. This is independent of the two MCP tools and does

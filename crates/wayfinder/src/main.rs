@@ -35,7 +35,11 @@ enum Command {
         peer_advertise: Option<SocketAddr>,
     },
     /// Run the persistent daemon in the foreground (suitable for an OS service).
-    Daemon,
+    Daemon {
+        /// Publish a scoped application capability at an explicit path (repeatable).
+        #[arg(long, value_name = "SERVICE=PATH")]
+        peer_service: Vec<String>,
+    },
     /// Attach to a live daemon, or run one until this TUI exits.
     Tui,
     /// Show daemon status through the private control interface.
@@ -82,10 +86,10 @@ async fn run() -> Result<()> {
             atomic_write(&data.join("config.json"), &c)?;
             println!("Initialized {}", data.display());
         }
-        Command::Daemon => {
+        Command::Daemon { peer_service } => {
             let lock = lock_dir(&data)?;
             let shutdown = CancellationToken::new();
-            let runner = daemon(data, lock, shutdown.clone());
+            let runner = daemon(data, lock, shutdown.clone(), peer_service);
             tokio::pin!(runner);
             let signal = tokio::select! {
                 result = &mut runner => return result,
@@ -182,7 +186,7 @@ async fn tui(data: PathBuf) -> Result<()> {
         },
     };
     let shutdown = CancellationToken::new();
-    let mut runner = tokio::spawn(daemon(data.clone(), lock, shutdown.clone()));
+    let mut runner = tokio::spawn(daemon(data.clone(), lock, shutdown.clone(), Vec::new()));
     let session = async {
         let client = wait_for_control(&data).await?;
         wayfinder_tui::run(client, true).await
@@ -208,7 +212,12 @@ impl Drop for DescriptorCleanup {
         let _ = std::fs::remove_file(&self.0);
     }
 }
-async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Result<()> {
+async fn daemon(
+    data: PathBuf,
+    _lock: File,
+    shutdown: CancellationToken,
+    capabilities: Vec<String>,
+) -> Result<()> {
     let config: Config = read_private(&data.join("config.json"))
         .context("Initialize first with wayfinder init --name NAME")?;
     config.validate()?;
@@ -220,7 +229,7 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
         data.join("state.json"),
         shutdown.clone(),
     )?;
-    // Bind every listener before publishing a control descriptor or serving any request.
+    // Bind the administration and peer listeners before publishing discovery.
     let mcp = TcpListener::bind(config.mcp_listen)
         .await
         .context("Cannot bind MCP listener")?;
@@ -228,9 +237,8 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
         .await
         .context("Cannot bind peer listener")?;
     let control = TcpListener::bind("127.0.0.1:0").await?;
-    let service_listener = TcpListener::bind("127.0.0.1:0").await?;
+
     let descriptor = ControlDescriptor {
-        service_address: service_listener.local_addr()?,
         version: VERSION,
         address: control.local_addr()?,
         credential: random_secret(),
@@ -238,11 +246,58 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
     atomic_write(&data.join("control.json"), &descriptor)?;
     let _cleanup = DescriptorCleanup(data.join("control.json"));
     let mut services = JoinSet::new();
-    services.spawn(
-        network
-            .clone()
-            .serve_services(service_listener, descriptor.credential.clone()),
+    ensure!(
+        capabilities.len() <= 32,
+        "At most 32 service capabilities are supported"
     );
+    let private_data = data.canonicalize()?;
+    let mut capability_cleanup = Vec::new();
+    for capability in capabilities {
+        let (service, path) = capability
+            .split_once('=')
+            .context("Expected SERVICE=PATH")?;
+        wayfinder_network::services::validate_name(service)?;
+        let path = PathBuf::from(path);
+        ensure!(
+            path.is_absolute()
+                && !path
+                    .parent()
+                    .context("Missing capability parent")?
+                    .canonicalize()?
+                    .starts_with(&private_data),
+            "Capability path must be absolute and outside private data directory"
+        );
+        ensure!(
+            path.symlink_metadata()
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
+            "Capability path already exists; remove stale descriptor explicitly"
+        );
+        let api = TcpListener::bind("127.0.0.1:0").await?;
+        let transport = TcpListener::bind("127.0.0.1:0").await?;
+        let credential = random_secret();
+        atomic_write(
+            &path,
+            &PeerServiceDescriptor {
+                version: 1,
+                service: service.into(),
+                address: api.local_addr()?,
+                service_address: transport.local_addr()?,
+                credential: credential.clone(),
+            },
+        )?;
+        capability_cleanup.push(DescriptorCleanup(path));
+        services.spawn(wayfinder_api::serve_peer_service(
+            api,
+            network.clone(),
+            credential.clone(),
+            service.into(),
+        ));
+        services.spawn(
+            network
+                .clone()
+                .serve_services(transport, credential, service.into()),
+        );
+    }
     services.spawn(wayfinder_mcp::serve(mcp, network.clone()));
     services.spawn(wayfinder_api::serve(
         control,

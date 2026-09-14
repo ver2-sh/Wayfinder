@@ -52,7 +52,7 @@ pub async fn write_json<T: Serialize>(stream: &mut TcpStream, value: &T) -> Resu
     stream.write_all(&data).await?;
     Ok(())
 }
-fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 96
@@ -240,6 +240,7 @@ impl Network {
         self: Arc<Self>,
         listener: TcpListener,
         credential: String,
+        service: String,
     ) -> Result<()> {
         ensure!(
             listener.local_addr()?.ip().is_loopback(),
@@ -259,11 +260,13 @@ impl Network {
                     };
                     let network = self.clone();
                     let credential = credential.clone();
+                    let service = service.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
                         let setup = tokio::time::timeout(SETUP, async {
                             let open: Open = read_json(&mut local).await?;
                             ensure!(secret_eq(&open.credential, &credential), "Invalid local service credential");
+                            ensure!(open.service == service, "Service outside capability scope");
                             ensure!(open.version == SERVICE_VERSION, "Unsupported service protocol version");
                             network.open_peer_service(&open.target, &open.service).await
                         }).await;
