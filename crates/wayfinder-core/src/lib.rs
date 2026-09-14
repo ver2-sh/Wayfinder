@@ -15,9 +15,6 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
-pub mod applications;
-pub use applications::*;
-
 pub const VERSION: u32 = 1;
 pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 pub const PROLOGUE: &[u8] = b"wayfinder-peer-v1";
@@ -412,17 +409,6 @@ pub struct Status {
 pub struct ControlDescriptor {
     pub version: u32,
     pub address: SocketAddr,
-    pub credential: String,
-}
-
-/// Ephemeral, service-scoped application capability; contains no admin authority.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeerServiceDescriptor {
-    pub version: u32,
-    pub service: String,
-    pub address: SocketAddr,
-    pub service_address: SocketAddr,
     pub credential: String,
 }
 

@@ -36,11 +36,6 @@ enum Command {
     },
     /// Run the persistent daemon in the foreground (suitable for an OS service).
     Daemon,
-    /// Configure local application capabilities. Changes apply at daemon restart.
-    Services {
-        #[command(subcommand)]
-        command: ServiceCommand,
-    },
     /// Attach to a live daemon, or run one until this TUI exits.
     Tui,
     /// Show daemon status through the private control interface.
@@ -49,21 +44,6 @@ enum Command {
     Control,
     /// Explicitly print this node's MCP bearer credential for client setup.
     Token,
-}
-#[derive(Subcommand)]
-enum ServiceCommand {
-    List,
-    Add {
-        service: String,
-        #[arg(long)]
-        capability: PathBuf,
-        /// Unix application group ID granted read-only descriptor access.
-        #[arg(long)]
-        group: Option<u32>,
-    },
-    Remove {
-        service: String,
-    },
 }
 #[tokio::main]
 async fn main() {
@@ -113,52 +93,6 @@ async fn run() -> Result<()> {
             };
             shutdown.cancel();
             combine_results(signal, runner.await)?;
-        }
-        Command::Services { command } => {
-            let _: Config = read_private(&data.join("config.json"))?;
-            match command {
-                ServiceCommand::Add {
-                    service,
-                    capability,
-                    group,
-                } => {
-                    configure_application(
-                        &data,
-                        Some(ApplicationService {
-                            service,
-                            capability,
-                            group,
-                        }),
-                        None,
-                    )?;
-                    println!(
-                        "Service configured. Restart the daemon to activate local application access."
-                    );
-                }
-                ServiceCommand::Remove { service } => {
-                    configure_application(&data, None, Some(&service))?;
-                    println!(
-                        "Service removed from configuration. Restart the daemon to revoke active access."
-                    );
-                }
-                ServiceCommand::List => {
-                    if let Ok(client) = live_client(&data).await {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(
-                                &client.call(wayfinder_api::Operation::Applications).await?
-                            )?
-                        );
-                    } else {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(
-                                &serde_json::json!({"configured": application_services(&data)?, "active": [], "daemon": "unavailable"})
-                            )?
-                        );
-                    }
-                }
-            }
         }
         Command::Token => {
             let c: Config = read_private(&data.join("config.json"))?;
@@ -303,47 +237,13 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
     atomic_write(&data.join("control.json"), &descriptor)?;
     let _cleanup = DescriptorCleanup(data.join("control.json"));
     let mut services = JoinSet::new();
-    let capabilities = application_services(&data)?;
-    ensure!(
-        capabilities.len() <= 32,
-        "At most 32 services are supported"
-    );
-    let mut capability_cleanup = Vec::new();
-    for capability in &capabilities {
-        capability.validate(&data)?;
-        wayfinder_network::services::validate_name(&capability.service)?;
-        let service = capability.service.as_str();
-        let path = capability.capability.clone();
-        let api = TcpListener::bind("127.0.0.1:0").await?;
-        let transport = TcpListener::bind("127.0.0.1:0").await?;
-        let credential = random_secret();
-        capability.publish(&PeerServiceDescriptor {
-            version: 1,
-            service: service.into(),
-            address: api.local_addr()?,
-            service_address: transport.local_addr()?,
-            credential: credential.clone(),
-        })?;
-        capability_cleanup.push(DescriptorCleanup(path));
-        services.spawn(wayfinder_api::serve_peer_service(
-            api,
-            network.clone(),
-            credential.clone(),
-            service.into(),
-        ));
-        services.spawn(
-            network
-                .clone()
-                .serve_services(transport, credential, service.into()),
-        );
-    }
+    let applications = wayfinder_network::applications::Endpoint::bind()?;
+    services.spawn(network.clone().serve_applications(applications));
     services.spawn(wayfinder_mcp::serve(mcp, network.clone()));
     services.spawn(wayfinder_api::serve(
         control,
         network.clone(),
         descriptor.credential,
-        data.clone(),
-        capabilities,
     ));
     services.spawn(network.serve(peer));
     eprintln!(

@@ -1,4 +1,5 @@
 //! Symmetric direct peer routing; signed membership histories, no elected hub.
+pub mod applications;
 pub mod services;
 mod transport;
 use anyhow::{Context, Result, bail, ensure};

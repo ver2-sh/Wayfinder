@@ -3,7 +3,7 @@
 Wayfinder is a self-hosted Rust daemon that exposes two MCP tools: `nodes` and `exec`. Each installation executes commands as its own OS account and can route requests directly to linked Wayfinder nodes. Any member can be the MCP entry point. There is no permanent leader, web dashboard, cloud account, hosted relay, or telemetry.
 
 ```text
-AI client → authenticated MCP → selected Wayfinder node → fresh local shell
+MCP client → authenticated MCP → selected Wayfinder node → fresh local shell
                                      │
                              authenticated Noise peers
                                      │
@@ -12,21 +12,19 @@ AI client → authenticated MCP → selected Wayfinder node → fresh local shel
 wayfinder tui → private loopback control API → daemon
 ```
 
-Local applications can also expose [named private peer services](docs/peer-services.md)
-using a separate, service-scoped application capability published with
-`services add SERVICE --capability /absolute/capability.json`. Applications need no
-access to the private administration descriptor or Wayfinder state directory.
-An authenticated local client opens a named service on a full stable peer node
-ID; Wayfinder streams bytes through the existing Noise transport to that peer's
-registered loopback endpoint. This is independent of the two MCP tools and does
-not execute shell commands. Service registration is leased, resources are
-bounded, disconnects close both ends, and operations are never retried.
+Local applications expose [named private peer services](docs/peer-services.md)
+through the automatic Unix application socket. Live sessions register arbitrary
+service names; no application-specific setup or descriptor file is required.
+Applications list generic nodes and open a named service on an exact stable node
+ID over the existing authenticated Noise transport. Registration disappears on
+session disconnect. Applications reconnect after daemon restart. Streams retain
+bounded buffers, backpressure and cancellation, without retry or failover.
 
 This grants arbitrary shell access as the daemon's account. It is not a sandbox. Use a dedicated, least-privileged OS account with only the files and network access you intend to grant. A command can read anything that account can read, including Wayfinder's own private files; credential separation does not protect against an authorized shell client or a compromised member.
 
 ## Build and run
 
-Use a current stable Rust toolchain and Cargo. Linux is the validated platform; Unix process groups provide ordinary descendant cleanup. Windows uses `cmd.exe` and best-effort `taskkill /T /F`; Windows and macOS have not been smoke-validated.
+Use a current stable Rust toolchain and Cargo. Linux is the validated platform; Unix process groups provide ordinary descendant cleanup. Dynamic local application transport is Linux-only in this iteration. Windows/macOS are unsupported for this interface.
 
 ```sh
 cargo build --release

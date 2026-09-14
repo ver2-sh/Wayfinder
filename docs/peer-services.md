@@ -1,163 +1,110 @@
-# Peer services v1
+# Dynamic local applications (Linux)
 
-Applications can expose a named private byte-stream service through Wayfinder.
-Either member can open a service on another member. There is no coordinator,
-additional overlay, public application listener, shell execution, or MCP data
-plane. Applications define their own protocol and remain responsible for their
-own authorization within the trusted membership boundary.
+Both `wayfinder daemon` and a daemon started by `wayfinder tui` automatically
+expose a generic Unix domain socket. Applications discover it, register while
+running, and reconnect when the daemon restarts. No application configuration,
+service catalogue, descriptor file or daemon restart is needed to install an app.
 
-## Local contract
+## Discovery and authorization
 
-The administrator configures each service once:
+The socket is `$XDG_RUNTIME_DIR/wayfinder/app.sock`. Without XDG_RUNTIME_DIR it is
+`/run/user/<uid>/wayfinder/app.sock` when that user directory exists; otherwise it
+is `/tmp/wayfinder-<uid>/wayfinder/app.sock`. The fallback is created automatically.
+Applications and Wayfinder run under the same OS account and runtime environment.
+A distinct XDG_RUNTIME_DIR can isolate multiple daemon instances for testing.
+The socket location is independent of the private `--data-dir`.
 
-```sh
-wayfinder services add example.service.v1 --capability /var/lib/wayfinder-app/example.json
-wayfinder services list
-wayfinder daemon
-# Or: wayfinder tui
-wayfinder services remove example.service.v1
-```
+The runtime parent must be owned by the daemon user and not writable by others.
+The application directory is owner-only (0700), the socket is 0600, and accepted
+connections must have the daemon's UID according to Unix peer credentials. A
+separate directory lock prevents two daemons from claiming the same application
+endpoint. Restart removes a stale socket only after acquiring that lock.
 
-Create the capability parent directory first, outside Wayfinder's private data
-directory, writable only by the administrator. Use an absolute, dedicated file
-path. Configuration is local and persistent, managed by the CLI without editing
-private JSON. Up to 32 arbitrary application-owned names are supported. Add and
-remove apply at the next daemon restart; removal revokes existing access when
-that daemon stops. `services list` distinguishes configured from active services.
-In the TUI, V inspects service configuration and active capability destinations.
-The optional systemd wrapper forwards `services` and `tui` to the application CLI,
-using its configured data directory. A TUI that starts its own daemon loads exactly the same configured services as
-`wayfinder daemon`; closing that TUI stops its daemon and application access.
-Attaching to a persistent daemon leaves it running when the TUI closes.
+This is an OS-account boundary, not a sandbox between mutually hostile processes
+sharing an account. The application API gives no access to private files, keys,
+membership administration or command execution. It has a separate decoder and
+listener from MCP, private administration and encrypted peer networking. No MCP
+bearer or admin credential is provided or accepted. Linux is validated; dynamic
+application transport on Windows/macOS is unsupported in this iteration.
 
-For a dedicated Unix application account, use `--group GID` with a dedicated
-application group. The daemon publishes mode 0640 with that group on every start;
-otherwise it publishes mode 0600 for its own account. The daemon account must be
-allowed to assign the group. Give the application traversal access to the parent,
-but no write access. No repeated chmod/chown is needed. On Windows, restrict the
-parent's inherited ACL to the daemon and intended application account; group IDs
-are Unix-only. Windows ACL deployment has not been validated.
+## Wire contract
 
-The descriptor contains `version: 1`, `service`, loopback `address` and
-`service_address`, and a random 256-bit `credential`. Publication uses a fresh
-private file, sets the configured group/permissions, then atomically replaces the
-destination. Credentials rotate at restart; clients must reread the selected path
-when connecting or retrying discovery. Clean shutdown removes the descriptor;
-startup replaces one left by a crash. Configuration and group grants persist.
+Each local request is a four-byte unsigned big-endian JSON byte length followed
+by UTF-8 JSON (requests maximum 16 KiB, replies maximum 128 KiB). Unknown operations and unknown fields close the
+session. The initial protocol is defined by these operations; admission replies
+identify version 1. Requests are sequential on a session.
 
-The application receives no access to Wayfinder's private directory. Its
-credential is separate from administration and MCP and authorizes only its exact
-service name for registration and opening. It cannot create/join/invite/remove
-membership, execute shell commands, or read identity, configuration, MCP bearer
-or durable state. `/control` remains the separate administrator-only TUI/CLI API.
-Configured services are never replicated or classified in node discovery.
+- `{"op":"status"}` returns `{"value":{"nodes":[{"id":"<full stable ID>",
+  "name":"server","local":true,"reachable":true}],"conflict":false}}`.
+  Nodes are machine membership, not application discovery. Local identity is the
+  entry with `local: true`. No private identity or application metadata is returned.
+- `{"op":"register_service","service":"echo.private.v1",
+  "address":"127.0.0.1:49152","credential":"<64 hex characters>"}` returns
+  `{"value":{"version":1,"registered":true}}`.
+- `{"op":"unregister_service","service":"echo.private.v1"}` returns
+  `{"value":{"unregistered":true}}`. Only the owning session may unregister.
+- On a separate socket, `{"op":"open_service","target":"<full stable ID>",
+  "service":"echo.private.v1"}` returns `{"version":1,"ready":true}`, then the
+  socket becomes an application byte stream. A rejected open returns
+  `{"error":"..."}` and closes. Other operation failures use the same error shape.
 
-POST `{"op":"status"}` to `http://<address>/peer-service` with
-`Authorization: Bearer <credential>`, a loopback Host and no Origin. Its `value`
-contains only `nodes` (stable `id`, display `name`, `local`, `reachable`) and
-`conflict`. No keys or network configuration are returned.
+Service names are opaque: 1–96 lowercase ASCII letters, digits, dots, hyphens or
+underscores. The application binds an ephemeral loopback listener and generates
+its own random 256-bit hex credential internally. Neither is user configuration.
+Applications may register multiple names. There are at most 32 registrations,
+64 local sessions, and independently bounded encrypted service streams. Open
+setup and reply writes have five-second deadlines; slow sessions cannot create
+unbounded tasks or buffers. Applications should bound their own incoming work.
 
-Register through the same `/peer-service` endpoint:
+## Registration lifetime
 
-```json
-{
-  "op": "register_service",
-  "service": "example.service.v1",
-  "address": "127.0.0.1:43210",
-  "credential": "<application-generated random 256-bit hex credential>"
-}
-```
+A successful registration belongs to its live local socket session. Repeating
+an identical registration on that session is harmless. Another session cannot
+replace it, even with the same application credential. No registration is saved
+or replicated. The TUI's Services view is read-only observation of live names.
 
-The response uses the `value` / `error` envelope. Successful
-registration returns `{"version":1,"lease_seconds":60}`. Renew before 60 seconds
-by sending the same service, endpoint and application credential. An unexpired
-registration cannot be overwritten with another credential or address. Removal
-uses `{"op":"unregister_service","service":"example.service.v1","credential":"..."}`.
-Registrations exist only in memory, expire without renewal, and disappear when
-Wayfinder stops. A crashed application may need to wait for its previous lease
-to expire before registering a new instance. Expiration stops new admissions;
-it does not revoke streams already admitted.
+When the application exits, crashes, explicitly unregisters, or closes the
+session, its registrations are removed immediately when EOF is observed. There
+is no lease or periodic renewal requirement. Keep the session open independently
+of opened streams. Unregistration prevents new opens; already admitted streams
+retain ordinary stream lifetime and cancellation semantics.
 
-Service names contain 1–96 lowercase ASCII letters, digits, dots, hyphens or
-underscores. Endpoints must be literal loopback socket addresses with nonzero
-ports. There are at most 32 registrations and 32 active service streams per
-daemon, shared between incoming and outgoing service use.
+A daemon restart closes sessions and streams. Applications reconnect and register
+again using their existing listener or a new ephemeral listener. The example
+checks the session periodically to notice daemon loss; this is client liveness
+observation, not registration renewal. Discovery may reconnect; application
+operations must not be retried after possible dispatch.
 
-To open a remote service, connect TCP to `service_address` and send a four-byte
-big-endian unsigned JSON byte length followed by UTF-8 JSON:
+## Peer transport
 
-```json
-{
-  "version": 1,
-  "credential": "<scoped peer-service capability credential>",
-  "target": "<full stable peer node ID>",
-  "service": "example.service.v1"
-}
-```
+An open selects one exact current member by its full stable ID. Existing pinned
+Noise encryption, membership authorization, conflict checks and service-name
+routing apply. No peer application catalogue is distributed: clients try a named
+service on nodes of interest, and service absence is an expected result.
 
-The local daemon replies using the same framing with
-`{"version":1,"ready":true}` or `{"version":1,"error":"..."}`. Header JSON is
-limited to 16 KiB. An open operation has a five-second setup deadline. A full
-stable node ID is required; this API does not resolve display names or forward
-to an intermediate node.
-
-Before acknowledging admission, the destination daemon connects only to its
-locally registered endpoint and sends this framed preface:
+The remote Wayfinder connects to the registered loopback address and sends a
+framed JSON preface:
 
 ```json
-{
-  "version": 1,
-  "credential": "<application registration credential>",
-  "source": "<authenticated initiating node ID>",
-  "target": "<this node ID>",
-  "service": "example.service.v1"
-}
+{"version":1,"credential":"<application's registration credential>",
+ "source":"<authenticated caller ID>","target":"<local ID>",
+ "service":"echo.private.v1"}
 ```
 
-The application must verify the credential and expected service, version and
-target, then reply with framed `{"version":1,"ready":true}`. After both ready
-responses, the stream carries application bytes without further local framing.
-A plain HTTP application therefore needs a small preface adapter; Wayfinder
-does not inject HTTP authentication, interpret URLs, or expose arbitrary ports.
-The registration credential stays on the destination machine. Neither this
-preface nor discovery returns peer keys or MCP credentials.
+The application verifies the credential, service and version and responds with
+`{"version":1,"ready":true}` before any caller bytes are forwarded. Subsequent
+bytes are opaque to Wayfinder. The encrypted bridge retains bounded 32 KiB
+payload records, backpressure, cancellation and exact owner routing. EOF closes
+both directions; truncated encrypted transport is an error. There is no automatic
+retry, failover or stream resumption. Admin/MCP credentials remain independent.
 
-## Peer transport and security
+## Runnable example and validation
 
-The existing pinned Noise connection starts with a JSON request
-`{"op":"service","version":1,"head":"<membership hash>","target":"<ID>","service":"..."}`.
-The receiver checks the authenticated Noise identity against its current
-membership, requires the exact current membership head and its own target ID,
-and replies with `ServiceReady` version 1 or the existing explicit Error reply.
-Untrusted identities, known revocations, membership conflicts, unknown services,
-stopped applications, expired leases and capacity failures fail admission.
-An older daemon lacking this primitive cannot provide a service stream.
+After linking two machines normally, run `python3 examples/echo_app.py` beside
+each daemon. It dynamically registers `echo.private.v1`, echoes bytes, and
+reconnects automatically. Its socket helper and framing functions demonstrate
+opening services without any private state access.
 
-After admission, the same Noise session carries length-prefixed encrypted
-records. Plaintext begins with byte 0 and 1–32768 payload bytes, or byte 1 alone
-for a clean close. Encrypted records are at most 32785 bytes. Each direction has
-one reader/writer pump and bounded buffers; a slow reader applies TCP
-backpressure across the whole path. Large application requests are streamed as
-records and do not use the existing 16 MiB JSON RPC message buffer.
-
-Membership authorization occurs on admission. Its eventual revocation and
-conflict semantics are exactly those documented in [architecture](architecture.md).
-Service leases do not create another membership or trust system. Authorized
-members already have Wayfinder shell authority; this is not a hostile tenant
-isolation mechanism.
-
-## Cancellation and failures
-
-Closing either local application stream closes both directions of the peer
-stream and the destination socket. Half-close is intentionally a full service
-close. Applications must not close their write half while expecting a response.
-Daemon shutdown cancels all service streams. Dropped/invalid encrypted records
-close the stream; TCP truncation is not an authenticated clean close.
-
-There is no service reopen, replay, fallback, or automatic operation retry.
-Failure before ready means no caller application bytes were forwarded. After
-ready, loss of the connection can leave an operation's outcome unknown. The
-application protocol must define completion and errors and check owner state
-before retrying side effects. Cancellation cannot undo already admitted work.
-Service capacity exhaustion closes or rejects admission; callers must treat
-either as an explicit failure and must never silently select another target.
+Run `cargo build -p wayfinder` then `python3 tests/dynamic_apps.py` for isolated
+real-process validation of encrypted bidirectional echo, third-node absence,
+registration ownership, crash/restart cleanup, reconnection and API separation.
