@@ -1,4 +1,5 @@
 //! Symmetric direct peer routing; signed membership histories, no elected hub.
+pub mod services;
 mod transport;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -52,10 +53,26 @@ impl Invitation {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    Preview { invitation: Invitation },
-    Join { invitation: Invitation, node: Node },
-    Sync { membership: Membership },
-    Exec { head: String, input: ExecInput },
+    Preview {
+        invitation: Invitation,
+    },
+    Join {
+        invitation: Invitation,
+        node: Node,
+    },
+    Sync {
+        membership: Membership,
+    },
+    Exec {
+        head: String,
+        input: ExecInput,
+    },
+    Service {
+        version: u32,
+        head: String,
+        target: String,
+        service: String,
+    },
     Ping,
 }
 #[derive(Serialize, Deserialize)]
@@ -69,6 +86,9 @@ enum Response {
         introducer: String,
     },
     Pong,
+    ServiceReady {
+        version: u32,
+    },
     Error(String),
 }
 struct InviteRecord {
@@ -89,6 +109,8 @@ pub struct Network {
     admin: Mutex<()>,
     sync: Mutex<()>,
     execution_slots: Arc<Semaphore>,
+    services: Mutex<BTreeMap<String, services::Registration>>,
+    service_slots: Arc<Semaphore>,
     pub shutdown: CancellationToken,
 }
 impl Network {
@@ -125,6 +147,8 @@ impl Network {
             admin: Mutex::new(()),
             sync: Mutex::new(()),
             execution_slots: Arc::new(Semaphore::new(16)),
+            services: Mutex::new(BTreeMap::new()),
+            service_slots: Arc::new(Semaphore::new(32)),
             shutdown,
         }))
     }
@@ -563,6 +587,7 @@ impl Network {
     }
     async fn handle(&self, ch: &mut Channel, request: Request) -> Result<Response> {
         match request {
+            Request::Service { .. } => bail!("Service request requires stream admission"),
             Request::Preview { invitation: i } => {
                 self.check_invite(&i).await?;
                 Ok(Response::Preview {
@@ -626,7 +651,7 @@ impl Network {
             }
         });
         loop {
-            tokio::select! {_=self.shutdown.cancelled()=>break,Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},accepted=listener.accept()=>{let (stream,_)=accepted?;let Ok(permit)=slots.clone().try_acquire_owned()else{drop(stream);continue;};let network=self.clone();tasks.spawn(async move{let _permit=permit;let setup=tokio::time::timeout(Duration::from_secs(5),async{let mut ch=Channel::accept(stream,&network.identity).await?;let req=ch.receive::<Request>().await?;Ok::<_,anyhow::Error>((ch,req))}).await;let Ok(Ok((mut ch,req)))=setup else{return;};let response=match network.handle(&mut ch,req).await{Ok(r)=>r,Err(e)=>Response::Error(e.to_string())};let _=tokio::time::timeout(Duration::from_secs(5),ch.send(&response)).await;});}}
+            tokio::select! {_=self.shutdown.cancelled()=>break,Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},accepted=listener.accept()=>{let (stream,_)=accepted?;let Ok(permit)=slots.clone().try_acquire_owned()else{drop(stream);continue;};let network=self.clone();tasks.spawn(async move{let _permit=permit;let setup=tokio::time::timeout(Duration::from_secs(5),async{let mut ch=Channel::accept(stream,&network.identity).await?;let req=ch.receive::<Request>().await?;Ok::<_,anyhow::Error>((ch,req))}).await;let Ok(Ok((mut ch,req)))=setup else{return;};if let Request::Service { version, head, target, service } = req { network.incoming_service(ch, version, head, target, service).await; return; } let response=match network.handle(&mut ch,req).await{Ok(r)=>r,Err(e)=>Response::Error(e.to_string())};let _=tokio::time::timeout(Duration::from_secs(5),ch.send(&response)).await;});}}
         }
         background_tasks.abort_all();
         while background_tasks.join_next().await.is_some() {}

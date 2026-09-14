@@ -38,6 +38,52 @@ async fn recv_handshake(s: &mut TcpStream, h: &mut HandshakeState) -> Result<()>
     Ok(())
 }
 impl Channel {
+    /// Switch an admitted service connection to bounded, full-duplex records.
+    /// Each direction has one pump; encryption never holds a lock across I/O.
+    /// EOF closes both directions. Truncated TCP is an error, not a clean EOF.
+    pub async fn bridge(self, local: TcpStream) -> Result<()> {
+        use std::sync::{Arc, Mutex};
+        let noise = Arc::new(Mutex::new(self.noise));
+        let (mut peer_read, mut peer_write) = self.stream.into_split();
+        let (mut local_read, mut local_write) = local.into_split();
+        let writer = noise.clone();
+        let send = async move {
+            let mut plain = vec![0; 32769];
+            let mut encrypted = vec![0; 65535];
+            loop {
+                let n = local_read.read(&mut plain[1..]).await?;
+                plain[0] = u8::from(n == 0);
+                let len = writer
+                    .lock()
+                    .unwrap()
+                    .write_message(&plain[..n + 1], &mut encrypted)?;
+                peer_write.write_u16(len as u16).await?;
+                peer_write.write_all(&encrypted[..len]).await?;
+                if n == 0 {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        };
+        let receive = async move {
+            let mut encrypted = vec![0; 65535];
+            let mut plain = vec![0; 65535];
+            loop {
+                let len = peer_read.read_u16().await? as usize;
+                ensure!((17..=32785).contains(&len), "Invalid service record length");
+                peer_read.read_exact(&mut encrypted[..len]).await?;
+                let n = noise
+                    .lock()
+                    .unwrap()
+                    .read_message(&encrypted[..len], &mut plain)?;
+                match plain[0] {
+                    0 if n > 1 => local_write.write_all(&plain[1..n]).await?,
+                    1 if n == 1 => return Ok::<_, anyhow::Error>(()),
+                    _ => anyhow::bail!("Invalid service record"),
+                }
+            }
+        };
+        tokio::select! { r = send => r, r = receive => r }
+    }
     pub async fn connect(
         endpoint: std::net::SocketAddr,
         expected: &str,

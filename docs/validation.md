@@ -52,6 +52,35 @@ Passed formatting, workspace check, Clippy with warnings denied, release build, 
 
 All smoke processes were reaped and temporary runtime directories removed. These lifecycle checks were run on Linux; other platforms remain unvalidated.
 
+## Peer services v1 (2026-09-14)
+
+The peer-service implementation was audited against upstream `848305b`. Linux
+workspace formatting, check, Clippy with warnings denied, release build,
+`cargo test --workspace`, and diff whitespace checks passed. The workspace has
+no test cases; direct integration supplied the service validation. No repository
+tests were added.
+
+Two isolated release daemons used distinct identities, private directories and
+loopback peer endpoints on one host. Both directions passed registration/renewal,
+credential isolation, takeover rejection, non-loopback endpoint rejection,
+missing-service errors, a 32 MiB echo with byte-for-byte integrity, slow-reader
+backpressure, disconnect propagation and unregister. The MCP bearer was rejected
+by the service-open listener. A third Wayfinder member joined normally with no
+application service and did not appear as an active application peer.
+
+An application integration then ran two Norted servers and real local llama.cpp
+backends through these Noise connections. Bidirectional streamed/non-streamed
+requests, original-client cancellation, remote control, daemon disconnect and
+reconnect passed. The application protocol rejected invalid source/target/hop
+identities, incompatible versions and oversized frames. Its public API and private
+control credentials remained separate. Wayfinder carried application bytes without
+adding application concepts or using MCP/shell execution for the data plane.
+
+There is no second physical machine connected yet. These checks exercise real
+processes and authenticated peer connections on one Linux host; physical LAN,
+firewall and cross-platform behavior are not claimed by this validation. Existing
+production services were left running throughout.
+
 ## Limits of this validation
 
 This is isolated end-to-end smoke validation, not a claim of exhaustive protocol, cryptographic or distributed-systems verification. Windows/macOS execution and terminal behavior, real LAN firewall configurations, external reverse proxies/tunnels, simultaneous membership forks and disk/power-loss fault injection were not validated. The exact membership/revocation limitations and manual fork recovery are documented in [architecture.md](architecture.md).

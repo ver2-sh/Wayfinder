@@ -2,14 +2,14 @@
 
 ## Composition
 
-The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds all three listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
+The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds MCP, peer, private administration and private service-open listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
 
 | Crate | Responsibility |
 | --- | --- |
 | `wayfinder-core` | Versioned contracts, identity, configuration, signed membership validation, private atomic storage |
 | `wayfinder-exec` | Fresh local shell, input validation, bounded pipes, exit status, cancellation and process cleanup |
-| `wayfinder-network` | Noise transport, invitations, replicated membership, reachability, exact-target direct execution |
-| `wayfinder-api` | Private loopback administration and descriptor-based client |
+| `wayfinder-network` | Noise transport, invitations, replicated membership, reachability, exact-target execution and generic peer services |
+| `wayfinder-api` | Private loopback administration, service registration and descriptor-based client |
 | `wayfinder-mcp` | Official rmcp Streamable HTTP adapter; exactly `nodes` and `exec` |
 | `wayfinder-tui` | Terminal frontend using only the private API client |
 | `wayfinder` | CLI, initialization, daemon startup/shutdown, TUI attachment |
@@ -27,6 +27,15 @@ There is no web dashboard, shell session store, filesystem API, central inventor
 Connection establishment failure means nothing was dispatched. Connection loss after sending is an explicitly unknown outcome. TCP disconnect during execution cancels it on the receiver, but cancellation cannot undo side effects that already happened. Revocation does not retroactively cancel admitted executions.
 
 ## Identity and transport
+
+**Peer services:** private control registration → leased named loopback endpoint;
+private authenticated service open → exact stable node ID → existing pinned Noise
+and membership admission → registered application preface → bounded bidirectional
+byte stream. The extra service-open listener is loopback only and is published in
+`control.json`. There is no application-specific metadata in Wayfinder. See the
+[complete version-1 contract](peer-services.md) for frames, limits, cancellation,
+credential handling and failure semantics. The per-request JSON limits below
+apply to setup/RPC messages; admitted service payloads use bounded stream records.
 
 Each node generates an Ed25519 signing identity and a separate X25519 Noise static key locally using established libraries. The stable node ID is its Ed25519 verifying key in hex. Private keys are stored only in `identity.json`, never replicated, returned by MCP, logged, or injected into subprocess environments. Peer descriptors contain only public keys, display names and IP endpoints.
 

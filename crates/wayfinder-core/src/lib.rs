@@ -408,6 +408,7 @@ pub struct Status {
 #[serde(deny_unknown_fields)]
 pub struct ControlDescriptor {
     pub version: u32,
+    pub service_address: SocketAddr,
     pub address: SocketAddr,
     pub credential: String,
 }
