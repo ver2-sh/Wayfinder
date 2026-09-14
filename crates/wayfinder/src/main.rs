@@ -228,7 +228,9 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
         .await
         .context("Cannot bind peer listener")?;
     let control = TcpListener::bind("127.0.0.1:0").await?;
+    let service_listener = TcpListener::bind("127.0.0.1:0").await?;
     let descriptor = ControlDescriptor {
+        service_address: service_listener.local_addr()?,
         version: VERSION,
         address: control.local_addr()?,
         credential: random_secret(),
@@ -236,6 +238,11 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
     atomic_write(&data.join("control.json"), &descriptor)?;
     let _cleanup = DescriptorCleanup(data.join("control.json"));
     let mut services = JoinSet::new();
+    services.spawn(
+        network
+            .clone()
+            .serve_services(service_listener, descriptor.credential.clone()),
+    );
     services.spawn(wayfinder_mcp::serve(mcp, network.clone()));
     services.spawn(wayfinder_api::serve(
         control,

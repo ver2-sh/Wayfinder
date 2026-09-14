@@ -17,12 +17,34 @@ use wayfinder_network::Network;
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
-    Details { id: String },
-    Create { name: String },
-    Invite { ttl: Option<u64> },
-    Preview { invitation: String },
-    Join { invitation: String },
-    Remove { id: String, confirm: bool },
+    RegisterService {
+        service: String,
+        address: std::net::SocketAddr,
+        credential: String,
+    },
+    UnregisterService {
+        service: String,
+        credential: String,
+    },
+    Details {
+        id: String,
+    },
+    Create {
+        name: String,
+    },
+    Invite {
+        ttl: Option<u64>,
+    },
+    Preview {
+        invitation: String,
+    },
+    Join {
+        invitation: String,
+    },
+    Remove {
+        id: String,
+        confirm: bool,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
@@ -76,6 +98,23 @@ async fn control(State(api): State<Api>, Json(op): Json<Operation>) -> Json<Repl
 }
 async fn dispatch(network: &Network, op: Operation) -> Result<serde_json::Value> {
     match op {
+        Operation::RegisterService {
+            service,
+            address,
+            credential,
+        } => {
+            network
+                .register_service(service, address, credential)
+                .await?;
+            Ok(serde_json::json!({"version": 1, "lease_seconds": 60}))
+        }
+        Operation::UnregisterService {
+            service,
+            credential,
+        } => {
+            network.unregister_service(service, credential).await?;
+            Ok(serde_json::json!({"unregistered": true}))
+        }
         Operation::Status => Ok(serde_json::to_value(network.status().await)?),
         Operation::Details { id } => Ok(serde_json::to_value(network.details(&id).await?)?),
         Operation::Create { name } => {

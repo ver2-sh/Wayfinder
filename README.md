@@ -12,6 +12,13 @@ AI client → authenticated MCP → selected Wayfinder node → fresh local shel
 wayfinder tui → private loopback control API → daemon
 ```
 
+Local applications can also expose [named private peer services](docs/peer-services.md).
+An authenticated local client opens a named service on a full stable peer node
+ID; Wayfinder streams bytes through the existing Noise transport to that peer's
+registered loopback endpoint. This is independent of the two MCP tools and does
+not execute shell commands. Service registration is leased, resources are
+bounded, disconnects close both ends, and operations are never retried.
+
 This grants arbitrary shell access as the daemon's account. It is not a sandbox. Use a dedicated, least-privileged OS account with only the files and network access you intend to grant. A command can read anything that account can read, including Wayfinder's own private files; credential separation does not protect against an authorized shell client or a compromised member.
 
 ## Build and run
