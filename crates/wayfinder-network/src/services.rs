@@ -1,41 +1,28 @@
 //! Generic private peer services. No application protocol is interpreted here.
 use super::{Channel, Network, Request, Response};
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{net::SocketAddr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
+    net::TcpStream,
 };
 use wayfinder_core::secret_eq;
 
 pub const SERVICE_VERSION: u32 = 1;
 pub const HEADER_LIMIT: usize = 16384;
-const LEASE: Duration = Duration::from_secs(60);
 const SETUP: Duration = Duration::from_secs(5);
 
 pub(super) struct Registration {
     address: SocketAddr,
     credential: String,
-    expires: Instant,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Open {
-    version: u32,
-    credential: String,
-    target: String,
-    service: String,
+    owner: String,
 }
 
 /// One u32 big-endian length followed by UTF-8 JSON; never line delimited.
-pub async fn read_json<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
+pub async fn read_json<T: DeserializeOwned>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<T> {
     let len = stream.read_u32().await? as usize;
     ensure!(
         (1..=HEADER_LIMIT).contains(&len),
@@ -45,7 +32,10 @@ pub async fn read_json<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T>
     stream.read_exact(&mut data).await?;
     Ok(serde_json::from_slice(&data)?)
 }
-pub async fn write_json<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+pub async fn write_json<T: Serialize>(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    value: &T,
+) -> Result<()> {
     let data = serde_json::to_vec(value)?;
     ensure!(data.len() <= HEADER_LIMIT, "Service header too large");
     stream.write_u32(data.len() as u32).await?;
@@ -64,12 +54,13 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 impl Network {
-    /// Renewal requires the original registration credential; takeover is never implicit.
+    /// Registrations belong to a live local session; takeover is never implicit.
     pub async fn register_service(
         &self,
         service: String,
         address: SocketAddr,
         credential: String,
+        owner: String,
     ) -> Result<()> {
         validate_name(&service)?;
         ensure!(
@@ -81,10 +72,11 @@ impl Network {
             "Service credential must be 256-bit hex"
         );
         let mut services = self.services.lock().await;
-        services.retain(|_, entry| entry.expires > Instant::now());
         if let Some(entry) = services.get(&service) {
             ensure!(
-                secret_eq(&credential, &entry.credential) && address == entry.address,
+                entry.owner == owner
+                    && secret_eq(&credential, &entry.credential)
+                    && address == entry.address,
                 "Service already registered by another instance"
             );
         } else {
@@ -95,16 +87,16 @@ impl Network {
             Registration {
                 address,
                 credential,
-                expires: Instant::now() + LEASE,
+                owner,
             },
         );
         Ok(())
     }
-    pub async fn unregister_service(&self, service: String, credential: String) -> Result<()> {
+    pub async fn unregister_service(&self, service: String, owner: String) -> Result<()> {
         let mut services = self.services.lock().await;
         if let Some(entry) = services.get(&service) {
             ensure!(
-                secret_eq(&credential, &entry.credential),
+                entry.owner == owner,
                 "Service registration credential mismatch"
             );
             services.remove(&service);
@@ -117,8 +109,7 @@ impl Network {
             let services = self.services.lock().await;
             let entry = services
                 .get(service)
-                .filter(|e| e.expires > Instant::now())
-                .context("Service unavailable: not registered or lease expired")?;
+                .context("Service unavailable: not registered")?;
             (entry.address, entry.credential.clone())
         };
         let mut stream = TcpStream::connect(address)
@@ -202,7 +193,7 @@ impl Network {
         }
         tokio::select! { _ = self.shutdown.cancelled() => {}, _ = channel.bridge(stream) => {} }
     }
-    async fn open_peer_service(&self, target: &str, service: &str) -> Result<Channel> {
+    pub(crate) async fn open_peer_service(&self, target: &str, service: &str) -> Result<Channel> {
         self.ensure_active().await?;
         validate_name(service)?;
         let membership = self.membership().await;
@@ -235,57 +226,13 @@ impl Network {
             _ => bail!("Unsupported or invalid peer service response"),
         }
     }
-    /// Separate authenticated local byte-stream listener; never part of MCP.
-    pub async fn serve_services(
-        self: Arc<Self>,
-        listener: TcpListener,
-        credential: String,
-        service: String,
-    ) -> Result<()> {
-        ensure!(
-            listener.local_addr()?.ip().is_loopback(),
-            "Service control must bind loopback"
-        );
-        let mut tasks = JoinSet::new();
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => break,
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-                accepted = listener.accept() => {
-                    let (mut local, _) = accepted?;
-                    let Ok(permit) = self.service_slots.clone().try_acquire_owned() else {
-                        // Bound rejection work along with admitted streams.
-                        let _ = tokio::time::timeout(Duration::from_millis(100), write_json(&mut local, &serde_json::json!({"version": 1, "error": "Service stream capacity reached"}))).await;
-                        continue;
-                    };
-                    let network = self.clone();
-                    let credential = credential.clone();
-                    let service = service.clone();
-                    tasks.spawn(async move {
-                        let _permit = permit;
-                        let setup = tokio::time::timeout(SETUP, async {
-                            let open: Open = read_json(&mut local).await?;
-                            ensure!(secret_eq(&open.credential, &credential), "Invalid local service credential");
-                            ensure!(open.service == service, "Service outside capability scope");
-                            ensure!(open.version == SERVICE_VERSION, "Unsupported service protocol version");
-                            network.open_peer_service(&open.target, &open.service).await
-                        }).await;
-                        match setup {
-                            Ok(Ok(channel)) => {
-                                if !matches!(tokio::time::timeout(SETUP, write_json(&mut local, &serde_json::json!({"version": 1, "ready": true}))).await, Ok(Ok(()))) { return; }
-                                tokio::select! { _ = network.shutdown.cancelled() => {}, _ = channel.bridge(local) => {} }
-                            }
-                            other => {
-                                let message = match other { Ok(Err(e)) => e.to_string(), _ => "Service open timed out; no application bytes dispatched".into() };
-                                let _ = tokio::time::timeout(SETUP, write_json(&mut local, &serde_json::json!({"version": 1, "error": message}))).await;
-                            }
-                        }
-                    });
-                }
-            }
-        }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-        Ok(())
+    pub async fn registered_services(&self) -> Vec<String> {
+        self.services.lock().await.keys().cloned().collect()
+    }
+    pub(crate) async fn remove_session(&self, owner: &str) {
+        self.services
+            .lock()
+            .await
+            .retain(|_, registration| registration.owner != owner);
     }
 }

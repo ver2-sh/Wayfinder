@@ -201,38 +201,8 @@ C Copy invite (OSC 52)  Q Quit"),areas[4]);
                             }
                             message = serde_json::to_string_pretty(&value)?;
                             if is_applications {
-                                service_text.clear();
-                                for service in value["configured"].as_array().into_iter().flatten()
-                                {
-                                    let active = value["active"]
-                                        .as_array()
-                                        .is_some_and(|items| items.contains(service));
-                                    service_text.push_str(&format!(
-                                        "{} · {}\n{}\n",
-                                        service["service"].as_str().unwrap_or(""),
-                                        if active {
-                                            "local capability active"
-                                        } else {
-                                            "pending daemon restart"
-                                        },
-                                        service["capability"].as_str().unwrap_or("")
-                                    ));
-                                }
-                                if service_text.is_empty() {
-                                    service_text = "No configured application services.".into();
-                                }
-                                for service in value["active"].as_array().into_iter().flatten() {
-                                    if !value["configured"]
-                                        .as_array()
-                                        .is_some_and(|items| items.contains(service))
-                                    {
-                                        service_text.push_str(&format!(
-                                            "\n{} · removal pending daemon restart\n",
-                                            service["service"].as_str().unwrap_or("")
-                                        ));
-                                    }
-                                }
-                                message = "Configure with CLI:\nwayfinder services add SERVICE --capability /absolute/path [--group GID]\nwayfinder services remove SERVICE\nRestart daemon to apply changes. V returns to nodes.".into();
+                                service_text = serde_json::to_string_pretty(&value["active"])?;
+                                message = "Live application registrations (read only). Applications register automatically. V returns to nodes.".into();
                             }
                             mode = if preview {
                                 Mode::ConfirmJoin(input.clone())

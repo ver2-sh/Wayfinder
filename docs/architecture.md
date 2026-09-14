@@ -2,7 +2,7 @@
 
 ## Composition
 
-The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds MCP, peer, private administration and private service-open listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
+The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds MCP, peer, private administration and Unix application listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -28,15 +28,16 @@ Connection establishment failure means nothing was dispatched. Connection loss a
 
 ## Identity and transport
 
-**Peer services:** scoped application capability registration → leased named loopback endpoint;
-private authenticated service open → exact stable node ID → existing pinned Noise
-and membership admission → registered application preface → bounded bidirectional
-byte stream. The extra service-open listener is loopback only and is published in
-a separate service-scoped capability descriptor. Both daemon and TUI startup load
-the persistent configured service set. There is no application-specific metadata in Wayfinder. See the
-[complete version-1 contract](peer-services.md) for frames, limits, cancellation,
-credential handling and failure semantics. The per-request JSON limits below
-apply to setup/RPC messages; admitted service payloads use bounded stream records.
+**Peer services:** live Unix application session → ephemeral named loopback endpoint;
+Unix service open → exact stable node ID → existing pinned Noise and membership
+admission → registered application preface → bounded bidirectional byte stream.
+The automatic application socket is separate from MCP, administration and peer
+networking. Registrations belong to live sessions and are removed on disconnect.
+Both daemon and TUI startup expose the same interface. No application metadata,
+persistent service configuration or replicated service catalogue is maintained.
+See the [local application contract](peer-services.md) for discovery, authorization,
+frames, limits and cancellation. The per-request JSON limits below apply to
+setup/RPC messages; admitted service payloads use bounded stream records.
 
 Each node generates an Ed25519 signing identity and a separate X25519 Noise static key locally using established libraries. The stable node ID is its Ed25519 verifying key in hex. Private keys are stored only in `identity.json`, never replicated, returned by MCP, logged, or injected into subprocess environments. Peer descriptors contain only public keys, display names and IP endpoints.
 

@@ -41,11 +41,14 @@ impl Channel {
     /// Switch an admitted service connection to bounded, full-duplex records.
     /// Each direction has one pump; encryption never holds a lock across I/O.
     /// EOF closes both directions. Truncated TCP is an error, not a clean EOF.
-    pub async fn bridge(self, local: TcpStream) -> Result<()> {
+    pub async fn bridge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        self,
+        local: S,
+    ) -> Result<()> {
         use std::sync::{Arc, Mutex};
         let noise = Arc::new(Mutex::new(self.noise));
         let (mut peer_read, mut peer_write) = self.stream.into_split();
-        let (mut local_read, mut local_write) = local.into_split();
+        let (mut local_read, mut local_write) = tokio::io::split(local);
         let writer = noise.clone();
         let send = async move {
             let mut plain = vec![0; 32769];
