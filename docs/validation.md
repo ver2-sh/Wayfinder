@@ -1,5 +1,101 @@
 # Validation record
 
+## Peer-service privilege boundary revalidation — 2026-09-14
+
+This pass starts from Wayfinder `1cb5cbc5488eb7404f07074bf28813a34eb7985a`
+and Norted-Server `499de722494ab361c5211cc8998845b14c562a08`. Changes remain
+local and unpushed. Earlier results below describe the previous implementation;
+the application credential instructions in the current peer-service/Link docs
+supersede that implementation's full-control discovery contract.
+
+Wayfinder now publishes an explicit, separate `PeerServiceDescriptor` for each
+`daemon --peer-service SERVICE=/absolute/path` option. The random capability is
+independent of administration and MCP credentials. `/peer-service` decodes only
+sanitized status, registration/renewal and unregistration. Both this API and the
+local stream listener enforce the configured service name. The administrator's
+`/control` authority is retained; its descriptor no longer advertises a transport
+listener. Norted uses only `link.wayfinder_peer_service`, with no old-path fallback.
+
+### Existing workspace checks
+
+Wayfinder passed `cargo fmt --all -- --check`, `cargo check --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+(no repository test cases), `cargo build --release`, and `git diff --check`.
+Norted passed `./validate.sh` (214 tests passed, one existing ignored),
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo build -p norted-server`, `cargo build --release -p norted-server`, and
+`git diff --check`. No repository tests were added.
+
+### Isolated boundary proof
+
+External driver `security.py` passed 58 assertions against two fresh Wayfinder
+instances using the final release binary:
+
+- Observation contains only `nodes` and `conflict`; every node contains exactly
+  `id`, `name`, `local`, and `reachable`.
+- Service capability differs from both admin and MCP credentials.
+- Admin status/details/create/invite/join/remove reject the service bearer with
+  HTTP 401. Administrative operations also fail the service API decoder (422).
+- MCP rejects the service bearer (401). Private identity/config/state paths and
+  `/control` do not exist on the service endpoint (404).
+- Register/unregister/open of an unrelated service name fail scope checks.
+  The admin bearer also fails authentication at the application stream listener.
+- Registration, renewal, unregistration, unavailable-after-unregister and actual
+  bidirectional Noise echo streams pass.
+- A separate Unix UID (65534), granted only the 0600 capability file, successfully
+  observes members while filesystem reads of identity.json, config.json,
+  state.json and control.json all fail with PermissionError.
+
+### Norted regression
+
+The prior two-node smoke/failure drivers were adapted outside the repositories
+to use the new capability paths. Fresh Wayfinder identities and independent
+Norted profiles reference an existing GGUF and llama.cpp binary; no model/runtime
+bytes are copied. An old setup-driver assumption about Norted's runtime descriptor
+location failed initially; the driver was corrected to use `runtime/servers`.
+This was a harness failure, not an application failure.
+
+Both Norted processes then ran in private mount namespaces masking their
+Wayfinder private directories with empty directories. `/proc/PID/root` checks
+confirmed that neither process could see Wayfinder identity/config/state/control
+files. The separate service descriptors remained visible. With that restriction:
+
+- `smoke.py`: 42 assertions passed, both A→B and B→A. Discovery, remote inventories,
+  local and qualified remote inference, nonstreaming/streaming Chat Completions,
+  Responses and Completions, owner embedding capability rejection, streaming and
+  nonstreaming cancellation, owner load/unload, no JIT load and state refresh.
+- `failures.py`: 44 assertions passed. Source/target/hop/version/size/operation
+  rejection, exact owner routing, deterministic duplicate aliases, no fallback
+  after owner profile removal, explicit interrupted-stream error, stale peer
+  handling, local inference during Wayfinder loss, reconnect and restored remote
+  inference in both directions. Independent profile stores remained intact and
+  neither model nor runtime installations appeared in the peer data directories.
+
+- `tui.py` and `tui-actions.py`: real Ratatui captures show both nodes in
+  Models/Overview and the selected remote owner in Profiles; 16 action assertions
+  passed for owner load/unload, unchanged local backends/profile files, disabled
+  remote editing and local-only Runtime views.
+- `cleanup.py`: 12 capture/lifecycle assertions passed. Isolated TUIs, Norted
+  servers, native backends and Wayfinder daemons were stopped; Norted listeners
+  closed and administration/application capability descriptors were removed.
+  Production processes were not targeted.
+
+Reproduction commands (drivers are intentionally outside the repositories):
+`python3 security.py`, `python3 setup.py` with its runtime descriptor lookup
+corrected by `python3 load.py`, `python3 restricted.py`, `python3 load.py`,
+`python3 smoke.py`, `python3 failures.py`, `python3 tui.py`,
+`python3 tui-actions.py`, and `python3 cleanup.py` from the scratch directory.
+
+Scripts, logs and assertion records are in
+`/srv/norted/scratch/norted-link-boundary`, outside both repositories. This is
+real multi-process Linux/llama.cpp validation on one host; no second physical
+machine or Windows/macOS deployment was tested. Existing q27/NInfer/DFlash2/vision
+contracts passed workspace checks; no new hardware inference runs for those
+engines are claimed. No federation semantics or runtime/model implementations
+were changed. Capability files are ephemeral: regrant application file access
+after restart and explicitly remove a stale descriptor after an unclean stop.
+
+
 Validated on Linux with Rust/Cargo 1.98.0. No new repository test suite was added. Temporary external smoke drivers exercised actual daemon processes and the real control, MCP and encrypted peer transports.
 
 ## Static checks and build

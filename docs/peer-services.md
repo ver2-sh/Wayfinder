@@ -8,16 +8,36 @@ own authorization within the trusted membership boundary.
 
 ## Local contract
 
-Run the application under the account allowed to read Wayfinder's private
-`control.json`. Its version-1 descriptor contains `address`, `service_address`,
-and `credential`. Both addresses are loopback sockets. `credential` is the
-ephemeral private control credential, distinct from the MCP bearer. Read the
-descriptor again after daemon restart; never copy credentials between machines.
-The existing 0700 directory / 0600 file rules apply on Unix. Restrict Windows
-ACLs to the intended account.
+The administrator starts Wayfinder with an explicit application capability:
 
-Register by POSTing JSON to `http://<address>/control` with
-`Authorization: Bearer <credential>`, a loopback Host, and no Origin:
+```sh
+wayfinder daemon --peer-service example.service.v1=/run/wayfinder-app/example.json
+```
+
+The parent directory must already exist, and the absolute descriptor path must
+be outside Wayfinder's private data directory. The option is repeatable for
+separate services. The daemon writes a 0600 descriptor with `version: 1`,
+`service`, loopback `address` and `service_address`, and a random 256-bit
+`credential`. Grant the application read access only to this file (for example,
+transfer file ownership to its dedicated account); keep the parent writable only
+by the Wayfinder administrator. Use equivalent restricted Windows ACLs.
+No access to the private Wayfinder directory is needed. Reapply the file grant
+after daemon restart; the capability is ephemeral and clients reread the path.
+Normal shutdown removes it; remove a stale descriptor explicitly after a crash.
+
+This credential is cryptographically separate from both administration and MCP.
+It authorizes only its exact service name for registration and opening. It cannot
+create/join/invite/remove membership, execute shell commands, or read identity,
+configuration, MCP bearer or durable state. `/control` remains the private,
+high-privilege TUI/CLI administration contract. Norted Link is an application
+protocol over this generic transport; Wayfinder has no Norted-specific behavior.
+
+POST `{"op":"status"}` to `http://<address>/peer-service` with
+`Authorization: Bearer <credential>`, a loopback Host and no Origin. Its `value`
+contains only `nodes` (stable `id`, display `name`, `local`, `reachable`) and
+`conflict`. No keys or network configuration are returned.
+
+Register through the same `/peer-service` endpoint:
 
 ```json
 {
@@ -28,7 +48,7 @@ Register by POSTing JSON to `http://<address>/control` with
 }
 ```
 
-The response uses the normal control `value` / `error` envelope. Successful
+The response uses the `value` / `error` envelope. Successful
 registration returns `{"version":1,"lease_seconds":60}`. Renew before 60 seconds
 by sending the same service, endpoint and application credential. An unexpired
 registration cannot be overwritten with another credential or address. Removal
@@ -49,7 +69,7 @@ big-endian unsigned JSON byte length followed by UTF-8 JSON:
 ```json
 {
   "version": 1,
-  "credential": "<local control credential>",
+  "credential": "<scoped peer-service capability credential>",
   "target": "<full stable peer node ID>",
   "service": "example.service.v1"
 }

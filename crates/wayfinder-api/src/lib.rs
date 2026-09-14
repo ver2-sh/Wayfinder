@@ -195,3 +195,111 @@ impl Client {
         Ok(serde_json::from_value(self.call(Operation::Status).await?)?)
     }
 }
+
+/// An application capability has no administration operations in its decoder.
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum ServiceOperation {
+    Status,
+    RegisterService {
+        service: String,
+        address: std::net::SocketAddr,
+        credential: String,
+    },
+    UnregisterService {
+        service: String,
+        credential: String,
+    },
+}
+#[derive(Clone)]
+struct ServiceApi {
+    network: Arc<Network>,
+    credential: String,
+    service: String,
+}
+async fn service_guard(State(api): State<ServiceApi>, req: Request, next: Next) -> Response {
+    if req.uri().path() != "/peer-service" || req.uri().query().is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if req.headers().contains_key("origin") || !allowed_host(&req) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(bearer_value)
+        .unwrap_or("");
+    if !secret_eq(token, &api.credential) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(req).await
+}
+async fn service_control(
+    State(api): State<ServiceApi>,
+    Json(op): Json<ServiceOperation>,
+) -> Json<Reply> {
+    let result: Result<serde_json::Value> = async {
+        match op {
+            ServiceOperation::Status => {
+                let status = api.network.status().await;
+                Ok(serde_json::json!({"nodes": status.nodes, "conflict": status.conflict}))
+            }
+            ServiceOperation::RegisterService {
+                service,
+                address,
+                credential,
+            } => {
+                ensure!(service == api.service, "Service outside capability scope");
+                api.network
+                    .register_service(service, address, credential)
+                    .await?;
+                Ok(serde_json::json!({"version": 1, "lease_seconds": 60}))
+            }
+            ServiceOperation::UnregisterService {
+                service,
+                credential,
+            } => {
+                ensure!(service == api.service, "Service outside capability scope");
+                api.network.unregister_service(service, credential).await?;
+                Ok(serde_json::json!({"unregistered": true}))
+            }
+        }
+    }
+    .await;
+    Json(match result {
+        Ok(value) => Reply {
+            value: Some(value),
+            error: None,
+        },
+        Err(e) => Reply {
+            value: None,
+            error: Some(e.to_string()),
+        },
+    })
+}
+pub async fn serve_peer_service(
+    listener: TcpListener,
+    network: Arc<Network>,
+    credential: String,
+    service: String,
+) -> Result<()> {
+    ensure!(
+        listener.local_addr()?.ip().is_loopback(),
+        "Peer service API must bind loopback"
+    );
+    let api = ServiceApi {
+        network: network.clone(),
+        credential,
+        service,
+    };
+    let app = Router::new()
+        .route("/peer-service", post(service_control))
+        .layer(DefaultBodyLimit::max(16384))
+        .layer(middleware::from_fn_with_state(api.clone(), service_guard))
+        .with_state(api);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(network.shutdown.clone().cancelled_owned())
+        .await?;
+    Ok(())
+}
