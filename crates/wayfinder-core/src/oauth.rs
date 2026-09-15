@@ -67,14 +67,23 @@ pub fn scope(value: &BTreeSet<Capability>) -> String {
 }
 #[derive(Deserialize)]
 pub struct Authorization {
+    #[serde(default)]
     pub response_type: String,
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: Option<String>,
     pub state: Option<String>,
+    #[serde(default)]
     pub resource: String,
+    #[serde(default)]
     pub code_challenge: String,
+    #[serde(default)]
     pub code_challenge_method: String,
+}
+/// Only errors constructed after exact client/redirect validation may leave the host.
+pub enum AuthorizationError {
+    Local,
+    Redirect(String),
 }
 #[derive(Clone, Serialize)]
 pub struct Approval {
@@ -118,31 +127,55 @@ impl OAuth {
             state: Mutex::new(FlowState::default()),
         })
     }
-    pub fn begin(&self, a: Authorization) -> Result<String> {
-        let client = self.credentials.oauth_client(&a.client_id, None)?;
-        ensure!(
-            a.response_type == "code"
-                && a.redirect_uri == client.redirect_uri
-                && a.resource == self.issuer
-                && a.code_challenge_method == "S256"
-                && a.code_challenge.len() == 43
-                && URL_SAFE_NO_PAD
-                    .decode(&a.code_challenge)
-                    .is_ok_and(|v| v.len() == 32)
-                && a.state.as_ref().is_none_or(|s| s.len() <= 2048),
-            "invalid_request"
-        );
-        let permissions = permissions(a.scope.as_deref().unwrap_or("read"))?;
+    pub fn begin(&self, a: Authorization) -> Result<String, AuthorizationError> {
+        let client = self
+            .credentials
+            .oauth_client(&a.client_id, None)
+            .map_err(|_| AuthorizationError::Local)?;
+        if a.redirect_uri != client.redirect_uri {
+            return Err(AuthorizationError::Local);
+        }
+        // Parse the registered URI, never an untrusted request URI. Keep the exact
+        // comparison above; URL normalization is not redirect validation.
+        let redirect = Url::parse(&client.redirect_uri).map_err(|_| AuthorizationError::Local)?;
+        let failure = |code| {
+            let mut uri = redirect.clone();
+            let mut q = uri.query_pairs_mut();
+            q.append_pair("error", code)
+                .append_pair("iss", &self.issuer);
+            if let Some(s) = &a.state {
+                q.append_pair("state", s);
+            }
+            drop(q);
+            AuthorizationError::Redirect(uri.into())
+        };
+        if a.response_type.is_empty() {
+            return Err(failure("invalid_request"));
+        }
+        if a.response_type != "code" {
+            return Err(failure("unsupported_response_type"));
+        }
+        if !(a.resource == self.issuer
+            && a.code_challenge_method == "S256"
+            && a.code_challenge.len() == 43
+            && URL_SAFE_NO_PAD
+                .decode(&a.code_challenge)
+                .is_ok_and(|v| v.len() == 32)
+            && a.state.as_ref().is_none_or(|s| s.len() <= 2048))
+        {
+            return Err(failure("invalid_request"));
+        }
+        let permissions = permissions(a.scope.as_deref().unwrap_or("read"))
+            .map_err(|_| failure("invalid_scope"))?;
         let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("OAuth unavailable"))?;
+            .map_err(|_| failure("temporarily_unavailable"))?;
         state.pending.retain(|_, p| p.approval.expires > now());
         state.codes.retain(|_, c| c.expires > now());
-        ensure!(
-            state.pending.len() + state.codes.len() < 64,
-            "temporarily_unavailable"
-        );
+        if state.pending.len() + state.codes.len() >= 64 {
+            return Err(failure("temporarily_unavailable"));
+        }
         let ticket = random_secret();
         state.pending.insert(
             digest(ticket.as_bytes()),

@@ -154,6 +154,10 @@ identity provider or hosted user account is required.
    a flow you initiated. Default approval is read only; requested permissions are
    an upper bound. `exec` permits shell execution as the daemon account. Return
    to the same browser page and refresh it to complete the OAuth redirect.
+   The initial OAuth-enabled MCP 401 challenge explicitly requests `read exec`
+   and supplies the protected-resource metadata URL. A client must request `exec`
+   to receive it; an authorization request omitting `scope` still defaults to
+   `read`, and local approval never grants more than the requested scopes.
 5. ChatGPT exchanges the one-use code and supplies the bearer token itself. Ask
    it to call Wayfinder `nodes`, then run `printf connected` on a selected node.
 
@@ -163,6 +167,12 @@ tokens rotate and the grant expires after 30 days, then reconnect with a new gra
 name. A refresh invalidates the previous access token. Reusing a consumed refresh
 token revokes the grant; after a lost refresh response, reconnect rather than
 retrying the old refresh token indefinitely.
+
+Successful authorization redirects and safe-to-redirect authorization errors
+include the exact configured issuer in `iss` and preserve supplied `state`.
+Errors redirect only after the registered client and its exact redirect URI
+have been validated. Unknown clients, mismatched redirects, and requests that
+cannot be unambiguously parsed fail locally without a callback redirect.
 
 Details and callback rules: [OpenAI authentication documentation](https://developers.openai.com/apps-sdk/build/auth).
 OAuth is generic; no ChatGPT-specific hostname or routing appears in the code.
@@ -212,8 +222,23 @@ The native rmcp 3.3.0 stateless HTTP service supports current 2026-07-28 discove
 and legacy initialization. It owns protocol headers, JSON/SSE negotiation, body
 limits, errors and disconnect cancellation. No custom MCP transport or session
 manager is introduced. Unauthenticated MCP requests receive 401 with a Bearer
-challenge (OAuth metadata URL when enabled). Wrong capabilities fail in tool
-handlers. Unknown routes, including the removed `/mcp`, return 404.
+challenge (protected-resource metadata URL and `scope="read exec"` when OAuth is
+enabled; only the Bearer realm otherwise). Wrong capabilities fail before tool
+execution. With OAuth enabled, the errored tool result carries
+`_meta["mcp/www_authenticate"]` with `error="insufficient_scope"`, the required
+scope (`read` for `nodes`, `exec` for `exec`), an error description, and the
+protected-resource metadata URL. Tool descriptors publish the corresponding
+OAuth scopes through OpenAI's documented `_meta["securitySchemes"]` compatibility
+field, supported by rmcp's native metadata representation. Bearer-only mode
+advertises no OAuth metadata and retains its existing capability error.
+
+This uses OpenAI's [tool-level recovery contract](https://developers.openai.com/plugins/build/auth#triggering-authentication-ui)
+and [metadata representation](https://developers.openai.com/plugins/reference#_meta-fields-on-tool-descriptor).
+rmcp 3.3.0 has no server-handler API for an HTTP insufficient-scope challenge;
+its native tool error result travels over HTTP 200. Clients that only implement
+HTTP 403 scope recovery, rather than this tool-result metadata, cannot step up
+automatically. Reauthorization still requires explicit local administrator
+approval. Unknown routes, including the removed `/mcp`, return 404.
 
 References: [current MCP transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http),
 [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization).
