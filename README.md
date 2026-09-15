@@ -34,7 +34,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Personal source-development endpoint (service installation uses /run/wayfinder).
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wayfinder-$(id -u)}"
-./target/release/wayfinder init --name server
+./target/release/wayfinder init --name server --mcp-enabled
 ./target/release/wayfinder daemon
 ```
 
@@ -70,7 +70,7 @@ wayfinder init --name storage \
 wayfinder daemon
 ```
 
-The MCP listener stays at `127.0.0.1:3000` on both machines. Permit the peer port between the intended machines.
+MCP is disabled by default. Enable it only on desired entry nodes; its default address is `127.0.0.1:3000`. Permit the peer port between the intended machines.
 
 1. Open A's TUI. Press `N`, enter a network name, and press Enter.
 2. Press `A` to generate an invitation. Press `C` to copy it using the terminal's OSC 52 clipboard support. If the terminal does not permit clipboard access, use the private CLI operation below to obtain the single-line invitation.
@@ -84,13 +84,40 @@ Use arrow keys and Enter for node details. `R` removes a selected remote node af
 
 ## MCP client setup
 
-Explicitly obtain this node's MCP token for your client:
+Enable `mcp_enabled` in `config.json` while stopped, or initialize a new node with
+`--mcp-enabled`. Start the daemon, then create a client credential:
 
 ```sh
-wayfinder token
+wayfinder auth create codex --permissions read,exec
+wayfinder auth list
+wayfinder auth revoke codex
 ```
 
-Keep the output private. Configure a Streamable HTTP client with `http://127.0.0.1:3000/mcp` and `Authorization: Bearer <token>` on every request. The server uses the [official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk), locked to the Cargo.lock dependency graph. The SDK handles initialization, tool discovery, protocol negotiation, JSON responses and SSE where required. This deployment uses stateless requests and configured bearer authentication, not OAuth discovery. Unknown paths, including OAuth discovery probes, return clean 404 responses before authentication.
+Creation displays the token once. The default permission is **read only**. List
+shows public metadata and Unix timestamps, never secrets or hashes. Revocation
+applies to subsequent requests immediately; it does not undo admitted commands.
+Use a new name for rotation, configure the replacement, then revoke the old name.
+
+Configure a Streamable HTTP client with `http://127.0.0.1:3000/` locally, or your
+HTTPS origin remotely, and `Authorization: Bearer <token>` on every request.
+The [official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)
+(`rmcp` 3.3.0, locked in Cargo.lock) owns protocol negotiation, initialization,
+discovery, JSON/SSE responses and cancellation. The endpoint is **`/`**; `/mcp`
+is removed. Local HTTP remains supported; there was no stdio MCP mode.
+
+ChatGPT's developer-mode UI requires OAuth for authenticated connections.
+Wayfinder also provides installation-local OAuth with PKCE, private CLI consent,
+and the same credential store. See the complete [HTTPS and ChatGPT setup](docs/remote-mcp.md).
+
+| Authority | Operations |
+| --- | --- |
+| `read` | MCP `nodes` |
+| `exec` | MCP `exec`, local or across existing peers |
+| Local administrator | Credential and network management through private control |
+
+Capabilities are independent. There is no remotely grantable `admin` permission
+or administrative MCP tool. An authorized shell still has the daemon account's
+OS privileges, including access to its private files.
 
 `nodes` returns stable IDs, unique names, the entry-node flag `local`, and `reachable` (last successful membership exchange). It does not disclose endpoints, peer keys, or secrets. Reachability is an observation, not a guarantee that the next request will succeed.
 
@@ -126,25 +153,16 @@ There are at most 16 local executions and 64 inbound peer connections per node. 
 
 ## Expose one MCP entry point
 
-Keep the backend on loopback and expose **only the chosen node's MCP endpoint** through HTTPS or an encrypted tunnel. The backend rejects browser Origin headers and validates Host to prevent DNS rebinding. The proxy must preserve Authorization and rewrite Host to the loopback backend. Do not inject a shared bearer at the proxy.
-
-For example, with Caddy on that machine:
-
-```caddyfile
-wayfinder.example.com {
-    reverse_proxy 127.0.0.1:3000 {
-        header_up Host 127.0.0.1:3000
-    }
-}
-```
-
-Use `https://wayfinder.example.com/mcp` in the client. Keep upstream response timeouts above 310 seconds and disable response buffering where necessary. A tunnel must provide encrypted remote transport and the same Host rewrite. Provider-specific tunnel credentials, organization/tenant selection, and control-plane authentication belong in that tunnel integration, not in Wayfinder; configure required provider context explicitly rather than relying on implicit account state. Never expose the private control listener. Other members' MCP ports do not need exposure; the selected gateway routes over authenticated Noise connections.
+Use a reverse proxy to terminate HTTPS and forward to `127.0.0.1:3000`.
+Wayfinder authenticates clients; the proxy preserves Authorization and rewrites
+Host to loopback. Only MCP and OAuth routes are exposed. No OpenAI Tunnel is
+required. See [the Caddy example and operator runbook](docs/remote-mcp.md).
 
 ## Configuration and private control
 
-`init` writes private `config.json`, `identity.json`, and `state.json`. The configuration has a version, node name, `mcp_listen`, `mcp_token`, `peer_listen`, and `peer_advertise`. Defaults are `127.0.0.1:3000` for MCP and `127.0.0.1:3001` for peers. Binding public or LAN interfaces requires explicit configuration. Peer encryption does not encrypt a directly exposed HTTP MCP listener.
+`init` writes private `config.json`, `identity.json`, and `state.json`. The configuration has a version, node name, `mcp_enabled`, `mcp_listen`, optional `mcp_public_url`, `peer_listen`, and `peer_advertise`. No bearer secret is stored in configuration. The daemon owns private `credentials.json`, using the existing atomic JSON storage. Defaults are `127.0.0.1:3000` for MCP and `127.0.0.1:3001` for peers. Binding public or LAN interfaces requires explicit configuration. Peer encryption does not encrypt a directly exposed HTTP MCP listener.
 
-Edit configuration only while that daemon is stopped. Restart to change MCP configuration or rotate its bearer. Linked node names, peer keys and advertised endpoints are immutable in this first schema: remove the old node and initialize a fresh identity/directory for a changed descriptor. Do not copy an identity directory to another machine. Keep private backups; missing or malformed identity/state fails startup rather than silently replacing the node.
+Edit configuration only while that daemon is stopped. Restart to change listener configuration. Credentials are created/revoked live through the private API. For older unreleased configurations, remove `mcp_token` and add `mcp_enabled` and `mcp_public_url` while stopped; see the [existing-host cutover](docs/remote-mcp.md#existing-norted-host-cutover). Linked node names, peer keys and advertised endpoints are immutable in this first schema: remove the old node and initialize a fresh identity/directory for a changed descriptor. Do not copy an identity directory to another machine. Keep private backups; missing or malformed identity/state fails startup rather than silently replacing the node.
 
 The daemon publishes `control.json` with an ephemeral loopback address and a separate random credential. The TUI reads this descriptor; it receives no execution/network managers. The descriptor is atomically replaced on startup and removed at graceful shutdown. The TUI verifies control API liveness; a stale descriptor after a crash does not count as a running daemon. MCP credentials cannot authorize control, and control credentials cannot authorize MCP. On Unix directories are mode 0700 and private files 0600; insecure file modes are rejected. Windows users must restrict the directory's ACL to the daemon account; Unix permission enforcement has no Windows equivalent here.
 

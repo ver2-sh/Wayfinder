@@ -3042,6 +3042,7 @@ dependencies = [
  "sha2",
  "snow",
  "subtle",
+ "url",
 ]
 
 [[package]]
@@ -3061,11 +3062,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "rmcp",
  "schemars",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "url",
  "wayfinder-core",
  "wayfinder-network",
 ]

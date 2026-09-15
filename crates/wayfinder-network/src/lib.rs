@@ -285,6 +285,7 @@ impl Network {
                 .collect(),
             mcp_listen: self.config.mcp_listen,
             mcp_authenticated: true,
+            mcp_enabled: self.config.mcp_enabled,
             peer_listen: self.config.peer_listen,
             conflict: s.persistent.conflict,
             revision: m.revisions.len(),

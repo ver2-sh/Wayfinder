@@ -15,6 +15,8 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+pub mod credentials;
+pub mod oauth;
 pub const VERSION: u32 = 1;
 pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 pub const PROLOGUE: &[u8] = b"wayfinder-peer-v1";
@@ -69,7 +71,8 @@ pub struct Config {
     pub mcp_listen: SocketAddr,
     pub peer_listen: SocketAddr,
     pub peer_advertise: SocketAddr,
-    pub mcp_token: String,
+    pub mcp_enabled: bool,
+    pub mcp_public_url: Option<String>,
 }
 impl Config {
     pub fn new(
@@ -84,7 +87,8 @@ impl Config {
             mcp_listen,
             peer_listen,
             peer_advertise,
-            mcp_token: random_secret(),
+            mcp_enabled: false,
+            mcp_public_url: None,
         };
         c.validate()?;
         Ok(c)
@@ -92,14 +96,9 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.version == VERSION, "Unsupported config version");
         valid_name(&self.name)?;
-        ensure!(
-            self.mcp_token.len() >= 32
-                && self
-                    .mcp_token
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b)),
-            "Invalid MCP credential"
-        );
+        if let Some(issuer) = &self.mcp_public_url {
+            oauth::validate_issuer(issuer)?;
+        }
         ensure!(
             self.mcp_listen.port() != 0
                 && self.peer_listen.port() != 0
@@ -400,6 +399,7 @@ pub struct Status {
     pub nodes: Vec<NodeStatus>,
     pub mcp_listen: SocketAddr,
     pub mcp_authenticated: bool,
+    pub mcp_enabled: bool,
     pub peer_listen: SocketAddr,
     pub conflict: bool,
     pub revision: usize,
