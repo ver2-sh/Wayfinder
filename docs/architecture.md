@@ -6,19 +6,45 @@ The Tokio composition root is `crates/wayfinder`. It loads private state under a
 
 | Crate | Responsibility |
 | --- | --- |
-| `wayfinder-core` | Versioned contracts, identity, configuration, signed membership validation, private atomic storage |
+| `wayfinder-core` | Versioned contracts, identity, configuration, signed membership validation, local credentials/OAuth grants, private atomic storage |
 | `wayfinder-exec` | Fresh local shell, input validation, bounded pipes, exit status, cancellation and process cleanup |
 | `wayfinder-network` | Noise transport, invitations, replicated membership, reachability, exact-target execution and generic peer services |
 | `wayfinder-api` | Private loopback administration, service registration and descriptor-based client |
-| `wayfinder-mcp` | Official rmcp Streamable HTTP adapter; exactly `nodes` and `exec` |
+| `wayfinder-mcp` | Official rmcp Streamable HTTP adapter, OAuth HTTP endpoints; exactly `nodes` and `exec` |
 | `wayfinder-tui` | Terminal frontend using only the private API client |
 | `wayfinder` | CLI, initialization, daemon startup/shutdown, TUI attachment |
 
-There is no web dashboard, shell session store, filesystem API, central inventory, telemetry, coordinator, or cloud dependency. Every retained member has the same administrative authority. Any member can introduce another node and be an MCP gateway. Hosts remain responsible for shell capabilities and OS access control. External reverse proxies and tunnel providers remain outside the Wayfinder trust/configuration model: provider credentials, organization or tenant selectors, and control-plane lifecycle must be handled by the integration layer rather than added to the daemon.
+There is no web dashboard, shell session store, filesystem API, central inventory, telemetry, coordinator, or cloud dependency. Every retained member has the same administrative authority. Any member can introduce another node and be an MCP gateway. Hosts remain responsible for shell capabilities and OS access control. External reverse proxies own HTTPS termination. Wayfinder owns client authentication locally; there is no tunnel dependency.
 
 ## Request paths
 
-**MCP:** exact `/mcp` path → constant-time hashed bearer comparison → reject Origin → validate Host → rmcp → choose exact ID/name → local execution or direct peer request. Unknown paths return 404 before bearer authentication, preserving commit `1f4d37c`. IDs take precedence over display names. The official SDK also enforces its conservative Host policy. A reverse proxy rewrites Host to loopback and supplies encrypted client transport.
+**MCP:** `/` → Host/Origin validation → parse credential ID → SHA-256 secret
+verification in constant time → request-local client identity → rmcp → capability
+check → exact-target execution over the existing peer path. The raw bearer is
+removed before SDK dispatch and never sent to peers. Stateless requests are
+reauthenticated individually, including after revocation. A reverse proxy must
+rewrite Host to loopback. Unknown paths return 404. OAuth discovery routes are
+public when `mcp_public_url` is configured; MCP protocol discovery stays protected.
+
+**OAuth:** locally pre-registered confidential client → exact registered redirect,
+resource and S256 PKCE validation → ten-minute browser request → explicit private
+CLI approval → one-minute single-use code → authenticated token exchange → same
+local client credential model. No browser action grants consent by itself. The
+issuer is a configured canonical HTTPS origin, never inferred from Host or proxy
+headers. No dynamic registration, URL fetching, hosted identity provider, or user
+account database is needed. Client secrets, access/refresh secrets and code/ticket
+verifiers use SHA-256 over high-entropy random values. Browser tickets/codes are
+memory-only and expire across restart. Callback includes exact `iss` and `state`.
+
+OAuth access tokens expire after one hour. Refresh tokens rotate with a fixed
+30-day grant lifetime; using an already-consumed refresh token revokes the grant.
+Refresh invalidates its previous access token. Revoking a credential invalidates
+both token types; revoking an OAuth client also revokes all its grants. Pending
+requests and codes share a 64-entry bound. There are at most 128 OAuth registrations
+and 1024 credential records, including revoked entries, and 4096 refreshes per
+grant. Exceeding a bound fails explicitly. Operators use new names for relinking.
+See [operator instructions](remote-mcp.md).
+
 
 **Control:** private `control.json` → loopback HTTP → distinct bearer → Origin and loopback Host validation → narrowly scoped network administration. The client disables HTTP proxies and redirects. There is no control operation for executing host commands. This separation prevents accidental credential reuse; it is not isolation from the same OS account.
 
@@ -69,7 +95,7 @@ A true fork requires explicit operator recovery, not a blind retry: stop the aff
 
 ## Storage and host boundary
 
-Configuration, identity and membership are separate versioned JSON files in OS application data. The control descriptor has its own distinct random credential generated per daemon start. Writes use a new private file, file fsync, atomic rename and parent-directory fsync on Unix. The directory lock prevents duplicate daemons from using the same state. Unknown formats and missing initialized identity/state fail closed. There are no prototype-format migrations.
+Configuration, identity, membership and credentials are separate versioned JSON files in OS application data. A dedicated installation can use `/var/lib/wayfinder` via `--data-dir`. The daemon composition root owns one credential store shared with MCP and private control; the peer graph never receives it. Version-1 `credentials.json` contains credential identity/name/permissions/created/last-used/revoked metadata, SHA-256 verifiers, optional OAuth grant bindings/expiry/refresh verifiers, and OAuth client registrations with exact redirects and secret hashes. Last-use timestamps persist at most once a minute per credential; persistence failures fail authentication closed. No SQLite or second persistence mechanism is introduced. The control descriptor has its own distinct random credential generated per daemon start. Writes use a new private file, file fsync, atomic rename and parent-directory fsync on Unix. The directory lock prevents duplicate daemons from using the same state. Unknown formats and missing initialized identity/state fail closed. There are no prototype-format migrations.
 
 Unix file modes are enforced (0700 directory, 0600 private files). Windows ACL configuration remains the operator's responsibility; atomic rename portability and Windows descendant cleanup have not been validated in this pass. Backups must preserve private ownership and permissions. Rollback of a local membership backup also rolls back local revocation knowledge until it synchronizes again.
 

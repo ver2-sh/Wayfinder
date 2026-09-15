@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
+use std::{collections::BTreeSet, sync::Arc};
 use std::{
     fs::File,
     io::{self, Read},
@@ -9,6 +10,7 @@ use std::{
 };
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use wayfinder_core::credentials::{Capability, CredentialStore};
 use wayfinder_core::*;
 #[derive(Parser)]
 #[command(
@@ -29,6 +31,12 @@ enum Command {
         name: String,
         #[arg(long, default_value = "127.0.0.1:3000")]
         mcp_listen: SocketAddr,
+        /// Enable authenticated HTTP MCP (TLS is provided by a reverse proxy).
+        #[arg(long)]
+        mcp_enabled: bool,
+        /// Canonical HTTPS origin for installation-local OAuth (no trailing slash).
+        #[arg(long)]
+        mcp_public_url: Option<String>,
         #[arg(long, default_value = "127.0.0.1:3001")]
         peer_listen: SocketAddr,
         #[arg(long)]
@@ -42,8 +50,44 @@ enum Command {
     Status,
     /// Send one JSON administration operation from stdin through private control.
     Control,
-    /// Explicitly print this node's MCP bearer credential for client setup.
-    Token,
+    /// Manage MCP credentials through the running daemon (local administrator only).
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+}
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// List registered OAuth client metadata, excluding secrets.
+    OauthClients,
+    /// Revoke an OAuth client and all its grants.
+    OauthRevokeClient { name: String },
+    /// Pre-register a confidential OAuth client; displays its secret once.
+    OauthRegister {
+        name: String,
+        #[arg(long)]
+        redirect_uri: String,
+    },
+    /// Show pending browser requests and their exact redirects/scopes.
+    Pending,
+    /// Approve a request you initiated. Defaults to read only; return to browser.
+    Approve {
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_delimiter = ',', default_value = "read", value_parser = ["read", "exec"])]
+        permissions: Vec<String>,
+    },
+    /// Create a credential and display its secret once. Defaults to read only.
+    Create {
+        name: String,
+        #[arg(long, value_delimiter = ',', default_value = "read", value_parser = ["read", "exec"])]
+        permissions: Vec<String>,
+    },
+    /// List metadata; never displays secrets or verifiers. Times are Unix seconds.
+    List,
+    /// Revoke by name immediately for subsequent requests.
+    Revoke { name: String },
 }
 #[tokio::main]
 async fn main() {
@@ -59,6 +103,8 @@ async fn run() -> Result<()> {
         Command::Init {
             name,
             mcp_listen,
+            mcp_enabled,
+            mcp_public_url,
             peer_listen,
             peer_advertise,
         } => {
@@ -67,12 +113,15 @@ async fn run() -> Result<()> {
                 !data.join("config.json").exists(),
                 "Configuration already exists"
             );
-            let c = Config::new(
+            let mut c = Config::new(
                 name,
                 mcp_listen,
                 peer_listen,
                 peer_advertise.unwrap_or(peer_listen),
             )?;
+            c.mcp_enabled = mcp_enabled;
+            c.mcp_public_url = mcp_public_url;
+            c.validate()?;
             let _ = load_or_create_identity(&data.join("identity.json"))?;
             ensure!(
                 !data.join("state.json").exists(),
@@ -94,10 +143,97 @@ async fn run() -> Result<()> {
             shutdown.cancel();
             combine_results(signal, runner.await)?;
         }
-        Command::Token => {
-            let c: Config = read_private(&data.join("config.json"))?;
-            c.validate()?;
-            println!("{}", c.mcp_token);
+        Command::Auth { command } => {
+            use wayfinder_api::Operation;
+            let client = wayfinder_api::Client::attach(&data)?;
+            match command {
+                AuthCommand::OauthClients => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.call(Operation::OauthClients).await?)?
+                ),
+                AuthCommand::OauthRevokeClient { name } => {
+                    client.call(Operation::OauthRevokeClient { name }).await?;
+                    println!("OAuth client and grants revoked.");
+                }
+                AuthCommand::OauthRegister { name, redirect_uri } => {
+                    let value = client
+                        .call(Operation::OauthRegister { name, redirect_uri })
+                        .await?;
+                    println!(
+                        "Client ID: {}\nClient secret: {}\n\nSave the client secret now. It will not be shown again.",
+                        value["client"]["id"]
+                            .as_str()
+                            .context("Missing client ID")?,
+                        value["client_secret"]
+                            .as_str()
+                            .context("Missing client secret")?
+                    );
+                }
+                AuthCommand::Pending => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.call(Operation::OauthPending).await?)?
+                ),
+                AuthCommand::Approve {
+                    id,
+                    name,
+                    permissions,
+                } => {
+                    let permissions = permissions
+                        .iter()
+                        .map(|p| {
+                            if p == "read" {
+                                Capability::Read
+                            } else {
+                                Capability::Exec
+                            }
+                        })
+                        .collect();
+                    client
+                        .call(Operation::OauthApprove {
+                            id,
+                            name,
+                            permissions,
+                        })
+                        .await?;
+                    println!(
+                        "Approved. Refresh the authorization page to return to your MCP client."
+                    );
+                }
+                AuthCommand::Create { name, permissions } => {
+                    let permissions: BTreeSet<_> = permissions
+                        .iter()
+                        .map(|p| {
+                            if p == "read" {
+                                Capability::Read
+                            } else {
+                                Capability::Exec
+                            }
+                        })
+                        .collect();
+                    let value = client
+                        .call(Operation::AuthCreate {
+                            name: name.clone(),
+                            permissions,
+                        })
+                        .await?;
+                    let token = value["token"]
+                        .as_str()
+                        .context("Missing generated credential")?;
+                    println!(
+                        "Created credential: {name}\n\nToken:\n{token}\n\nSave this token now. It will not be shown again."
+                    );
+                }
+                AuthCommand::List => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&client.call(Operation::AuthList).await?)?
+                ),
+                AuthCommand::Revoke { name } => {
+                    client
+                        .call(Operation::AuthRevoke { name: name.clone() })
+                        .await?;
+                    println!("Revoked credential: {name}");
+                }
+            }
         }
         Command::Tui => tui(data).await?,
         Command::Status => {
@@ -221,9 +357,21 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
         shutdown.clone(),
     )?;
     // Bind the administration and peer listeners before publishing discovery.
-    let mcp = TcpListener::bind(config.mcp_listen)
-        .await
-        .context("Cannot bind MCP listener")?;
+    let credentials = Arc::new(CredentialStore::open(data.join("credentials.json"))?);
+    let oauth = config
+        .mcp_public_url
+        .clone()
+        .map(|issuer| wayfinder_core::oauth::OAuth::new(issuer, credentials.clone()).map(Arc::new))
+        .transpose()?;
+    let mcp = if config.mcp_enabled {
+        Some(
+            TcpListener::bind(config.mcp_listen)
+                .await
+                .context("Cannot bind MCP listener")?,
+        )
+    } else {
+        None
+    };
     let peer = TcpListener::bind(config.peer_listen)
         .await
         .context("Cannot bind peer listener")?;
@@ -242,16 +390,25 @@ async fn daemon(data: PathBuf, _lock: File, shutdown: CancellationToken) -> Resu
         let applications = wayfinder_network::applications::Endpoint::bind()?;
         services.spawn(network.clone().serve_applications(applications));
     }
-    services.spawn(wayfinder_mcp::serve(mcp, network.clone()));
+    if let Some(mcp) = mcp {
+        services.spawn(wayfinder_mcp::serve(
+            mcp,
+            network.clone(),
+            credentials.clone(),
+            oauth.clone(),
+        ));
+    }
     services.spawn(wayfinder_api::serve(
         control,
         network.clone(),
         descriptor.credential,
+        credentials,
+        oauth,
     ));
     services.spawn(network.serve(peer));
     eprintln!(
-        "Wayfinder daemon listening: MCP {}, peers {}",
-        config.mcp_listen, config.peer_listen
+        "Wayfinder daemon listening: MCP enabled={} address={}, peers {}",
+        config.mcp_enabled, config.mcp_listen, config.peer_listen
     );
     let outcome = tokio::select! {r=services.join_next()=>match r{Some(Ok(r))=>r,Some(Err(e))=>Err(e.into()),None=>Ok(())},_=shutdown.cancelled()=>Ok(())};
     shutdown.cancel();

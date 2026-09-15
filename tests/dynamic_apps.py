@@ -125,7 +125,7 @@ try:
                 app_dir.chmod(0o2750)
             node["env"] = dict(os.environ, XDG_RUNTIME_DIR=str(node["run"]))
             subprocess.run([str(BINARY), "--data-dir", str(node["data"]), "init", "--name", name,
-                            "--mcp-listen", f'127.0.0.1:{node["mcp"]}', "--peer-listen", f"127.0.0.1:{port()}"], check=True, capture_output=True, **identity())
+                            "--mcp-enabled", "--mcp-listen", f'127.0.0.1:{node["mcp"]}', "--peer-listen", f"127.0.0.1:{port()}"], check=True, capture_output=True, **identity())
             start_daemon(node)
             node["id"] = control(node, {"op": "status"})["node"]["id"]
             nodes.append(node)
@@ -207,7 +207,7 @@ sys.exit(1)
             raise AssertionError("Admin accepted application credential")
         except urllib.error.HTTPError as e:
             check("application credential rejected by admin", e.code == 401)
-        req = urllib.request.Request(f'http://127.0.0.1:{a["mcp"]}/mcp', b'{}', {"Content-Type": "application/json", "Authorization": "Bearer " + "a" * 64})
+        req = urllib.request.Request(f'http://127.0.0.1:{a["mcp"]}/', b'{}', {"Content-Type": "application/json", "Authorization": "Bearer " + "a" * 64})
         try:
             urllib.request.urlopen(req)
             raise AssertionError("MCP accepted application credential")

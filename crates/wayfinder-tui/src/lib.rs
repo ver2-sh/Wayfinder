@@ -58,7 +58,7 @@ pub async fn run(client: Client, stops_daemon_on_exit: bool) -> Result<()> {
  f.render_stateful_widget(List::new(rows).block(Block::bordered().title("Nodes")).highlight_style(Style::default().fg(Color::Cyan)).highlight_symbol("› "),areas[1],&mut selected);
  }
  let reachable=status.nodes.iter().filter(|n|!n.local&&n.reachable).count();let peers=status.nodes.iter().filter(|n|!n.local).count();
- f.render_widget(Paragraph::new(format!("MCP  {}  Listening / bearer required\nPeers  {}  {reachable} / {peers} reachable{}",status.mcp_listen,status.peer_listen,if status.conflict{"   MEMBERSHIP CONFLICT — peer execution blocked"}else{""})).block(Block::bordered().title("Connections")),areas[2]);
+ f.render_widget(Paragraph::new(format!("MCP  {}  {}\nPeers  {}  {reachable} / {peers} reachable{}",status.mcp_listen,if status.mcp_enabled {"Listening / bearer required"} else {"Disabled"},status.peer_listen,if status.conflict{"   MEMBERSHIP CONFLICT — peer execution blocked"}else{""})).block(Block::bordered().title("Connections")),areas[2]);
  let text=match &mode{Mode::Browse=>safe(&message),Mode::Create=>format!("Create network — enter a name, then Enter. Esc cancels.\n{input}"),Mode::Join=>format!("Paste invitation, then Enter to authenticate the inviter. Esc cancels.\n{input}"),Mode::ConfirmJoin(_)=>format!("{}\nJoin this network? Y confirms; Esc cancels.",safe(&message)),Mode::Remove(id)=>format!("Remove node {id}?\nThis revokes peer access after membership propagates. Y confirms; Esc cancels.")};
  f.render_widget(Paragraph::new(text).wrap(Wrap{trim:false}).block(Block::bordered().title("Network administration")),areas[3]);
  f.render_widget(Paragraph::new("↑↓ Select  Enter Details  A Add  R Remove  N Create  J Join  S Settings  V Services

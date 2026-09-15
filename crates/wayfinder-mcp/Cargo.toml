@@ -15,3 +15,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 wayfinder-core.workspace = true
 wayfinder-network.workspace = true
+serde.workspace = true
+url.workspace = true
+base64.workspace = true

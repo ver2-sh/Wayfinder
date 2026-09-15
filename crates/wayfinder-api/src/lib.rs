@@ -9,21 +9,58 @@ use axum::{
     routing::post,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use wayfinder_core::credentials::{Capability, CredentialStore};
 use wayfinder_core::*;
 use wayfinder_network::Network;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
+    AuthCreate {
+        name: String,
+        permissions: BTreeSet<Capability>,
+    },
+    AuthList,
+    OauthRegister {
+        name: String,
+        redirect_uri: String,
+    },
+    OauthPending,
+    OauthClients,
+    OauthRevokeClient {
+        name: String,
+    },
+    OauthApprove {
+        id: String,
+        name: String,
+        permissions: BTreeSet<Capability>,
+    },
+    AuthRevoke {
+        name: String,
+    },
     Applications,
-    Details { id: String },
-    Create { name: String },
-    Invite { ttl: Option<u64> },
-    Preview { invitation: String },
-    Join { invitation: String },
-    Remove { id: String, confirm: bool },
+    Details {
+        id: String,
+    },
+    Create {
+        name: String,
+    },
+    Invite {
+        ttl: Option<u64>,
+    },
+    Preview {
+        invitation: String,
+    },
+    Join {
+        invitation: String,
+    },
+    Remove {
+        id: String,
+        confirm: bool,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
@@ -34,6 +71,8 @@ pub struct Reply {
 struct Api {
     network: Arc<Network>,
     credential: String,
+    credentials: Arc<CredentialStore>,
+    oauth: Option<Arc<wayfinder_core::oauth::OAuth>>,
 }
 pub fn allowed_host(req: &Request) -> bool {
     let host = req
@@ -60,10 +99,14 @@ async fn guard(State(api): State<Api>, req: Request, next: Next) -> Response {
     if !secret_eq(token, &api.credential) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    next.run(req).await
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
 }
 async fn control(State(api): State<Api>, Json(op): Json<Operation>) -> Json<Reply> {
-    let result = dispatch(&api.network, op).await;
+    let result = dispatch(&api, op).await;
     Json(match result {
         Ok(v) => Reply {
             value: Some(v),
@@ -75,8 +118,45 @@ async fn control(State(api): State<Api>, Json(op): Json<Operation>) -> Json<Repl
         },
     })
 }
-async fn dispatch(network: &Network, op: Operation) -> Result<serde_json::Value> {
+async fn dispatch(api: &Api, op: Operation) -> Result<serde_json::Value> {
+    let network = &api.network;
     match op {
+        Operation::OauthClients => Ok(serde_json::to_value(api.credentials.oauth_clients()?)?),
+        Operation::OauthRevokeClient { name } => {
+            api.credentials.revoke_oauth_client(&name)?;
+            Ok(serde_json::json!({"revoked":true}))
+        }
+        Operation::OauthRegister { name, redirect_uri } => {
+            ensure!(
+                api.oauth.is_some(),
+                "Configure mcp_public_url to enable OAuth"
+            );
+            let (client, secret) = api.credentials.register_oauth_client(name, redirect_uri)?;
+            Ok(serde_json::json!({"client":client,"client_secret":secret}))
+        }
+        Operation::OauthPending => Ok(serde_json::to_value(
+            api.oauth.as_ref().context("OAuth is disabled")?.pending()?,
+        )?),
+        Operation::OauthApprove {
+            id,
+            name,
+            permissions,
+        } => {
+            api.oauth
+                .as_ref()
+                .context("OAuth is disabled")?
+                .approve(&id, name, permissions)?;
+            Ok(serde_json::json!({"approved":true}))
+        }
+        Operation::AuthCreate { name, permissions } => {
+            let (client, token) = api.credentials.create(name, permissions)?;
+            Ok(serde_json::json!({"client": client, "token": token}))
+        }
+        Operation::AuthList => Ok(serde_json::to_value(api.credentials.list()?)?),
+        Operation::AuthRevoke { name } => {
+            api.credentials.revoke(&name)?;
+            Ok(serde_json::json!({"revoked": true}))
+        }
         Operation::Applications => {
             Ok(serde_json::json!({"active": network.registered_services().await}))
         }
@@ -101,7 +181,13 @@ async fn dispatch(network: &Network, op: Operation) -> Result<serde_json::Value>
         }
     }
 }
-pub async fn serve(listener: TcpListener, network: Arc<Network>, credential: String) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    network: Arc<Network>,
+    credential: String,
+    credentials: Arc<CredentialStore>,
+    oauth: Option<Arc<wayfinder_core::oauth::OAuth>>,
+) -> Result<()> {
     ensure!(
         listener.local_addr()?.ip().is_loopback(),
         "Control must bind loopback"
@@ -109,6 +195,8 @@ pub async fn serve(listener: TcpListener, network: Arc<Network>, credential: Str
     let api = Api {
         network: network.clone(),
         credential,
+        credentials,
+        oauth,
     };
     let app = Router::new()
         .route("/control", post(control))

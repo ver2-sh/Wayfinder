@@ -44,7 +44,7 @@ Commands:
   remove    Stop, disable, remove the systemd unit and global command
   services  Observe live application services (forwarded to CLI)
   tui       Open the terminal interface (forwarded to CLI)
-  init, daemon, control, token and --data-dir are also forwarded to the CLI.
+  init, daemon, control, auth and --data-dir are also forwarded to the CLI.
 
 Environment:
   WAYFINDER_REPO_DIR  Repository directory (default: this script directory)
@@ -278,7 +278,7 @@ EOF
 
 cmd="${1:-}"
 case "$cmd" in
-  init|daemon|tui|services|control|token|--data-dir|--data-dir=*|--version)
+  init|daemon|tui|services|control|auth|--data-dir|--data-dir=*|--version)
     require_wayfinder
     app_args=("$@")
     explicit_data=false
