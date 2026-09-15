@@ -9,7 +9,7 @@ use axum::{
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
-    handler::server::wrapper::Parameters,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -25,11 +25,47 @@ use wayfinder_network::Network;
 #[derive(Clone)]
 struct Mcp {
     network: Arc<Network>,
+    issuer: Option<String>,
+    tools: ToolRouter<Self>,
 }
 #[tool_router]
 impl Mcp {
-    fn new(network: Arc<Network>) -> Self {
-        Self { network }
+    fn new(network: Arc<Network>, issuer: Option<String>) -> Self {
+        let mut tools = Self::tool_router();
+        if issuer.is_some() {
+            for (name, scope) in [("nodes", "read"), ("exec", "exec")] {
+                // rmcp has no top-level securitySchemes field. Use OpenAI's
+                // documented compatibility representation in native Tool.meta.
+                let mut meta = MetaObject::new();
+                meta.insert(
+                    "securitySchemes".into(),
+                    serde_json::json!([{"type":"oauth2","scopes":[scope]}]),
+                );
+                tools.map.get_mut(name).unwrap().attr.meta = Some(meta);
+            }
+        }
+        Self {
+            network,
+            issuer,
+            tools,
+        }
+    }
+    fn capability_error(&self, error: ErrorData, scope: &str) -> Result<CallToolResult, ErrorData> {
+        let Some(issuer) = &self.issuer else {
+            return Err(error);
+        };
+        let challenge = format!(
+            "Bearer error=\"insufficient_scope\", error_description=\"Credential lacks the required capability\", scope=\"{scope}\", resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\""
+        );
+        let mut meta = MetaObject::new();
+        meta.insert(
+            "mcp/www_authenticate".into(),
+            serde_json::json!([challenge]),
+        );
+        Ok(CallToolResult::error(vec![ContentBlock::text(
+            "Credential lacks the required capability",
+        )])
+        .with_meta(Some(meta)))
     }
     #[tool(
         description = "Discover Wayfinder nodes: stable ID, unique name, entry node and last observed reachability."
@@ -38,7 +74,9 @@ impl Mcp {
         &self,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        require(&context, Capability::Read)?;
+        if let Err(error) = require(&context, Capability::Read) {
+            return self.capability_error(error, "read");
+        }
         let value = serde_json::json!({"nodes":self.network.status().await.nodes});
         Ok(CallToolResult::structured(value))
     }
@@ -50,7 +88,9 @@ impl Mcp {
         Parameters(input): Parameters<ExecInput>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        require(&context, Capability::Exec)?;
+        if let Err(error) = require(&context, Capability::Exec) {
+            return self.capability_error(error, "exec");
+        }
         let result = self.network.execute(input, context.ct.clone()).await;
         let failed = result.is_error();
         let mut response = CallToolResult::structured(
@@ -61,7 +101,7 @@ impl Mcp {
         Ok(response)
     }
 }
-#[tool_handler]
+#[tool_handler(router = self.tools)]
 impl ServerHandler for Mcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new("wayfinder",env!("CARGO_PKG_VERSION"))).with_instructions("Use nodes to choose a target, then exec. Commands execute as the target daemon's OS account.")
@@ -150,7 +190,7 @@ async fn guard(State(ingress): State<Ingress>, mut req: Request, next: Next) -> 
         Ok(None) => {
             let challenge = match &ingress.oauth {
                 Some(o) => format!(
-                    "Bearer realm=\"wayfinder\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                    "Bearer realm=\"wayfinder\", resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"read exec\"",
                     o.issuer
                 ),
                 None => "Bearer realm=\"wayfinder\"".to_string(),
@@ -195,6 +235,7 @@ pub async fn serve(
     oauth: Option<Arc<wayfinder_core::oauth::OAuth>>,
 ) -> anyhow::Result<()> {
     let factory = network.clone();
+    let issuer = oauth.as_ref().map(|o| o.issuer.clone());
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true);
@@ -202,7 +243,7 @@ pub async fn serve(
     config.cancellation_token = network.shutdown.clone();
     config.max_request_body_bytes = 131072;
     let service = StreamableHttpService::new(
-        move || Ok(Mcp::new(factory.clone())),
+        move || Ok(Mcp::new(factory.clone(), issuer.clone())),
         Arc::new(LocalSessionManager::default()),
         config,
     );

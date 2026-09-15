@@ -9,7 +9,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::json;
-use wayfinder_core::oauth::{Authorization, Continue};
+use wayfinder_core::oauth::{Authorization, AuthorizationError, Continue};
 
 pub async fn resource(State(i): State<Ingress>) -> Response {
     let Some(o) = &i.oauth else {
@@ -45,8 +45,9 @@ pub async fn authorize(
     };
     match o.begin(a) {
         Ok(ticket) => Redirect::to(&format!("/oauth/continue?ticket={ticket}")).into_response(),
-        // Never redirect to an unvalidated user-supplied URI.
-        Err(_) => error("invalid_request", StatusCode::BAD_REQUEST),
+        Err(AuthorizationError::Redirect(uri)) => Redirect::to(&uri).into_response(),
+        // Missing/ambiguous parameters and untrusted client/redirect pairs stay local.
+        Err(AuthorizationError::Local) => error("invalid_request", StatusCode::BAD_REQUEST),
     }
 }
 #[derive(Deserialize)]
