@@ -155,8 +155,8 @@ There are at most 16 local executions and 64 inbound peer connections per node. 
 
 Use a reverse proxy to terminate HTTPS and forward to `127.0.0.1:3000`.
 Wayfinder authenticates clients; the proxy preserves Authorization and rewrites
-Host to loopback. Only MCP and OAuth routes are exposed. No OpenAI Tunnel is
-required. See [the Caddy example and operator runbook](docs/remote-mcp.md).
+Host to loopback. Only MCP and OAuth routes are exposed. See the ingress example and operator
+runbook in [docs/remote-mcp.md](docs/remote-mcp.md).
 
 ## Configuration and private control
 
