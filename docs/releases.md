@@ -113,13 +113,18 @@ this Linux-only audit pass and remain release gates.
 ## Artifact trust and public readiness
 
 The release origin is the repository metadata/dist configuration; updater discovery
-is centralized in `crates/wayfinder/src/update.rs`, independent of gateways. Later
-`usewayfinder.app` can link/redirect users to these assets. An actual hosting change
-must update dist hosting and updater source together, including existing receipts;
-no mandatory vendor update service is needed. Private GitHub releases are not
-anonymous public downloads. No private token is embedded or requested by Wayfinder.
-A public repository/release channel is required before the documented consumer
-commands work without authentication.
+is centralized in `crates/wayfinder/src/update.rs`, independent of gateways.
+`usewayfinder.app` is the stable user-facing distribution front door: its separate
+Cloudflare Worker redirects `/install.sh`, `/install.ps1` and download aliases to
+the public GitHub Releases channel. It does not host artifacts, carry credentials,
+or become the updater's trust/source of truth. Moving the underlying artifact host
+later requires coordinating dist hosting/updater receipts, while the documented
+install URLs can remain stable. No mandatory vendor update service is needed.
+
+Private GitHub releases are not anonymous public downloads. No private token is
+embedded or requested by Wayfinder or the distribution Worker. A public repository
+and release channel are required before the documented consumer commands work
+without authentication.
 
 The updater uses axoupdater 0.10.2, its receipt ownership checks and upstream
 Windows rename/restore/self-replace support. Its PowerShell subprocess uses
@@ -134,7 +139,8 @@ Wayfinder attempts to restart a previously running managed agent even on failure
 The error directs users with organizational restrictions to their administrator.
 Receipt validation and package-manager ownership protection still apply.
 
-For initial installation, download and inspect the script first, then run
+For initial installation, download `https://usewayfinder.app/install.ps1` and
+inspect it first, then run
 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wayfinder-installer.ps1`
 as shown in the README. This is also process-only and cannot override Group Policy.
 See Microsoft's [execution-policy scope and precedence documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
