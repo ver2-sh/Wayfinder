@@ -35,6 +35,7 @@ wayfinder-exec = { path = "crates/wayfinder-exec" }
 wayfinder-mcp = { path = "crates/wayfinder-mcp" }
 bip39 = { version = "2", features = ["zeroize"] }
 hkdf = "0.12"
+hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 futures-util = "0.3"

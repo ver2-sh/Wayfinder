@@ -116,6 +116,16 @@ impl OAuth {
             state: Mutex::new(FlowState::default()),
         })
     }
+    pub fn expire(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("OAuth unavailable"))?;
+        state.pending.retain(|_, p| p.approval.expires > now());
+        state.codes.retain(|_, c| c.expires > now());
+        drop(state);
+        self.credentials.expire_oauth()
+    }
     pub fn begin(&self, a: Authorization) -> Result<String, AuthorizationError> {
         let client = self
             .credentials
@@ -162,7 +172,16 @@ impl OAuth {
             .map_err(|_| failure("temporarily_unavailable"))?;
         state.pending.retain(|_, p| p.approval.expires > now());
         state.codes.retain(|_, c| c.expires > now());
-        if state.pending.len() + state.codes.len() >= 1024 {
+        // Unapproved requests have their own budget and cannot consume the
+        // slots reserved for chain-approved requests and authorization codes.
+        if state.pending.values().filter(|p| p.chain.is_none()).count() >= 1024
+            || state
+                .pending
+                .values()
+                .filter(|p| p.approval.client_id == client.id && p.chain.is_none())
+                .count()
+                >= 4
+        {
             return Err(failure("temporarily_unavailable"));
         }
         let ticket = random_secret();
@@ -208,6 +227,22 @@ impl OAuth {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("OAuth unavailable"))?;
+        state.pending.retain(|_, p| p.approval.expires > now());
+        state.codes.retain(|_, c| c.expires > now());
+        let approved = state
+            .pending
+            .values()
+            .filter_map(|p| p.chain.as_ref())
+            .chain(
+                state
+                    .codes
+                    .values()
+                    .filter_map(|c| c.pending.chain.as_ref()),
+            );
+        ensure!(
+            approved.clone().count() < 1024 && approved.filter(|c| **c == chain).count() < 16,
+            "Approval capacity reached"
+        );
         let matches = state
             .pending
             .values()
@@ -309,6 +344,74 @@ impl OAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unapproved_flood_cannot_take_approved_capacity() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("wayfinder-flow-{}", random_secret()));
+        let store = Arc::new(CredentialStore::open(dir.join("registry.sqlite"))?);
+        let oauth = OAuth::new("http://127.0.0.1:12345".into(), store.clone())?;
+        let register =
+            || store.register_oauth_client("Test".into(), "http://127.0.0.1/callback".into(), true);
+        let verifier = random_secret();
+        let begin = |client: &crate::credentials::OAuthClientInfo| {
+            oauth.begin(Authorization {
+                response_type: "code".into(),
+                client_id: client.id.clone(),
+                redirect_uri: client.redirect_uri.clone(),
+                scope: Some("read".into()),
+                state: None,
+                resource: oauth.issuer.clone(),
+                code_challenge: URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+                code_challenge_method: "S256".into(),
+            })
+        };
+        let (client, _) = register()?;
+        let ticket = begin(&client).map_err(|_| anyhow::anyhow!("begin failed"))?;
+        for _ in 0..3 {
+            assert!(begin(&client).is_ok());
+        }
+        assert!(begin(&client).is_err());
+        for _ in 0..255 {
+            let (c, _) = register()?;
+            for _ in 0..4 {
+                assert!(begin(&c).is_ok());
+            }
+        }
+        let (other, _) = register()?;
+        assert!(begin(&other).is_err());
+        let approval = match oauth.continue_authorization(&ticket)? {
+            Continue::Waiting(a) => a,
+            _ => panic!("unexpected redirect"),
+        };
+        oauth.approve(
+            &approval.id,
+            "chain".into(),
+            &digest(&serde_json::to_vec(&approval)?),
+        )?;
+        assert!(begin(&other).is_ok());
+        assert!(matches!(
+            oauth.continue_authorization(&ticket)?,
+            Continue::Redirect(_)
+        ));
+        assert!(oauth.continue_authorization(&ticket).is_err());
+        assert_eq!(oauth.state.lock().unwrap().codes.len(), 1);
+        {
+            let mut state = oauth.state.lock().unwrap();
+            for p in state.pending.values_mut() {
+                p.approval.expires = now();
+            }
+            for c in state.codes.values_mut() {
+                c.expires = now();
+            }
+        }
+        oauth.expire()?;
+        assert!(oauth.state.lock().unwrap().pending.is_empty());
+        assert!(oauth.state.lock().unwrap().codes.is_empty());
+        assert!(begin(&other).is_ok());
+        drop(oauth);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     // Exercise expiry boundaries directly so validation never waits ten minutes
     // or changes the host clock. No production clock override exists.
     #[test]

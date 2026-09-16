@@ -97,7 +97,7 @@ last-observed display, not an authentication source.
 
 JSON frames have explicit tagged schemas. Connect outward to `/agent` using WSS.
 The gateway sends `{type: challenge, version: 1, gateway, nonce}`. Its nonce is
-256 random bits, scoped to that socket, expires in 15 seconds, and is consumed
+256 random bits, scoped to that socket, expires in 5 seconds, and is consumed
 by the single authentication frame. The device verifies the exact configured
 gateway origin and version, then signs:
 
@@ -148,8 +148,14 @@ clients are global metadata; they confer no access without local chain approval.
 
 ## Signed administration and OAuth
 
-Administrative HTTP operations request a 256-bit nonce from `/device/challenge`
-with 30-second expiry. It is removed on the first attempt. The proof is:
+Administrative HTTP operations request an opaque challenge from `/device/challenge`.
+It contains a 30-second deadline, 256 random bits and an HMAC-SHA256 tag under a
+process-local random gateway key. Issuance allocates no server state. After MAC,
+expiry, device signature, active certificate, role and live-session validation,
+the gateway records consumption in a per-device replay cache (at most 128
+unexpired consumption records). The cache survives reconnects; gateway restart rotates the MAC key,
+invalidating every outstanding challenge. A forged request cannot consume another
+device's challenge. The proof is:
 
 ```text
 UTF8("wayfinder/administration/v1\0")
@@ -179,9 +185,31 @@ The browser UI has no phrase input, no JavaScript, no third-party resources, no
 cache, no referrer and no frame embedding. Refreshing the page after local approval
 returns the OAuth redirect with the original state and issuer. Dynamic registration
 supports public and confidential clients. Pairing lookups are limited to ten per
-device per minute. Pending requests, nonce tables and client registrations are
-bounded. Distributed abuse prevention and production capacity tuning are future
-operational work, not an identity mechanism.
+device per minute. Public registrations live in memory for one hour (1,024 total)
+and become durable only when a chain-approved code issues a grant. Durable clients
+remain usable while any associated grant is within its absolute 30-day refresh
+lifetime. A minute maintenance tick removes expired flows/registrations, expired
+grant/token records and unreferenced clients. Refresh replay records remain until
+the entire grant expires, including when revoked. Device tombstones never expire.
+
+Unapproved OAuth requests retain their ten-minute lifetime with at most four per
+client and 1,024 overall. Approved requests and one-minute codes have a separate
+1,024-slot budget, at most 16 per chain. Unauthenticated traffic cannot consume
+that approved capacity. Transient registrations and flows are lost on restart;
+clients must register again if they had not obtained a grant.
+
+Agent handshakes have a separate 128-slot budget and a five-second total deadline.
+Only verified devices acquire the 1,024 authenticated-session slots; a chain may
+hold at most 64 sessions. New durable device admission is limited to 60 per minute
+globally and ten per chain, using monotonic process-local time. Existing devices
+reconnect/heartbeat outside this budget, and revocations are never discarded.
+
+These generic bounds complement source-based admission at the TLS ingress. Public
+self-hosted gateways must configure equivalent source controls for `/agent`,
+`/oauth/` and `/device/`; source headers never establish application identity.
+Hosted deployment uses native edge rate limits. Accountless root creation cannot
+prevent distributed Sybil attacks; these are proportionate controls, not a global
+quota or a claim of distributed denial-of-service immunity.
 
 ## Security boundary
 

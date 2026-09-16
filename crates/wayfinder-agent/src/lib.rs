@@ -96,7 +96,7 @@ pub async fn operation(i: &Installation, op: Operation) -> Result<serde_json::Va
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing challenge"))?
         .to_string();
-    key_bytes(&nonce)?;
+    ensure!(!nonce.is_empty() && nonce.len() <= 160, "Invalid challenge");
     let signature = sign(
         &i.key()?,
         &operation_proof(&i.gateway, &nonce, &i.certificate, &op)?,

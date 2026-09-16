@@ -16,3 +16,6 @@ tokio-util.workspace = true
 wayfinder-core.workspace = true
 wayfinder-mcp.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
