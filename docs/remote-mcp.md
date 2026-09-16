@@ -251,8 +251,8 @@ Inspection on 2026-09-15 found `/etc/systemd/system/wayfinder.service` runs as
 `root`, with working directory `/srv/norted/repos/project-wayfinder`, executable
 `target/release/wayfinder`, data at `/root/.local/share/wayfinder`, MCP
 `127.0.0.1:3000`, and existing peer listen/advertise `100.117.187.71:3001`.
-No Caddy/nginx configuration was present. The OpenAI Tunnel service is external
-to this repository. These instructions preserve the current peer identity.
+No Caddy/nginx configuration was present. These instructions preserve the
+current peer identity.
 
 1. On the host, stop `wayfinder.service`. Keep a private backup of its data
    directory. Edit `/root/.local/share/wayfinder/config.json`: remove `mcp_token`,
@@ -290,12 +290,3 @@ to this repository. These instructions preserve the current peer identity.
 5. Confirm `nodes` shows the existing graph and `exec` works on the intended
    target. Verify a read-only credential cannot execute. Revoke a temporary
    credential and confirm its next request receives 401.
-6. After the direct HTTPS connection works, disable the external ingress service:
-
-   ```sh
-   sudo systemctl disable --now openai-wayfinder-tunnel.service
-   ```
-
-   Remove the old tunnel connection from the MCP client. No repository-owned
-   tunnel implementation remains to remove, and the running service was not
-   altered during development of this change.
