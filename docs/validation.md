@@ -1,7 +1,8 @@
 # Implementation, security review and deployment record
 
-Date: 2026-09-16. The original three working trees were clean before edits. Changes
-remain uncommitted and unpushed. No real Sync Chain recovery phrase was generated.
+Date: 2026-09-16. The sections below record the original implementation; the
+material abuse-resistance follow-up at the end records the subsequent audit.
+No real Sync Chain recovery phrase was generated during either validation.
 All automated enrollment used disposable material kept out of transcripts/logs.
 
 ## Repository changes
@@ -56,7 +57,7 @@ per-gateway device tombstone and closes the session. Existing grants remain
 separately revocable. Possession of the root phrase can enroll new administrators.
 
 WSS challenge-response proves device possession with a one-use 256-bit nonce,
-15-second authentication deadline, exact gateway audience and certificate digest.
+5-second authentication deadline, exact gateway audience and certificate digest.
 Heartbeat is 15 seconds, liveness deadline 45 seconds, reconnect 1–30 seconds plus
 jitter. Dispatch never retries after uncertain delivery. HTTP disconnect and
 session loss propagate cancellation to process groups where transport permits.
@@ -117,7 +118,7 @@ third-party cryptographic audit or distributed load test.
 | --- | --- |
 | Recovery/key leakage | No protocol field carries private identity material; no phrase argv/env/log output. Creation requires a terminal. Transient secret buffers zeroized where practical. |
 | Identity forgery | Strict Ed25519 verification and root/device-to-ID checks precede registration. Stored membership cannot be rewritten. |
-| Replay | Session-local challenge once; admin nonce removed before verification; code/approval one-use and bounded TTL. |
+| Replay | Session-local challenge once; stateless admin challenge; replay consumption after verified live-device authentication; code/approval one-use and bounded TTL. |
 | Cross-chain IDOR | Device/grant queries and socket maps use verified chain keys. No target input selects chain. Negative live tests passed. |
 | Revoked reconnect | Durable tombstones reject registration; active socket terminated; gateway restart preserves revocation. |
 | Approval confused deputy | Admin-only, connected device required; exact request digest, client, redirect, scopes, gateway and expiry bound; no browser-only consent. |
@@ -128,8 +129,8 @@ third-party cryptographic audit or distributed load test.
 | Local OS privilege | norted agent is configured as root; commands will run as root. Gateway uses an unprivileged dynamic service user. |
 
 Intentional limits: no root rotation or QR format; no revocation synchronization
-across gateways; no high availability/distributed database; bounded challenge/client/session counts
-but no comprehensive distributed abuse controls; no OS protection against a
+across gateways; no high availability/distributed database; bounded authenticated replay/client/session state plus hosted native source limits;
+no comprehensive distributed denial-of-service guarantee; no OS protection against a
 compromised device, swap or core dumps; Windows/macOS service packaging untested.
 A malicious gateway can send commands through an active authenticated channel;
 self-hosting changes who is trusted, not that application-layer boundary.
@@ -174,3 +175,52 @@ Browser Integrity Check for `mcp.usewayfinder.app`, leaving other hosts unchange
 Then verify default urllib metadata requests. See that repository's README for
 the exact policy and Cloudflare documentation. This is an external permission
 limitation, not an application auth workaround.
+
+
+## Material abuse-resistance follow-up (2026-09-16)
+
+The follow-up keeps the existing database schema and permanent device trust state.
+Public challenge issuance is stateless; signed-operation replay records survive
+reconnects and expire with the challenge. Handshakes and authenticated sessions
+have separate capacity, with chain limits. Public DCR is temporary until a grant
+is approved. OAuth pending/approved budgets are separate and expired OAuth state
+is collected. Durable device creation has a rate budget, not destructive GC.
+
+The existing 49-check process suite remains unchanged. Additional tests in existing
+Rust source files cover challenge floods, forged proofs, reconnect/restart replay,
+expiry, DCR saturation without durable writes, client persistence, refresh replay
+through maintenance, and preservation of revoked devices during expiry/admission.
+OAuth tests also saturate the unapproved pool and exercise reserved approved capacity.
+
+There is no reset, migration or device re-enrollment requirement. Deploy gateway
+and CLI together because administrative challenges are now opaque MAC-bearing
+values. In-progress authorizations and registrations without grants restart;
+existing grants and device identity survive. Do not clear live disposable device
+tombstones after validation.
+
+
+Follow-up validation passed `cargo fmt --check`, `cargo check --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`
+(five unit tests plus doc tests). Both current debug binaries were explicitly
+built before the unchanged `tests/sync_chain.py`: **49 local checks passed** and
+**46 hosted checks passed**. A separate disposable local saturation exercise held
+128 unauthenticated sockets, verified a live admin's operations still worked,
+and verified admission recovered after the five-second handshake expiry.
+
+The release gateway/CLI and Cloudflare Worker were deployed. Before/after hashes
+confirmed the original live device trust rows were unchanged, and the original
+grant survived. The actual connected Wayfinder client listed `norted` and executed
+a harmless command after deployment. Hosted checks used real Rust agents and WSS,
+including cancellation, isolation, scopes, revocation and refresh replay. No live
+database was reset; disposable test devices were revoked, leaving their tombstones.
+Cloudflare `npm run check` passed all four proxy tests, TypeScript and dry-run build.
+Live settings confirm three native rate-limit bindings, no observability, no
+Logpush and no tail consumers. Browser Integrity remains a material external
+permission blocker: stock urllib still receives 403/1010 and Configuration Rules
+access receives 403. The hostname-only rule remains correct and unapplied.
+
+A live persistent-connection test using invalid registration bodies returned ten
+422 responses followed by 429 with `Retry-After: 60`, without creating clients.
+During that source throttle, MCP `/` still returned the expected 401 and both
+metadata endpoints returned 200 with the correct issuer/resource. Native counters
+are approximate across edge isolates; the test does not claim a strict global cap.

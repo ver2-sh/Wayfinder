@@ -10,6 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -41,7 +43,9 @@ pub struct Gateway {
     pub store: Arc<CredentialStore>,
     oauth: Arc<oauth::OAuth>,
     sessions: Mutex<HashMap<Key, Session>>,
-    nonces: Mutex<HashMap<String, u64>>,
+    challenge_key: String,
+    nonces: Mutex<HashMap<Key, HashMap<String, u64>>>,
+    handshakes: Arc<tokio::sync::Semaphore>,
     approvals: Mutex<HashMap<Key, (u64, u32)>>,
     administration: Mutex<()>,
     connections: Arc<tokio::sync::Semaphore>,
@@ -55,11 +59,25 @@ impl Gateway {
             store,
             oauth,
             sessions: Mutex::new(HashMap::new()),
+            challenge_key: random_secret(),
             nonces: Mutex::new(HashMap::new()),
+            handshakes: Arc::new(tokio::sync::Semaphore::new(128)),
             approvals: Mutex::new(HashMap::new()),
             administration: Mutex::new(()),
             connections: Arc::new(tokio::sync::Semaphore::new(1024)),
         }))
+    }
+    pub fn expire(&self) -> Result<()> {
+        self.oauth.expire()?;
+        self.nonces.lock().unwrap().retain(|_, used| {
+            used.retain(|_, expiry| *expiry > now());
+            !used.is_empty()
+        });
+        self.approvals
+            .lock()
+            .unwrap()
+            .retain(|_, (t, _)| *t + 60 > now());
+        Ok(())
     }
     pub fn router(self: &Arc<Self>) -> Router {
         let protocol = Router::new()
@@ -85,13 +103,7 @@ impl Gateway {
     }
     fn operate(&self, s: SignedOperation) -> Result<serde_json::Value> {
         let _administration = self.administration.lock().unwrap();
-        let expiry = self
-            .nonces
-            .lock()
-            .unwrap()
-            .remove(&s.nonce)
-            .ok_or_else(|| anyhow::anyhow!("Expired challenge"))?;
-        ensure!(expiry > now(), "Expired challenge");
+        let expiry = self.verify_challenge(&s.nonce)?;
         s.certificate.verify()?;
         verify(
             &s.certificate.device_public,
@@ -111,6 +123,19 @@ impl Gateway {
         );
         if !matches!(s.operation, Operation::Devices) {
             ensure!(c.role == Role::Admin, "Administrative device required");
+        }
+        // Only a verified, live device can allocate replay state. Keep it across
+        // reconnects until expiry; clearing it on disconnect would permit replay.
+        {
+            let mut nonces = self.nonces.lock().unwrap();
+            nonces.retain(|_, used| {
+                used.retain(|_, expiry| *expiry > now());
+                !used.is_empty()
+            });
+            let used = nonces.entry(key.clone()).or_default();
+            ensure!(used.len() < 128, "Device operation rate limit");
+            ensure!(!used.contains_key(&s.nonce), "Challenge already used");
+            used.insert(s.nonce, expiry);
         }
         match s.operation {
             Operation::Devices => self.nodes(&c.chain_id),
@@ -146,37 +171,79 @@ impl Gateway {
             }
         }
     }
-    async fn connection(self: Arc<Self>, mut socket: WebSocket) -> Result<()> {
-        let nonce = random_secret();
-        send(
-            &mut socket,
-            &Frame::Challenge {
-                version: 1,
-                gateway: self.issuer.clone(),
-                nonce: nonce.clone(),
-            },
-        )
-        .await?;
-        let frame = tokio::time::timeout(Duration::from_secs(15), receive(&mut socket)).await??;
-        let Frame::Authenticate {
-            certificate,
-            signature,
-        } = frame
-        else {
-            anyhow::bail!("Authentication required")
-        };
-        certificate.verify()?;
-        verify(
-            &certificate.device_public,
-            &session_proof(&self.issuer, &nonce, &certificate)?,
-            &signature,
-        )?;
+    fn challenge(&self) -> String {
+        let payload = format!("{}.{}", now() + 30, random_secret());
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.challenge_key.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        format!("{payload}.{}", hex::encode(mac.finalize().into_bytes()))
+    }
+    fn verify_challenge(&self, nonce: &str) -> Result<u64> {
+        ensure!(nonce.len() <= 160, "Invalid challenge");
+        let (payload, tag) = nonce
+            .rsplit_once('.')
+            .ok_or_else(|| anyhow::anyhow!("Invalid challenge"))?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.challenge_key.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&hex::decode(tag)?)?;
+        let (expiry, _) = payload
+            .split_once('.')
+            .ok_or_else(|| anyhow::anyhow!("Invalid challenge"))?;
+        let expiry: u64 = expiry.parse()?;
+        ensure!(expiry > now() && expiry <= now() + 30, "Expired challenge");
+        Ok(expiry)
+    }
+    async fn connection(
+        self: Arc<Self>,
+        mut socket: WebSocket,
+        handshake: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let certificate = tokio::time::timeout(Duration::from_secs(5), async {
+            let nonce = random_secret();
+            send(
+                &mut socket,
+                &Frame::Challenge {
+                    version: 1,
+                    gateway: self.issuer.clone(),
+                    nonce: nonce.clone(),
+                },
+            )
+            .await?;
+            let frame = receive(&mut socket).await?;
+            let Frame::Authenticate {
+                certificate,
+                signature,
+            } = frame
+            else {
+                anyhow::bail!("Authentication required")
+            };
+            certificate.verify()?;
+            verify(
+                &certificate.device_public,
+                &session_proof(&self.issuer, &nonce, &certificate)?,
+                &signature,
+            )?;
+            Ok::<_, anyhow::Error>(certificate)
+        })
+        .await??;
+        drop(handshake);
+        let _permit = self.connections.clone().try_acquire_owned()?;
         let key = (certificate.chain_id.clone(), certificate.device_id.clone());
         let generation = random_secret();
         let stop = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<Dispatch>(16);
         {
             let _administration = self.administration.lock().unwrap();
+            let sessions = self.sessions.lock().unwrap();
+            ensure!(
+                sessions.contains_key(&key)
+                    || sessions
+                        .keys()
+                        .filter(|(chain, _)| chain == &certificate.chain_id)
+                        .count()
+                        < 64,
+                "Chain connection capacity reached"
+            );
+            drop(sessions);
             self.store.register(&certificate)?;
             if let Some(old) = self.sessions.lock().unwrap().insert(
                 key.clone(),
@@ -269,25 +336,18 @@ async fn receive(s: &mut WebSocket) -> Result<Frame> {
     }
 }
 async fn upgrade(State(g): State<Arc<Gateway>>, ws: WebSocketUpgrade) -> Response {
-    let Ok(permit) = g.connections.clone().try_acquire_owned() else {
+    let Ok(permit) = g.handshakes.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     // Two 1 MiB streams can expand sixfold when JSON escapes control bytes.
     ws.max_message_size(16 * 1024 * 1024)
         .max_frame_size(16 * 1024 * 1024)
         .on_upgrade(move |s| async move {
-            let _permit = permit;
-            let _ = g.connection(s).await;
+            let _ = g.connection(s, permit).await;
         })
 }
 async fn challenge(State(g): State<Arc<Gateway>>) -> Response {
-    let mut n = g.nonces.lock().unwrap();
-    n.retain(|_, t| *t > now());
-    if n.len() >= 4096 {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-    let nonce = random_secret();
-    n.insert(nonce.clone(), now() + 30);
+    let nonce = g.challenge();
     Json(serde_json::json!({"version":1,"gateway":g.issuer,"nonce":nonce})).into_response()
 }
 async fn operation(State(g): State<Arc<Gateway>>, Json(s): Json<SignedOperation>) -> Response {
@@ -345,5 +405,70 @@ impl wayfinder_mcp::Routing for Gateway {
  }.await;
             result.unwrap_or_else(|e| ExecResult::failed(target, e))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn challenges_allocate_only_after_authentication_and_survive_reconnect() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("wayfinder-challenge-{}", random_secret()));
+        let store = Arc::new(CredentialStore::open(dir.join("registry.sqlite"))?);
+        let g = Gateway::new("http://127.0.0.1:12345".into(), store.clone())?;
+        for _ in 0..5000 {
+            assert!(g.verify_challenge(&g.challenge()).is_ok());
+        }
+        assert!(g.nonces.lock().unwrap().is_empty());
+        let device = identity::new_key();
+        let cert = Certificate::issue(&identity::new_key(), &device, "Test".into(), Role::Admin)?;
+        store.register(&cert)?;
+        let key = (cert.chain_id.clone(), cert.device_id.clone());
+        let (send, _) = mpsc::channel(1);
+        let session = Session {
+            generation: random_secret(),
+            send,
+            stop: CancellationToken::new(),
+        };
+        g.sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session.clone());
+        let nonce = g.challenge();
+        let signature = identity::sign(
+            &device,
+            &operation_proof(&g.issuer, &nonce, &cert, &Operation::Devices)?,
+        );
+        let request = |signature: String| SignedOperation {
+            certificate: cert.clone(),
+            nonce: nonce.clone(),
+            operation: Operation::Devices,
+            signature,
+        };
+        assert!(g.operate(request("00".repeat(64))).is_err());
+        assert!(g.nonces.lock().unwrap().is_empty());
+        assert!(g.operate(request(signature.clone())).is_ok());
+        g.sessions.lock().unwrap().remove(&key);
+        g.sessions.lock().unwrap().insert(key, session);
+        assert!(g.operate(request(signature)).is_err());
+        assert!(g.verify_challenge(&format!("{nonce}0")).is_err());
+        let restarted = Gateway::new(g.issuer.clone(), store.clone())?;
+        assert!(restarted.verify_challenge(&nonce).is_err());
+        // Valid MAC with an expired deadline must still fail.
+        let payload = format!("{}.{}", now(), random_secret());
+        let mut mac = Hmac::<Sha256>::new_from_slice(g.challenge_key.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        assert!(
+            g.verify_challenge(&format!(
+                "{payload}.{}",
+                hex::encode(mac.finalize().into_bytes())
+            ))
+            .is_err()
+        );
+        drop(restarted);
+        drop(g);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

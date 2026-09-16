@@ -22,6 +22,16 @@ async fn main() -> anyhow::Result<()> {
         a.data_dir.join("gateway.sqlite"),
     )?);
     let g = wayfinder_gateway::Gateway::new(a.public_url, store)?;
+    let maintenance = g.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            if maintenance.expire().is_err() {
+                eprintln!("Gateway state expiry failed");
+            }
+        }
+    });
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     eprintln!("Wayfinder gateway listening on {}", a.listen);
     axum::serve(listener, g.router())

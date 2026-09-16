@@ -127,3 +127,18 @@ cancellation until the agent detects loss or reaches the command deadline.
 The official Cloudflare Worker/VPC/tunnel remains deployment infrastructure.
 Self-hosting needs none of it. See Wayfinder-Cloudflare for its hosted deployment
 contract. No OpenAI Tunnel or peer-address configuration is part of Wayfinder.
+
+
+## Admission and registration lifetime
+
+Unapproved dynamic registrations expire after one hour or a gateway restart;
+register again if authorization has not completed. Once a grant is issued, the
+client registration persists for the lifetime of its grants. Expired grants and
+tokens are collected; device revocations remain permanent. A client can have four
+unapproved requests at once. Requests expire after ten minutes.
+
+Public deployments must rate-limit connection attempts, dynamic registration and
+OAuth/device endpoints at their TLS ingress. The generic gateway never trusts
+Cloudflare or forwarded IP headers for authorization. Capacity limits reject new
+work without evicting authenticated sessions or active grants. Wait before retrying
+admission failures; new-device admission is bounded separately from reconnects.
