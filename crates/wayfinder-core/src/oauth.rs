@@ -1,8 +1,8 @@
-//! Installation-local authorization code + S256 PKCE flow. Consent is granted
-//! exclusively over private control, never by possession of a browser URL.
+//! Chain-bound authorization code + S256 PKCE flow. Consent is granted
+//! exclusively by an authenticated administrative device, never by possession of a browser URL.
 use crate::{
     credentials::{Capability, CredentialStore, OAuthTokens},
-    digest, now, random_secret, valid_name,
+    digest, now, random_secret,
 };
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -15,18 +15,7 @@ use std::{
 use url::Url;
 
 pub fn validate_issuer(value: &str) -> Result<()> {
-    let u = Url::parse(value)?;
-    ensure!(
-        u.scheme() == "https"
-            && u.host_str().is_some()
-            && u.username().is_empty()
-            && u.password().is_none()
-            && u.query().is_none()
-            && u.fragment().is_none()
-            && u.path() == "/"
-            && value == u.origin().ascii_serialization(),
-        "mcp_public_url must be a canonical HTTPS origin without a trailing slash"
-    );
+    crate::identity::validate_gateway(value)?;
     Ok(())
 }
 pub fn validate_redirect(value: &str) -> Result<()> {
@@ -85,7 +74,7 @@ pub enum AuthorizationError {
     Local,
     Redirect(String),
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Approval {
     pub id: String,
     pub client_id: String,
@@ -98,7 +87,7 @@ struct Pending {
     approval: Approval,
     state: Option<String>,
     challenge: String,
-    name: Option<String>,
+    chain: Option<String>,
 }
 struct Code {
     pending: Pending,
@@ -173,7 +162,7 @@ impl OAuth {
             .map_err(|_| failure("temporarily_unavailable"))?;
         state.pending.retain(|_, p| p.approval.expires > now());
         state.codes.retain(|_, c| c.expires > now());
-        if state.pending.len() + state.codes.len() >= 64 {
+        if state.pending.len() + state.codes.len() >= 1024 {
             return Err(failure("temporarily_unavailable"));
         }
         let ticket = random_secret();
@@ -181,7 +170,10 @@ impl OAuth {
             digest(ticket.as_bytes()),
             Pending {
                 approval: Approval {
-                    id: random_secret(),
+                    id: {
+                        let s = random_secret();
+                        format!("{}-{}", &s[..6], &s[6..12]).to_uppercase()
+                    },
                     client_id: client.id,
                     client_name: client.name,
                     redirect_uri: client.redirect_uri,
@@ -190,44 +182,48 @@ impl OAuth {
                 },
                 state: a.state,
                 challenge: a.code_challenge,
-                name: None,
+                chain: None,
             },
         );
         Ok(ticket)
     }
-    pub fn pending(&self) -> Result<Vec<Approval>> {
+    pub fn pending(&self, code: &str) -> Result<Approval> {
         let state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("OAuth unavailable"))?;
-        Ok(state
+        let matches: Vec<_> = state
             .pending
             .values()
-            .filter(|p| p.approval.expires > now() && p.name.is_none())
-            .map(|p| p.approval.clone())
-            .collect())
+            .filter(|p| p.approval.id == code && p.approval.expires > now() && p.chain.is_none())
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "Pending authorization not found or ambiguous"
+        );
+        Ok(matches[0].approval.clone())
     }
-    pub fn approve(&self, id: &str, name: String, allowed: BTreeSet<Capability>) -> Result<()> {
-        valid_name(&name)?;
+    pub fn approve(&self, code: &str, chain: String, request_hash: &str) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("OAuth unavailable"))?;
+        let matches = state
+            .pending
+            .values()
+            .filter(|p| p.approval.id == code && p.approval.expires > now() && p.chain.is_none())
+            .count();
+        ensure!(matches == 1, "Pending authorization not found or ambiguous");
         let p = state
             .pending
             .values_mut()
-            .find(|p| p.approval.id == id && p.approval.expires > now() && p.name.is_none())
-            .ok_or_else(|| anyhow::anyhow!("Pending authorization not found"))?;
+            .find(|p| p.approval.id == code && p.approval.expires > now() && p.chain.is_none())
+            .unwrap();
         ensure!(
-            !allowed.is_empty() && allowed.is_subset(&p.approval.permissions),
-            "Approve only requested permissions"
+            digest(&serde_json::to_vec(&p.approval)?) == request_hash,
+            "Approval details changed"
         );
-        ensure!(
-            !self.credentials.list()?.iter().any(|c| c.name == name),
-            "Credential name already exists"
-        );
-        p.approval.permissions = allowed;
-        p.name = Some(name);
+        p.chain = Some(chain);
         Ok(())
     }
     pub fn continue_authorization(&self, ticket: &str) -> Result<Continue> {
@@ -242,7 +238,7 @@ impl OAuth {
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("Authorization expired"))?;
         ensure!(p.approval.expires > now(), "Authorization expired");
-        if p.name.is_none() {
+        if p.chain.is_none() {
             return Ok(Continue::Waiting(p.approval.clone()));
         }
         let p = state.pending.remove(&key).unwrap();
@@ -301,10 +297,98 @@ impl OAuth {
             "invalid_grant"
         );
         self.credentials.issue_oauth(
-            p.name.unwrap(),
+            p.chain.unwrap(),
+            p.approval.client_name,
             p.approval.permissions,
             client_id.to_string(),
             self.issuer.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Exercise expiry boundaries directly so validation never waits ten minutes
+    // or changes the host clock. No production clock override exists.
+    #[test]
+    fn expired_pending_and_code_cannot_authorize() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("wayfinder-oauth-{}", random_secret()));
+        let store = Arc::new(CredentialStore::open(dir.join("registry.sqlite"))?);
+        let (client, _) = store.register_oauth_client(
+            "Expiry test".into(),
+            "http://127.0.0.1/callback".into(),
+            true,
+        )?;
+        let oauth = OAuth::new("http://127.0.0.1:12345".into(), store.clone())?;
+        let verifier = random_secret();
+        let begin = || {
+            oauth
+                .begin(Authorization {
+                    response_type: "code".into(),
+                    client_id: client.id.clone(),
+                    redirect_uri: client.redirect_uri.clone(),
+                    scope: Some("read".into()),
+                    state: Some("preserved".into()),
+                    resource: oauth.issuer.clone(),
+                    code_challenge: URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+                    code_challenge_method: "S256".into(),
+                })
+                .map_err(|_| anyhow::anyhow!("begin failed"))
+        };
+        let ticket = begin()?;
+        let id = {
+            let mut state = oauth.state.lock().unwrap();
+            let pending = state.pending.get_mut(&digest(ticket.as_bytes())).unwrap();
+            pending.approval.expires = now();
+            pending.approval.id.clone()
+        };
+        assert!(oauth.pending(&id).is_err());
+        assert!(oauth.approve(&id, "chain".into(), "hash").is_err());
+        assert!(oauth.continue_authorization(&ticket).is_err());
+        let ticket = begin()?;
+        let approval = match oauth.continue_authorization(&ticket)? {
+            Continue::Waiting(a) => a,
+            _ => panic!("unapproved request redirected"),
+        };
+        oauth.approve(
+            &approval.id,
+            "chain".into(),
+            &digest(&serde_json::to_vec(&approval)?),
+        )?;
+        let uri = match oauth.continue_authorization(&ticket)? {
+            Continue::Redirect(u) => u,
+            _ => panic!("approval did not redirect"),
+        };
+        let code = Url::parse(&uri)?
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        oauth
+            .state
+            .lock()
+            .unwrap()
+            .codes
+            .get_mut(&digest(code.as_bytes()))
+            .unwrap()
+            .expires = now();
+        assert!(
+            oauth
+                .exchange(
+                    &code,
+                    &client.id,
+                    &client.redirect_uri,
+                    &oauth.issuer,
+                    &verifier
+                )
+                .is_err()
+        );
+        assert!(oauth.state.lock().unwrap().codes.is_empty());
+        drop(oauth);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

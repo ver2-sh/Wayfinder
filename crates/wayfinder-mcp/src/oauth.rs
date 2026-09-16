@@ -12,16 +12,12 @@ use serde_json::json;
 use wayfinder_core::oauth::{Authorization, AuthorizationError, Continue};
 
 pub async fn resource(State(i): State<Ingress>) -> Response {
-    let Some(o) = &i.oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let o = &i.oauth;
     Json(json!({"resource":o.issuer,"authorization_servers":[o.issuer],"scopes_supported":["read","exec"],"bearer_methods_supported":["header"]})).into_response()
 }
 pub async fn metadata(State(i): State<Ingress>) -> Response {
-    let Some(o) = &i.oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    Json(json!({"issuer":o.issuer,"authorization_endpoint":format!("{}/oauth/authorize",o.issuer),"token_endpoint":format!("{}/oauth/token",o.issuer),"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post"],"code_challenge_methods_supported":["S256"],"scopes_supported":["read","exec"],"authorization_response_iss_parameter_supported":true})).into_response()
+    let o = &i.oauth;
+    Json(json!({"issuer":o.issuer,"authorization_endpoint":format!("{}/oauth/authorize",o.issuer),"registration_endpoint":format!("{}/oauth/register",o.issuer),"token_endpoint":format!("{}/oauth/token",o.issuer),"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["none","client_secret_basic","client_secret_post"],"code_challenge_methods_supported":["S256"],"scopes_supported":["read","exec"],"authorization_response_iss_parameter_supported":true})).into_response()
 }
 fn error(code: &'static str, status: StatusCode) -> Response {
     let mut response = (status, Json(json!({"error":code}))).into_response();
@@ -37,9 +33,7 @@ pub async fn authorize(
     State(i): State<Ingress>,
     query: Result<Query<Authorization>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    let Some(o) = &i.oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let o = &i.oauth;
     let Ok(Query(a)) = query else {
         return error("invalid_request", StatusCode::BAD_REQUEST);
     };
@@ -63,12 +57,10 @@ fn escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 pub async fn continue_authorization(State(i): State<Ingress>, Query(t): Query<Ticket>) -> Response {
-    let Some(o) = &i.oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let o = &i.oauth;
     match o.continue_authorization(&t.ticket) {
         Ok(Continue::Redirect(uri)) => Redirect::to(&uri).into_response(),
-        Ok(Continue::Waiting(a)) => Html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Authorize Wayfinder</title><h1>Authorize Wayfinder</h1><p>Client: {}</p><p>Redirect: {}</p><p>Requested permissions: {}</p><p>On your Wayfinder host, run <code>wayfinder auth pending</code>. Verify this request ID and redirect, then approve only if you initiated this connection.</p><pre>{}</pre><p>Execution grants shell access as the daemon account. Never approve a request supplied by someone else.</p><p>After approving, refresh this page to return to your MCP client. This request expires in ten minutes.</p></html>",escape(&a.client_name),escape(&a.redirect_uri),escape(&wayfinder_core::oauth::scope(&a.permissions)),a.id)).into_response(),
+        Ok(Continue::Waiting(a)) => Html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Authorize Wayfinder</title><h1>Authorize Wayfinder</h1><p>Client: {}</p><p>Redirect: {}</p><p>Requested permissions: {}</p><p>On an administrative Wayfinder device, run this command and verify the client and scopes. Never enter your recovery phrase in this browser.</p><pre>wayfinder authorize {}</pre><p>Execution grants shell access as the daemon account. Never approve a request supplied by someone else.</p><p>After approving, refresh this page to return to your MCP client. This request expires in ten minutes.</p></html>",escape(&a.client_name),escape(&a.redirect_uri),escape(&wayfinder_core::oauth::scope(&a.permissions)),a.id)).into_response(),
         Err(_) => error("invalid_request", StatusCode::BAD_REQUEST),
     }
 }
@@ -108,7 +100,10 @@ fn client_credentials(headers: &HeaderMap, form: &TokenRequest) -> Option<(Strin
         }
         Some((id, secret))
     } else {
-        Some((form.client_id.clone()?, form.client_secret.clone()?))
+        Some((
+            form.client_id.clone()?,
+            form.client_secret.clone().unwrap_or_default(),
+        ))
     }
 }
 pub async fn token(
@@ -116,9 +111,7 @@ pub async fn token(
     headers: HeaderMap,
     form: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let Some(o) = &i.oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let o = &i.oauth;
     let Ok(Form(f)) = form else {
         return error("invalid_request", StatusCode::BAD_REQUEST);
     };
@@ -155,5 +148,44 @@ pub async fn token(
     match result {
         Ok(tokens) => Json(tokens).into_response(),
         Err(_) => error("invalid_grant", StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Registration {
+    client_name: Option<String>,
+    redirect_uris: Vec<String>,
+    token_endpoint_auth_method: Option<String>,
+    grant_types: Option<Vec<String>>,
+    response_types: Option<Vec<String>>,
+}
+pub async fn register(State(i): State<Ingress>, Json(r): Json<Registration>) -> Response {
+    if r.redirect_uris.len() != 1
+        || r.grant_types.as_ref().is_some_and(|g| {
+            g.iter()
+                .any(|s| s != "authorization_code" && s != "refresh_token")
+        })
+        || r.response_types.as_ref().is_some_and(|g| g != &["code"])
+    {
+        return error("invalid_client_metadata", StatusCode::BAD_REQUEST);
+    }
+    let method = r.token_endpoint_auth_method.as_deref().unwrap_or("none");
+    if !["none", "client_secret_basic", "client_secret_post"].contains(&method) {
+        return error("invalid_client_metadata", StatusCode::BAD_REQUEST);
+    }
+    match i.credentials.register_oauth_client(
+        r.client_name.unwrap_or("MCP client".into()),
+        r.redirect_uris[0].clone(),
+        method == "none",
+    ) {
+        Ok((c, secret)) => {
+            let mut v = json!({"client_id":c.id,"client_name":c.name,"redirect_uris":[c.redirect_uri],"token_endpoint_auth_method":method,"grant_types":["authorization_code","refresh_token"],"response_types":["code"]});
+            if !c.public {
+                v["client_secret"] = json!(secret);
+                v["client_secret_expires_at"] = json!(0);
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(_) => error("invalid_client_metadata", StatusCode::BAD_REQUEST),
     }
 }

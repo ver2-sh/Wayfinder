@@ -1,5 +1,5 @@
 [package]
-name = "wayfinder-api"
+name = "wayfinder-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 wayfinder-core.workspace = true
-wayfinder-network.workspace = true
+wayfinder-exec.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+reqwest.workspace = true
+zeroize.workspace = true
