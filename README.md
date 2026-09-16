@@ -39,10 +39,14 @@ Windows x64, from PowerShell:
 
 ```powershell
 Invoke-WebRequest https://github.com/Made-by-Eugene/project-wayfinder/releases/latest/download/wayfinder-installer.ps1 -OutFile wayfinder-installer.ps1
-# Inspect the downloaded installer, then run under your existing execution policy:
-./wayfinder-installer.ps1
+# Inspect the downloaded installer, then use a process-only policy:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wayfinder-installer.ps1
 wayfinder
 ```
+
+`-ExecutionPolicy Bypass` applies only to that PowerShell process. It does not
+change CurrentUser or LocalMachine policy; organizational MachinePolicy/UserPolicy
+Group Policy still takes precedence. Wayfinder never calls `Set-ExecutionPolicy`.
 
 Installers place the binary in the current user's Cargo bin directory (normally
 `~/.cargo/bin`; Cargo itself is not required), update PATH, and write an install
@@ -50,6 +54,8 @@ receipt for updates. Open a new terminal if PATH has not refreshed. Archives and
 SHA-256 sums also support manual installation. No MSI is generated. Windows ARM
 users may use x64 emulation. Signing/notarization and the upstream PowerShell
 checksum limitation are documented in [release readiness](docs/releases.md).
+Release CI verifies cargo-dist 0.33.0 archives against repository-pinned SHA-256
+hashes before execution, including in the privileged publishing job.
 Do not disable OS protections to install an unsigned build.
 
 ## Normal usage
@@ -211,8 +217,10 @@ are reported without interrupting operation. No update installs automatically.
 `update` reports versions and asks for explicit confirmation. A matching dist
 receipt permits one-action updating through axoupdater and the release installer;
 users do not need to rerun the original installation command. On Windows, the
-current upstream updater is refused if it would relax the existing PowerShell
-execution policy; checks remain available. See the documented upstream limitation.
+updater uses process-scoped PowerShell `-ExecutionPolicy Bypass`; normal direct
+installs do not need an existing Bypass policy or a permanent policy change.
+Group Policy remains authoritative; if it blocks the installer, the update fails
+and the previous installation is restored. See [release limitations](docs/releases.md).
 Missing/mismatched
 receipts refuse replacement: use the owning package manager (for example
 `brew upgrade wayfinder` for a future Homebrew installation), or your source/manual

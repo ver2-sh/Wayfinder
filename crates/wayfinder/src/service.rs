@@ -203,6 +203,38 @@ fn native(data: &Path, action: Action) -> Result<()> {
     }
     Ok(())
 }
+// Encode one argv element using Windows CRT quote/backslash rules. PowerShell
+// quoting is a separate outer layer; its single-quoted strings preserve this.
+#[cfg(any(windows, test))]
+fn windows_argument(value: &str) -> String {
+    let mut encoded = String::from("\"");
+    let mut backslashes = 0;
+    for c in value.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        encoded.extend(std::iter::repeat_n(
+            '\\',
+            if c == '"' {
+                backslashes * 2 + 1
+            } else {
+                backslashes
+            },
+        ));
+        encoded.push(c);
+        backslashes = 0;
+    }
+    encoded.extend(std::iter::repeat_n('\\', backslashes * 2));
+    encoded.push('"');
+    encoded
+}
+
+#[cfg(any(windows, test))]
+fn windows_task_arguments(data: &str) -> String {
+    format!("--data-dir {} daemon", windows_argument(data))
+}
+
 #[cfg(windows)]
 fn native(data: &Path, action: Action) -> Result<()> {
     fn ps(s: &str) -> String {
@@ -218,7 +250,7 @@ fn native(data: &Path, action: Action) -> Result<()> {
             format!(
                 "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName {name} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null; Start-ScheduledTask -TaskName {name}",
                 ps(exe.to_str().context("Executable path must be UTF-8")?),
-                ps(&format!("--data-dir \"{data}\" daemon"))
+                ps(&windows_task_arguments(data))
             )
         }
         Action::Start => format!("Start-ScheduledTask -TaskName {name}"),
@@ -282,5 +314,31 @@ impl TemporaryAgent {
         self.stop.cancel();
         self.task.await??;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_task_command_lines() {
+        for (path, command) in [
+            (r"C:\wayfinder", r#"--data-dir "C:\wayfinder" daemon"#),
+            (
+                r"C:\My Data\wayfinder",
+                r#"--data-dir "C:\My Data\wayfinder" daemon"#,
+            ),
+            (r"C:\My Data\", r#"--data-dir "C:\My Data\\" daemon"#),
+            (r"C:\", r#"--data-dir "C:\\" daemon"#),
+            (
+                r"\\?\C:\My Data\",
+                r#"--data-dir "\\?\C:\My Data\\" daemon"#,
+            ),
+        ] {
+            assert_eq!(windows_task_arguments(path), command);
+        }
+        assert_eq!(windows_argument(""), r#""""#);
+        assert_eq!(windows_argument(r#"a\"b"#), r#""a\\\"b""#);
     }
 }

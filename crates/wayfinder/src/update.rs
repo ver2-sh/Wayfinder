@@ -51,29 +51,8 @@ fn updater(receipt: bool) -> Result<AxoUpdater> {
             .build()?,
     );
     if receipt {
-        // axoupdater 0.10.2 invokes PowerShell with process-scoped Bypass. Never
-        // use that to relax a user's existing script policy; discovery still works.
-        #[cfg(windows)]
-        {
-            let output = std::process::Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "Get-ExecutionPolicy",
-                ])
-                .output()
-                .context("Cannot inspect PowerShell execution policy")?;
-            ensure!(
-                output.status.success(),
-                "Cannot inspect PowerShell execution policy"
-            );
-            let policy = String::from_utf8_lossy(&output.stdout);
-            ensure!(
-                policy.trim() == "Bypass",
-                "Automatic update unavailable under the current PowerShell policy: upstream axoupdater uses process-scoped Bypass. Use an approved signed/manual installation; Wayfinder will not lower your policy"
-            );
-        }
+        // axoupdater uses process-scoped PowerShell Bypass on Windows. It does
+        // not persist policy changes; MachinePolicy/UserPolicy take precedence.
         u.load_receipt().context("No direct-install receipt. Upgrade using the package manager or source/manual installation method that owns this binary")?;
         ensure!(
             u.check_receipt_is_for_this_executable()?,
@@ -168,7 +147,11 @@ pub async fn install(data: &Path) -> Result<()> {
         ensure!(
             u.run()
                 .await
-                .context("Update failed; user identity and configuration were not changed")?
+                .context(if cfg!(windows) {
+                    "Update failed; identity and configuration were not changed. If PowerShell reports an organizational MachinePolicy/UserPolicy restriction, contact your administrator; Wayfinder does not override Group Policy or change persistent execution policy"
+                } else {
+                    "Update failed; user identity and configuration were not changed"
+                })?
                 .is_some(),
             "No binary replacement was performed"
         );
