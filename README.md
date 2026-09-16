@@ -24,12 +24,14 @@ ChatGPT / other MCP client ── HTTPS + chain-bound OAuth ──┐
 **Private and unreleased today:** anonymous consumer downloads and update checks
 are not yet available. The following is the intended release installation path
 once public releases exist; it requires no Rust, Cargo, compiler or repository
-checkout. Do not supply private credentials to installer commands.
+checkout. `usewayfinder.app` is the stable public install front door and redirects
+to the corresponding public GitHub Release assets. Do not supply private
+credentials to installer commands.
 
 Linux x64/ARM64, WSL (inside Linux), and macOS Intel/Apple Silicon:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Made-by-Eugene/project-wayfinder/releases/latest/download/wayfinder-installer.sh -o wayfinder-installer.sh
+curl --proto '=https' --tlsv1.2 -LsSf https://usewayfinder.app/install.sh -o wayfinder-installer.sh
 # Inspect the downloaded installer, then:
 sh wayfinder-installer.sh
 wayfinder
@@ -38,7 +40,7 @@ wayfinder
 Windows x64, from PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Made-by-Eugene/project-wayfinder/releases/latest/download/wayfinder-installer.ps1 -OutFile wayfinder-installer.ps1
+Invoke-WebRequest https://usewayfinder.app/install.ps1 -OutFile wayfinder-installer.ps1
 # Inspect the downloaded installer, then use a process-only policy:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\wayfinder-installer.ps1
 wayfinder
