@@ -1,0 +1,24 @@
+[Unit]
+Description=Wayfinder shared MCP and Sync Chain gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=wayfinder-gateway
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/wayfinder-gateway --data-dir /var/lib/wayfinder-gateway --listen 127.0.0.1:3000 --public-url https://mcp.usewayfinder.app
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

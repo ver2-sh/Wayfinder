@@ -1,345 +1,50 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-
-ROOT="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
-WAYFINDER_DIR="${WAYFINDER_REPO_DIR:-$ROOT}"
-UNIT_NAME="wayfinder.service"
-UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
-GLOBAL_LINK="/usr/local/bin/wayfinder"
-BINARY="${WAYFINDER_DIR}/target/release/wayfinder"
-
-if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-  echo "Run this script as your normal user, not with sudo." >&2
-  exit 1
-fi
-
-if (( EUID == 0 )); then
-  SUDO=()
-else
-  command -v sudo >/dev/null 2>&1 || {
-    echo "sudo is required when not running as root." >&2
-    exit 1
-  }
-  SUDO=(sudo)
-fi
-
-usage() {
-  cat <<EOF
-Usage: wayfinder <command>
-
-Manage the Wayfinder daemon (Rust) as a systemd service.
-Also callable as ./wayfinder-service.sh <command>.
-
-Commands:
-  install   Build Wayfinder, install the systemd unit, install the
-            global 'wayfinder' command, and start the service
-  update    Git-pull (ff-only), rebuild, and restart the service
-  build     Build the release binary with cargo
-  start     Start the service
-  stop      Stop the service
-  restart   Restart the service
-  status    Show service status
-  logs      Follow service logs
-  disable   Stop and disable the service
-  remove    Stop, disable, remove the systemd unit and global command
-  services  Observe live application services (forwarded to CLI)
-  tui       Open the terminal interface (forwarded to CLI)
-  init, daemon, control, auth and --data-dir are also forwarded to the CLI.
-
-Environment:
-  WAYFINDER_REPO_DIR  Repository directory (default: this script directory)
-  WAYFINDER_DATA_DIR  Explicit Wayfinder private data directory passed to the
-                      service as --data-dir (default: the service account's
-                      OS application-data directory, e.g. ~/.local/share/wayfinder)
-
-The daemon must be initialized before the service can run:
-  wayfinder init --name NAME   (as the service account, or with --data-dir)
-EOF
-}
-
-require_wayfinder() {
-  [[ -d "$WAYFINDER_DIR" && -f "$WAYFINDER_DIR/Cargo.toml" ]] || {
-    echo "Wayfinder repository not found at ${WAYFINDER_DIR}." >&2
-    echo "Clone it there, or set WAYFINDER_REPO_DIR." >&2
-    exit 1
-  }
-}
-
-require_cargo() {
-  command -v cargo >/dev/null 2>&1 || {
-    echo "cargo is not installed; install Rust via rustup." >&2
-    exit 1
-  }
-}
-
-build_wayfinder() {
-  require_wayfinder
-  require_cargo
-  echo "Building Wayfinder (release)..."
-  (cd "$WAYFINDER_DIR" && cargo build --release -p wayfinder)
-  echo "Build complete: ${BINARY}"
-}
-
-update_wayfinder() {
-  require_wayfinder
-  require_cargo
-
-  echo "Fetching latest changes for project-wayfinder..."
-  git -C "$WAYFINDER_DIR" fetch --prune origin
-
-  local head_sha upstream_sha upstream
-  head_sha="$(git -C "$WAYFINDER_DIR" rev-parse HEAD)"
-  upstream="$(git -C "$WAYFINDER_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-  if [[ -z "$upstream" || "$upstream" != origin/* ]]; then
-    echo "Current branch has no upstream tracking origin; skipping update." >&2
-    exit 1
-  fi
-  upstream_sha="$(git -C "$WAYFINDER_DIR" rev-parse "$upstream")"
-
-  if [[ "$head_sha" == "$upstream_sha" ]]; then
-    echo "Already up to date at ${head_sha:0:12}."
-    return 0
-  fi
-
-  local dirty
-  if ! dirty="$(git -C "$WAYFINDER_DIR" status --porcelain 2>/dev/null)"; then
-    echo "Cannot inspect the worktree; skipping update." >&2
-    exit 1
-  fi
-  if [[ -n "$dirty" ]]; then
-    echo "Worktree is dirty or has untracked files; refusing to update." >&2
-    echo "Commit or stash your changes, then rerun 'wayfinder update'." >&2
-    exit 1
-  fi
-
-  if git -C "$WAYFINDER_DIR" merge-base --is-ancestor HEAD "$upstream"; then
-    echo "Fast-forwarding to ${upstream_sha:0:12}..."
-    git -C "$WAYFINDER_DIR" merge --ff-only "$upstream"
-  elif git -C "$WAYFINDER_DIR" merge-base --is-ancestor "$upstream" HEAD; then
-    echo "Local is ahead of ${upstream}; leaving it unchanged." >&2
-    return 0
-  else
-    echo "Local branch has diverged from ${upstream}; refusing to update." >&2
-    echo "Rebase or merge manually, then rerun 'wayfinder update'." >&2
-    exit 1
-  fi
-
-  echo
-  build_wayfinder
-  echo
-  install_unit --built
-  echo "Wayfinder updated and restarted."
-}
-
-install_unit() {
-  if [[ "${1:-}" != --built ]]; then build_wayfinder; fi
-
-  local run_user run_group home_dir tmp_unit backup_unit
-  local old_unit_exists=0 old_active=0 old_enabled=0 rollback_needed=0
-
-  run_user="$(stat -c '%U' "$WAYFINDER_DIR")"
-  run_group="$(stat -c '%G' "$WAYFINDER_DIR")"
-  home_dir="$(getent passwd "$run_user" | cut -d: -f6)"
-  [[ -n "$home_dir" ]] || {
-    echo "Could not determine home directory for ${run_user}." >&2
-    exit 1
-  }
-
-  local data_dir exec_start
-  data_dir="${WAYFINDER_DATA_DIR:-${home_dir}/.local/share/wayfinder}"
-  if [[ -n "${WAYFINDER_DATA_DIR:-}" ]]; then
-    exec_start="${BINARY} --data-dir ${WAYFINDER_DATA_DIR} daemon"
-  else
-    exec_start="${BINARY} daemon"
-  fi
-  if [[ ! -f "${data_dir}/config.json" ]]; then
-    echo "WARNING: no Wayfinder configuration at ${data_dir}." >&2
-    echo "The service will fail until it is initialized, e.g.:" >&2
-    echo "  sudo -u ${run_user} ${exec_start/daemon/init --name NAME}" >&2
-  fi
-
-  # Shared OS contract; membership grants application transport only.
-  getent group wayfinder-apps >/dev/null || "${SUDO[@]}" groupadd --system wayfinder-apps
-
-  tmp_unit="$(mktemp)"
-  backup_unit="$(mktemp)"
-  trap 'rm -f "$tmp_unit" "$backup_unit"' RETURN
-
-  cat > "$tmp_unit" <<EOF
+set -euo pipefail
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+command_name="${1:-help}"
+case "$command_name" in
+  build) exec "$repo_dir/build-production.sh" ;;
+  install)
+    # Run as the account whose OS privileges remote commands should receive.
+    run_user="$(id -un)"
+    run_group="$(id -gn)"
+    data_dir="${WAYFINDER_DATA_DIR:-$HOME/.local/share/wayfinder}"
+    [[ "$data_dir" == /* && "$data_dir" != *[[:space:]\%\"\\]* ]] || { echo 'Use an absolute data directory without whitespace, %, quote or backslash' >&2; exit 1; }
+    if (( EUID == 0 )); then elevate=(); else elevate=(sudo); fi
+    "$repo_dir/build-production.sh"
+    tmp_unit="$(mktemp)"
+    trap 'rm -f "$tmp_unit"' EXIT
+    cat > "$tmp_unit" <<UNIT
 [Unit]
-Description=Wayfinder daemon (private network of MCP shell execution nodes)
+Description=Wayfinder Sync Chain agent
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists=$data_dir/installation.json
 
 [Service]
 Type=simple
-User=${run_user}
-Group=wayfinder-apps
-RuntimeDirectory=wayfinder
-RuntimeDirectoryMode=2750
-WorkingDirectory=${WAYFINDER_DIR}
-Environment=HOME=${home_dir}
-ExecStart=${exec_start}
-Restart=always
-RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
+User=$run_user
+Group=$run_group
+ExecStart=/usr/local/bin/wayfinder --data-dir $data_dir daemon
+Restart=on-failure
+RestartSec=5
 UMask=0077
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-  if "${SUDO[@]}" test -e "$UNIT_PATH"; then
-    old_unit_exists=1
-    "${SUDO[@]}" cat "$UNIT_PATH" > "$backup_unit"
-  fi
-  if systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
-    old_active=1
-  fi
-  if systemctl is-enabled --quiet "$UNIT_NAME" 2>/dev/null; then
-    old_enabled=1
-  fi
-
-  rollback_unit() {
-    local original_rc="${1:-1}"
-    trap - ERR
-    set +e
-
-    echo
-    echo "Service activation failed; restoring the previous systemd state..." >&2
-
-    if (( old_unit_exists )); then
-      "${SUDO[@]}" install -m 0644 "$backup_unit" "$UNIT_PATH"
-    else
-      "${SUDO[@]}" rm -f "$UNIT_PATH"
-    fi
-    "${SUDO[@]}" systemctl daemon-reload
-
-    if (( old_enabled )); then
-      "${SUDO[@]}" systemctl enable "$UNIT_NAME" >/dev/null 2>&1
-    else
-      "${SUDO[@]}" systemctl disable "$UNIT_NAME" >/dev/null 2>&1
-    fi
-
-    if (( old_active )); then
-      "${SUDO[@]}" systemctl restart "$UNIT_NAME"
-      if ! systemctl is-active --quiet "$UNIT_NAME"; then
-        echo "WARNING: previous service could not be restored to active state automatically." >&2
-      fi
-    else
-      "${SUDO[@]}" systemctl stop "$UNIT_NAME" >/dev/null 2>&1
-    fi
-
-    set -e
-    exit "$original_rc"
-  }
-
-  on_error() {
-    local rc=$?
-    if (( rollback_needed )); then
-      rollback_unit "$rc"
-    fi
-    exit "$rc"
-  }
-
-  trap on_error ERR
-
-  echo "Installing systemd unit..."
-  rollback_needed=1
-  "${SUDO[@]}" install -m 0644 "$tmp_unit" "$UNIT_PATH"
-  "${SUDO[@]}" systemctl daemon-reload
-  "${SUDO[@]}" systemctl enable "$UNIT_NAME"
-
-  if (( old_active )); then
-    "${SUDO[@]}" systemctl restart "$UNIT_NAME"
-  else
-    "${SUDO[@]}" systemctl start "$UNIT_NAME"
-  fi
-
-  "${SUDO[@]}" systemctl is-active --quiet "$UNIT_NAME"
-
-  rollback_needed=0
-  trap - ERR
-
-  # Install the global 'wayfinder' symlink so the script is callable from anywhere.
-  if [[ -e "$GLOBAL_LINK" && ! -L "$GLOBAL_LINK" ]]; then
-    echo "WARNING: ${GLOBAL_LINK} exists but is not a symlink; leaving it unchanged." >&2
-  else
-    local tmp_link="${ROOT}/.wayfinder.new.$$"
-    rm -f "$tmp_link"
-    ln -s "${ROOT}/wayfinder-service.sh" "$tmp_link"
-    "${SUDO[@]}" mv -Tf "$tmp_link" "$GLOBAL_LINK"
-  fi
-
-  echo
-  "${SUDO[@]}" systemctl --no-pager --full status "$UNIT_NAME"
-}
-
-cmd="${1:-}"
-case "$cmd" in
-  init|daemon|tui|services|control|auth|--data-dir|--data-dir=*|--version)
-    require_wayfinder
-    app_args=("$@")
-    explicit_data=false
-    for arg in "$@"; do
-      case "$arg" in --data-dir|--data-dir=*) explicit_data=true ;; esac
-    done
-    if [[ -n "${WAYFINDER_DATA_DIR:-}" && "$explicit_data" == false ]]; then
-      app_args=(--data-dir "$WAYFINDER_DATA_DIR" "${app_args[@]}")
-    fi
-    exec "$BINARY" "${app_args[@]}"
+UNIT
+    "${elevate[@]}" install -m 0755 "$repo_dir/target/release/wayfinder" /usr/local/bin/wayfinder.new
+    "${elevate[@]}" mv -Tf /usr/local/bin/wayfinder.new /usr/local/bin/wayfinder
+    "${elevate[@]}" install -m 0644 "$tmp_unit" /etc/systemd/system/wayfinder.service
+    "${elevate[@]}" systemctl daemon-reload
+    "${elevate[@]}" systemctl enable wayfinder.service
+    "${elevate[@]}" systemctl restart wayfinder.service
+    echo "Agent installed as $run_user. Commands execute with that account's OS privileges."
+    echo "If not enrolled, run: wayfinder --data-dir $data_dir chain create --name DEVICE"
+    echo 'Then run: sudo systemctl start wayfinder.service'
     ;;
-  install)
-    install_unit
-    ;;
-  update)
-    update_wayfinder
-    ;;
-  build)
-    build_wayfinder
-    ;;
-  start)
-    require_wayfinder
-    "${SUDO[@]}" systemctl start "$UNIT_NAME"
-    ;;
-  stop)
-    "${SUDO[@]}" systemctl stop "$UNIT_NAME"
-    ;;
-  restart)
-    require_wayfinder
-    "${SUDO[@]}" systemctl restart "$UNIT_NAME"
-    "${SUDO[@]}" systemctl is-active --quiet "$UNIT_NAME"
-    ;;
-  status)
-    "${SUDO[@]}" systemctl --no-pager --full status "$UNIT_NAME"
-    ;;
-  logs)
-    "${SUDO[@]}" journalctl -u "$UNIT_NAME" -n 100 -f
-    ;;
-  disable)
-    "${SUDO[@]}" systemctl disable --now "$UNIT_NAME"
-    ;;
-  remove)
-    "${SUDO[@]}" systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
-    "${SUDO[@]}" rm -f "$UNIT_PATH"
-    "${SUDO[@]}" systemctl daemon-reload
-    # Remove the global symlink only if it points at this script.
-    if [[ -L "$GLOBAL_LINK" ]]; then
-      local resolved
-      resolved="$(readlink -f "$GLOBAL_LINK" 2>/dev/null || true)"
-      if [[ "$resolved" == "${ROOT}/wayfinder-service.sh" ]]; then
-        "${SUDO[@]}" rm -f "$GLOBAL_LINK"
-      fi
-    fi
-    echo "Removed ${UNIT_PATH}. Wayfinder source was left untouched."
-    ;;
-  -h|--help|"")
-    usage
-    exit 0
-    ;;
-  *)
-    usage >&2
-    exit 2
-    ;;
+  start|stop|restart|status) exec systemctl "$command_name" wayfinder.service ;;
+  logs) exec journalctl -u wayfinder.service -f ;;
+  *) echo 'Usage: ./wayfinder-service.sh install|build|start|stop|restart|status|logs'
+     echo 'The installed wayfinder command is the agent CLI. This script installs no gateway.' ;;
 esac

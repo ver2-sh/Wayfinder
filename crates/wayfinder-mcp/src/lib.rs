@@ -18,21 +18,32 @@ use rmcp::{
     },
 };
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use std::{future::Future, pin::Pin};
 use wayfinder_core::credentials::{Capability, ClientIdentity, CredentialStore};
 use wayfinder_core::{ExecInput, bearer_value};
-use wayfinder_network::Network;
+pub trait Routing: Send + Sync {
+    fn nodes<'a>(
+        &'a self,
+        chain: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send + 'a>>;
+    fn execute<'a>(
+        &'a self,
+        client: ClientIdentity,
+        input: ExecInput,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = wayfinder_core::ExecResult> + Send + 'a>>;
+}
 #[derive(Clone)]
 struct Mcp {
-    network: Arc<Network>,
-    issuer: Option<String>,
+    routing: Arc<dyn Routing>,
+    issuer: String,
     tools: ToolRouter<Self>,
 }
 #[tool_router]
 impl Mcp {
-    fn new(network: Arc<Network>, issuer: Option<String>) -> Self {
+    fn new(routing: Arc<dyn Routing>, issuer: String) -> Self {
         let mut tools = Self::tool_router();
-        if issuer.is_some() {
+        {
             for (name, scope) in [("nodes", "read"), ("exec", "exec")] {
                 // rmcp has no top-level securitySchemes field. Use OpenAI's
                 // documented compatibility representation in native Tool.meta.
@@ -45,15 +56,13 @@ impl Mcp {
             }
         }
         Self {
-            network,
+            routing,
             issuer,
             tools,
         }
     }
-    fn capability_error(&self, error: ErrorData, scope: &str) -> Result<CallToolResult, ErrorData> {
-        let Some(issuer) = &self.issuer else {
-            return Err(error);
-        };
+    fn capability_error(&self, scope: &str) -> Result<CallToolResult, ErrorData> {
+        let issuer = &self.issuer;
         let challenge = format!(
             "Bearer error=\"insufficient_scope\", error_description=\"Credential lacks the required capability\", scope=\"{scope}\", resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\""
         );
@@ -68,30 +77,33 @@ impl Mcp {
         .with_meta(Some(meta)))
     }
     #[tool(
-        description = "Discover Wayfinder nodes: stable ID, unique name, entry node and last observed reachability."
+        description = "Discover Wayfinder nodes: stable device ID, display name, role and reachability within your Sync Chain."
     )]
     async fn nodes(
         &self,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(error) = require(&context, Capability::Read) {
-            return self.capability_error(error, "read");
+        if require(&context, Capability::Read).is_err() {
+            return self.capability_error("read");
         }
-        let value = serde_json::json!({"nodes":self.network.status().await.nodes});
+        let value = serde_json::json!({"nodes":self.routing.nodes(&identity(&context)?.chain_id).await.map_err(|_|ErrorData::internal_error("Registry unavailable",None))?});
         Ok(CallToolResult::structured(value))
     }
     #[tool(
-        description = "Execute a fresh host shell as the selected node's OS account. No sandbox. Omit target for this node; otherwise use exact node ID or unique name. Timeout is 1–300000 milliseconds. No fallback or automatic retry."
+        description = "Execute a fresh host shell as the selected node's OS account. No sandbox. Target is required: use a stable device ID or unique name within your Sync Chain. Timeout is 1–300000 milliseconds. No fallback or automatic retry."
     )]
     async fn exec(
         &self,
         Parameters(input): Parameters<ExecInput>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(error) = require(&context, Capability::Exec) {
-            return self.capability_error(error, "exec");
+        if require(&context, Capability::Exec).is_err() {
+            return self.capability_error("exec");
         }
-        let result = self.network.execute(input, context.ct.clone()).await;
+        let result = self
+            .routing
+            .execute(identity(&context)?.clone(), input, context.ct.clone())
+            .await;
         let failed = result.is_error();
         let mut response = CallToolResult::structured(
             serde_json::to_value(result)
@@ -106,6 +118,13 @@ impl ServerHandler for Mcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new("wayfinder",env!("CARGO_PKG_VERSION"))).with_instructions("Use nodes to choose a target, then exec. Commands execute as the target daemon's OS account.")
     }
+}
+fn identity(context: &RequestContext<RoleServer>) -> Result<&ClientIdentity, ErrorData> {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|p| p.extensions.get::<ClientIdentity>())
+        .ok_or_else(|| ErrorData::invalid_request("Missing authorization", None))
 }
 fn require(context: &RequestContext<RoleServer>, permission: Capability) -> Result<(), ErrorData> {
     let client = context
@@ -123,21 +142,20 @@ fn require(context: &RequestContext<RoleServer>, permission: Capability) -> Resu
 }
 #[derive(Clone)]
 struct Ingress {
-    network: Arc<Network>,
     credentials: Arc<CredentialStore>,
-    oauth: Option<Arc<wayfinder_core::oauth::OAuth>>,
+    oauth: Arc<wayfinder_core::oauth::OAuth>,
 }
 async fn guard(State(ingress): State<Ingress>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    let oauth_path = ingress.oauth.is_some()
-        && matches!(
-            path,
-            "/.well-known/oauth-protected-resource"
-                | "/.well-known/oauth-authorization-server"
-                | "/oauth/authorize"
-                | "/oauth/continue"
-                | "/oauth/token"
-        );
+    let oauth_path = matches!(
+        path,
+        "/.well-known/oauth-protected-resource"
+            | "/.well-known/oauth-authorization-server"
+            | "/oauth/authorize"
+            | "/oauth/continue"
+            | "/oauth/token"
+            | "/oauth/register"
+    );
     if path != "/" && !oauth_path {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -145,13 +163,8 @@ async fn guard(State(ingress): State<Ingress>, mut req: Request, next: Next) -> 
         return StatusCode::NOT_FOUND.into_response();
     }
     let origin = req.headers().get("origin");
-    if origin.is_some_and(|v| {
-        !oauth_path
-            || ingress
-                .oauth
-                .as_ref()
-                .is_none_or(|o| v.to_str().ok() != Some(o.issuer.as_str()))
-    }) {
+    if origin.is_some_and(|v| !oauth_path || v.to_str().ok() != Some(ingress.oauth.issuer.as_str()))
+    {
         return StatusCode::FORBIDDEN.into_response();
     }
     // Both SDK and ingress require the proxy to rewrite Host to loopback.
@@ -166,9 +179,6 @@ async fn guard(State(ingress): State<Ingress>, mut req: Request, next: Next) -> 
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if ingress.network.shutdown.is_cancelled() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     if oauth_path {
         return secured(next.run(req).await);
     }
@@ -181,20 +191,17 @@ async fn guard(State(ingress): State<Ingress>, mut req: Request, next: Next) -> 
     let client = if req.headers().get_all("authorization").iter().count() == 1 {
         ingress
             .credentials
-            .authenticate(token, ingress.oauth.as_ref().map(|o| o.issuer.as_str()))
+            .authenticate(token, &ingress.oauth.issuer)
     } else {
         Ok(None)
     };
     let client = match client {
         Ok(Some(client)) => client,
         Ok(None) => {
-            let challenge = match &ingress.oauth {
-                Some(o) => format!(
-                    "Bearer realm=\"wayfinder\", resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"read exec\"",
-                    o.issuer
-                ),
-                None => "Bearer realm=\"wayfinder\"".to_string(),
-            };
+            let challenge = format!(
+                "Bearer realm=\"wayfinder\", resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"read exec\"",
+                ingress.oauth.issuer
+            );
             return (
                 StatusCode::UNAUTHORIZED,
                 [
@@ -228,31 +235,25 @@ fn secured(mut response: Response) -> Response {
     }
     response
 }
-pub async fn serve(
-    listener: TcpListener,
-    network: Arc<Network>,
+pub fn router(
+    routing: Arc<dyn Routing>,
     credentials: Arc<CredentialStore>,
-    oauth: Option<Arc<wayfinder_core::oauth::OAuth>>,
-) -> anyhow::Result<()> {
-    let factory = network.clone();
-    let issuer = oauth.as_ref().map(|o| o.issuer.clone());
+    oauth: Arc<wayfinder_core::oauth::OAuth>,
+) -> Router {
+    let factory = routing.clone();
+    let issuer = oauth.issuer.clone();
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true);
     let mut config = config;
-    config.cancellation_token = network.shutdown.clone();
     config.max_request_body_bytes = 131072;
     let service = StreamableHttpService::new(
         move || Ok(Mcp::new(factory.clone(), issuer.clone())),
         Arc::new(LocalSessionManager::default()),
         config,
     );
-    let ingress = Ingress {
-        network: network.clone(),
-        credentials,
-        oauth,
-    };
-    let app = Router::new()
+    let ingress = Ingress { credentials, oauth };
+    Router::new()
         .route_service("/", service)
         .route(
             "/.well-known/oauth-protected-resource",
@@ -268,11 +269,8 @@ pub async fn serve(
             axum::routing::get(oauth::continue_authorization),
         )
         .route("/oauth/token", axum::routing::post(oauth::token))
+        .route("/oauth/register", axum::routing::post(oauth::register))
         .layer(DefaultBodyLimit::max(131072))
         .layer(middleware::from_fn_with_state(ingress.clone(), guard))
-        .with_state(ingress);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(network.shutdown.clone().cancelled_owned())
-        .await?;
-    Ok(())
+        .with_state(ingress)
 }

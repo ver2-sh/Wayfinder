@@ -10,7 +10,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
@@ -19,14 +19,12 @@ ed25519-dalek = "2"
 fs2 = "0.4"
 hex = "0.4"
 rand = "0.8"
-ratatui = "0.30.2"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3.3.0", features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-snow = "0.10"
 subtle = "2"
 url = "2"
 tokio = { version = "1", features = ["full"] }
@@ -34,7 +32,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 nix = { version = "0.30", features = ["signal", "process"] }
 wayfinder-core = { path = "crates/wayfinder-core" }
 wayfinder-exec = { path = "crates/wayfinder-exec" }
-wayfinder-network = { path = "crates/wayfinder-network" }
-wayfinder-api = { path = "crates/wayfinder-api" }
 wayfinder-mcp = { path = "crates/wayfinder-mcp" }
-wayfinder-tui = { path = "crates/wayfinder-tui" }
+bip39 = { version = "2", features = ["zeroize"] }
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+rpassword = "7"
+wayfinder-agent = { path = "crates/wayfinder-agent" }
+wayfinder-gateway = { path = "crates/wayfinder-gateway" }

@@ -1,237 +1,53 @@
-//! Installation-local API credentials, persisted using the existing private JSON store.
-use crate::{atomic_write, digest, key_bytes, now, random_secret, read_private, valid_name};
+//! Single-host SQLite registry. All device and grant administration is chain-scoped.
+use crate::{digest, identity::Certificate, now, protocol::Device, random_secret, secret_eq};
 use anyhow::{Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
-use subtle::ConstantTimeEq;
-
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{Mutex, MutexGuard},
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     Read,
     Exec,
 }
-
-/// Public client identity; deliberately contains no verifier or bearer secret.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientIdentity {
     pub id: String,
+    pub chain_id: String,
     pub name: String,
+    pub client_id: String,
     pub permissions: BTreeSet<Capability>,
     pub created: u64,
-    pub last_used: Option<u64>,
     pub revoked: Option<u64>,
 }
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Record {
-    client: ClientIdentity,
-    secret_sha256: String,
-    oauth: Option<OAuthGrant>,
+#[derive(Serialize)]
+pub struct GrantInfo {
+    #[serde(flatten)]
+    pub identity: ClientIdentity,
+    pub access_expires: u64,
+    pub refresh_expires: u64,
+    pub active: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Credentials {
-    version: u32,
-    records: Vec<Record>,
-    oauth_clients: Vec<OAuthClient>,
-}
-/// Owned by the daemon under its directory lock, shared only with ingress/control.
-/// Never replicated to peers. Mutations commit before becoming visible in memory.
-pub struct CredentialStore {
-    path: PathBuf,
-    state: Mutex<Credentials>,
-}
-impl CredentialStore {
-    pub fn open(path: PathBuf) -> Result<Self> {
-        let state: Credentials = if path.exists() {
-            read_private(&path)?
-        } else {
-            let empty = Credentials {
-                version: 1,
-                records: vec![],
-                oauth_clients: vec![],
-            };
-            atomic_write(&path, &empty)?;
-            empty
-        };
-        ensure!(
-            state.version == 1 && state.records.len() <= 1024,
-            "Unsupported credential store"
-        );
-        ensure!(
-            state.oauth_clients.len() <= 128,
-            "OAuth client limit exceeded"
-        );
-        let mut client_ids = BTreeSet::new();
-        for c in &state.oauth_clients {
-            key_bytes(&c.id)?;
-            key_bytes(&c.secret_sha256)?;
-            valid_name(&c.name)?;
-            crate::oauth::validate_redirect(&c.redirect_uri)?;
-            ensure!(client_ids.insert(&c.id), "Duplicate OAuth client");
-        }
-        let mut ids = BTreeSet::new();
-        let mut names = BTreeSet::new();
-        for r in &state.records {
-            key_bytes(&r.client.id)?;
-            key_bytes(&r.secret_sha256)?;
-            valid_name(&r.client.name)?;
-            if let Some(g) = &r.oauth {
-                crate::oauth::validate_issuer(&g.resource)?;
-                key_bytes(&g.refresh_sha256)?;
-                ensure!(
-                    client_ids.contains(&g.client_id) && g.used_refreshes.len() <= 4096,
-                    "Invalid OAuth grant"
-                );
-                for hash in &g.used_refreshes {
-                    key_bytes(hash)?;
-                }
-            }
-            ensure!(
-                !r.client.permissions.is_empty()
-                    && ids.insert(&r.client.id)
-                    && names.insert(&r.client.name),
-                "Invalid credential record"
-            );
-        }
-        Ok(Self {
-            path,
-            state: Mutex::new(state),
-        })
-    }
-    pub fn create(
-        &self,
-        name: String,
-        permissions: BTreeSet<Capability>,
-    ) -> Result<(ClientIdentity, String)> {
-        valid_name(&name)?;
-        ensure!(!permissions.is_empty(), "Select at least one permission");
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        ensure!(state.records.len() < 1024, "Credential limit reached");
-        ensure!(
-            !state.records.iter().any(|r| r.client.name == name),
-            "Credential name already exists; choose a new name for rotation"
-        );
-        let client = ClientIdentity {
-            id: random_secret(),
-            name,
-            permissions,
-            created: now(),
-            last_used: None,
-            revoked: None,
-        };
-        let secret = random_secret();
-        // 256 random bits from the OS CSPRNG make offline guessing infeasible.
-        // SHA-256 is appropriate for this API secret, unlike a human password;
-        // password KDF cost would only amplify unauthenticated request load.
-        let mut updated = state.clone();
-        updated.records.push(Record {
-            client: client.clone(),
-            secret_sha256: digest(secret.as_bytes()),
-            oauth: None,
-        });
-        atomic_write(&self.path, &updated)?;
-        *state = updated;
-        Ok((client.clone(), format!("wf_{}_{}", client.id, secret)))
-    }
-    pub fn list(&self) -> Result<Vec<ClientIdentity>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        Ok(state.records.iter().map(|r| r.client.clone()).collect())
-    }
-    pub fn revoke(&self, name: &str) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        let mut updated = state.clone();
-        let record = updated
-            .records
-            .iter_mut()
-            .find(|r| r.client.name == name)
-            .ok_or_else(|| anyhow::anyhow!("Credential not found"))?;
-        record.client.revoked.get_or_insert_with(now);
-        atomic_write(&self.path, &updated)?;
-        *state = updated;
-        Ok(())
-    }
-    pub fn authenticate(
-        &self,
-        token: &str,
-        issuer: Option<&str>,
-    ) -> Result<Option<ClientIdentity>> {
-        let Some((id, secret)) = token.strip_prefix("wf_").and_then(|v| v.split_once('_')) else {
-            return Ok(None);
-        };
-        if key_bytes(id).is_err() || key_bytes(secret).is_err() {
-            return Ok(None);
-        }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        let Some(index) = state.records.iter().position(|r| r.client.id == id) else {
-            return Ok(None);
-        };
-        let record = &state.records[index];
-        let supplied = digest(secret.as_bytes());
-        if !bool::from(supplied.as_bytes().ct_eq(record.secret_sha256.as_bytes()))
-            || record.client.revoked.is_some()
-            || record
-                .oauth
-                .as_ref()
-                .is_some_and(|g| Some(g.resource.as_str()) != issuer || now() >= g.expires)
-        {
-            return Ok(None);
-        }
-        // Persist at most once a minute per active credential, bounding write load.
-        let used = now();
-        if record
-            .client
-            .last_used
-            .is_none_or(|last| used.saturating_sub(last) >= 60)
-        {
-            let mut updated = state.clone();
-            updated.records[index].client.last_used = Some(used);
-            atomic_write(&self.path, &updated)?;
-            *state = updated;
-        }
-        Ok(Some(state.records[index].client.clone()))
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OAuthGrant {
-    client_id: String,
-    resource: String,
-    expires: u64,
-    refresh_expires: u64,
-    refresh_sha256: String,
-    used_refreshes: BTreeSet<String>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OAuthClient {
-    revoked: Option<u64>,
-    id: String,
-    name: String,
-    redirect_uri: String,
-    secret_sha256: String,
-}
-#[derive(Clone, Serialize)]
 pub struct OAuthClientInfo {
-    pub revoked: Option<u64>,
     pub id: String,
     pub name: String,
     pub redirect_uri: String,
+    pub public: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct Grant {
+    identity: ClientIdentity,
+    access_hash: String,
+    refresh_hash: String,
+    resource: String,
+    expires: u64,
+    refresh_expires: u64,
+    used: BTreeSet<String>,
 }
 #[derive(Serialize)]
 pub struct OAuthTokens {
@@ -241,237 +57,350 @@ pub struct OAuthTokens {
     pub expires_in: u64,
     pub scope: String,
 }
+pub struct CredentialStore {
+    db: Mutex<Connection>,
+}
 impl CredentialStore {
+    pub fn open(path: PathBuf) -> Result<Self> {
+        crate::private_dir(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("Missing database directory"))?,
+        )?;
+        if !path.exists() {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&path)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(
+                std::fs::symlink_metadata(&path)?.is_file()
+                    && std::fs::metadata(&path)?.permissions().mode() & 0o077 == 0,
+                "Insecure database file"
+            );
+        }
+        let db = Connection::open(path)?;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+  CREATE TABLE IF NOT EXISTS chains(id TEXT PRIMARY KEY, root TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS devices(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, certificate TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY(chain,id));
+  CREATE TABLE IF NOT EXISTS clients(id TEXT PRIMARY KEY, info TEXT NOT NULL, secret_hash TEXT);
+  CREATE TABLE IF NOT EXISTS grants(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(chain,id));
+  CREATE TABLE IF NOT EXISTS tokens(hash TEXT PRIMARY KEY, chain TEXT NOT NULL, grant_id TEXT NOT NULL, FOREIGN KEY(chain,grant_id) REFERENCES grants(chain,id));")?;
+        Ok(Self { db: Mutex::new(db) })
+    }
+    fn db(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Registry unavailable"))
+    }
+    pub fn register(&self, c: &Certificate) -> Result<()> {
+        c.verify()?;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO chains(id,root) VALUES(?1,?2)",
+            params![c.chain_id, c.root_public],
+        )?;
+        let root: String =
+            tx.query_row("SELECT root FROM chains WHERE id=?1", [&c.chain_id], |r| {
+                r.get(0)
+            })?;
+        ensure!(root == c.root_public, "Root mismatch");
+        let existing: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT certificate,revoked FROM devices WHERE chain=?1 AND id=?2",
+                params![c.chain_id, c.device_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let cert = serde_json::to_string(c)?;
+        if let Some((old, revoked)) = existing {
+            ensure!(
+                !revoked && old == cert,
+                "Device revoked or certificate changed"
+            );
+            tx.execute(
+                "UPDATE devices SET last_seen=?3 WHERE chain=?1 AND id=?2",
+                params![c.chain_id, c.device_id, now()],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO devices(chain,id,certificate,last_seen) VALUES(?1,?2,?3,?4)",
+                params![c.chain_id, c.device_id, cert, now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn active(&self, c: &Certificate) -> Result<()> {
+        let db = self.db()?;
+        let valid: Option<(String, bool)> = db
+            .query_row(
+                "SELECT certificate,revoked FROM devices WHERE chain=?1 AND id=?2",
+                params![c.chain_id, c.device_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        ensure!(
+            valid.is_some_and(|(cert, revoked)| !revoked
+                && serde_json::from_str::<Certificate>(&cert).is_ok_and(|v| v == *c)),
+            "Device is not active"
+        );
+        Ok(())
+    }
+    pub fn devices(&self, chain: &str) -> Result<Vec<Device>> {
+        let db = self.db()?;
+        let mut s = db.prepare(
+            "SELECT certificate,revoked,last_seen FROM devices WHERE chain=?1 ORDER BY id",
+        )?;
+        let rows = s.query_map([chain], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, u64>(2)?,
+            ))
+        })?;
+        let mut out = vec![];
+        for r in rows {
+            let (c, revoked, last_seen) = r?;
+            let c: Certificate = serde_json::from_str(&c)?;
+            out.push(Device {
+                id: c.device_id,
+                name: c.name,
+                role: c.role,
+                last_seen,
+                revoked,
+                online: false,
+            });
+        }
+        Ok(out)
+    }
+    pub fn revoke_device(&self, chain: &str, id: &str) -> Result<()> {
+        ensure!(
+            self.db()?.execute(
+                "UPDATE devices SET revoked=1 WHERE chain=?1 AND id=?2",
+                params![chain, id]
+            )? == 1,
+            "Device not found"
+        );
+        Ok(())
+    }
+    pub fn list(&self, chain: &str) -> Result<Vec<GrantInfo>> {
+        let db = self.db()?;
+        let mut s = db.prepare("SELECT record FROM grants WHERE chain=?1")?;
+        let rows = s.query_map([chain], |r| r.get::<_, String>(0))?;
+        rows.map(|r| {
+            let grant: Grant = serde_json::from_str(&r?)?;
+            Ok(GrantInfo {
+                active: grant.identity.revoked.is_none() && grant.refresh_expires > now(),
+                access_expires: grant.expires,
+                refresh_expires: grant.refresh_expires,
+                identity: grant.identity,
+            })
+        })
+        .collect()
+    }
+    pub fn revoke(&self, chain: &str, id: &str) -> Result<()> {
+        let db = self.db()?;
+        let raw: String = db.query_row(
+            "SELECT record FROM grants WHERE chain=?1 AND id=?2",
+            params![chain, id],
+            |r| r.get(0),
+        )?;
+        let mut g: Grant = serde_json::from_str(&raw)?;
+        g.identity.revoked = Some(now());
+        db.execute(
+            "UPDATE grants SET record=?3 WHERE chain=?1 AND id=?2",
+            params![chain, id, serde_json::to_string(&g)?],
+        )?;
+        Ok(())
+    }
     pub fn register_oauth_client(
         &self,
         name: String,
         redirect_uri: String,
+        public: bool,
     ) -> Result<(OAuthClientInfo, String)> {
-        valid_name(&name)?;
+        crate::valid_name(&name)?;
         crate::oauth::validate_redirect(&redirect_uri)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        ensure!(
-            state.oauth_clients.len() < 128 && !state.oauth_clients.iter().any(|c| c.name == name),
-            "OAuth client limit or duplicate name"
-        );
+        let db = self.db()?;
+        let count: u64 = db.query_row("SELECT count(*) FROM clients", [], |r| r.get(0))?;
+        ensure!(count < 10000, "Client limit reached");
         let secret = random_secret();
-        let client = OAuthClient {
-            revoked: None,
+        let c = OAuthClientInfo {
             id: random_secret(),
             name,
             redirect_uri,
-            secret_sha256: digest(secret.as_bytes()),
+            public,
         };
-        let info = OAuthClientInfo {
-            revoked: client.revoked,
-            id: client.id.clone(),
-            name: client.name.clone(),
-            redirect_uri: client.redirect_uri.clone(),
-        };
-        let mut updated = state.clone();
-        updated.oauth_clients.push(client);
-        atomic_write(&self.path, &updated)?;
-        *state = updated;
-        Ok((info, secret))
+        db.execute(
+            "INSERT INTO clients VALUES(?1,?2,?3)",
+            params![
+                c.id,
+                serde_json::to_string(&c)?,
+                if public {
+                    None
+                } else {
+                    Some(digest(secret.as_bytes()))
+                }
+            ],
+        )?;
+        Ok((c, secret))
     }
     pub fn oauth_client(&self, id: &str, secret: Option<&str>) -> Result<OAuthClientInfo> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        let c = state
-            .oauth_clients
-            .iter()
-            .find(|c| c.id == id)
-            .ok_or_else(|| anyhow::anyhow!("invalid_client"))?;
+        let db = self.db()?;
+        let (raw, hash): (String, Option<String>) = db.query_row(
+            "SELECT info,secret_hash FROM clients WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         if let Some(secret) = secret {
             ensure!(
-                bool::from(
-                    digest(secret.as_bytes())
-                        .as_bytes()
-                        .ct_eq(c.secret_sha256.as_bytes())
-                ),
+                hash.is_none() && secret.is_empty()
+                    || hash.is_some_and(|h| secret_eq(&h, &digest(secret.as_bytes()))),
                 "invalid_client"
             );
         }
-        ensure!(c.revoked.is_none(), "invalid_client");
-        Ok(OAuthClientInfo {
-            revoked: c.revoked,
-            id: c.id.clone(),
-            name: c.name.clone(),
-            redirect_uri: c.redirect_uri.clone(),
-        })
+        Ok(serde_json::from_str(&raw)?)
     }
     pub fn issue_oauth(
         &self,
+        chain: String,
         name: String,
         permissions: BTreeSet<Capability>,
         client_id: String,
         resource: String,
     ) -> Result<OAuthTokens> {
-        valid_name(&name)?;
-        ensure!(!permissions.is_empty(), "Select permissions");
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        ensure!(
-            state.records.len() < 1024 && !state.records.iter().any(|r| r.client.name == name),
-            "Credential limit or duplicate name"
-        );
-        ensure!(
-            state
-                .oauth_clients
-                .iter()
-                .any(|c| c.id == client_id && c.revoked.is_none()),
-            "invalid_client"
-        );
-        let id = random_secret();
-        let secret = random_secret();
+        self.oauth_client(&client_id, None)?;
+        ensure!(!permissions.is_empty(), "invalid_scope");
+        let access = random_secret();
         let refresh = random_secret();
+        let id = random_secret();
         let scope = crate::oauth::scope(&permissions);
-        let record = Record {
-            client: ClientIdentity {
+        let g = Grant {
+            identity: ClientIdentity {
                 id: id.clone(),
+                chain_id: chain.clone(),
                 name,
+                client_id,
                 permissions,
                 created: now(),
-                last_used: None,
                 revoked: None,
             },
-            secret_sha256: digest(secret.as_bytes()),
-            oauth: Some(OAuthGrant {
-                client_id,
-                resource,
-                expires: now() + 3600,
-                refresh_expires: now() + 30 * 86400,
-                refresh_sha256: digest(refresh.as_bytes()),
-                used_refreshes: BTreeSet::new(),
-            }),
+            access_hash: digest(access.as_bytes()),
+            refresh_hash: digest(refresh.as_bytes()),
+            resource,
+            expires: now() + 3600,
+            refresh_expires: now() + 30 * 86400,
+            used: BTreeSet::new(),
         };
-        let mut updated = state.clone();
-        updated.records.push(record);
-        atomic_write(&self.path, &updated)?;
-        *state = updated;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO grants VALUES(?1,?2,?3)",
+            params![chain, id, serde_json::to_string(&g)?],
+        )?;
+        for token in [&access, &refresh] {
+            tx.execute(
+                "INSERT INTO tokens VALUES(?1,?2,?3)",
+                params![digest(token.as_bytes()), chain, id],
+            )?;
+        }
+        tx.commit()?;
         Ok(OAuthTokens {
-            access_token: format!("wf_{id}_{secret}"),
-            refresh_token: format!("wfr_{id}_{refresh}"),
+            access_token: access,
+            refresh_token: refresh,
             token_type: "Bearer",
             expires_in: 3600,
             scope,
         })
+    }
+    pub fn authenticate(&self, token: &str, issuer: &str) -> Result<Option<ClientIdentity>> {
+        let db = self.db()?;
+        let raw:Option<String>=db.query_row("SELECT g.record FROM tokens t JOIN grants g ON g.chain=t.chain AND g.id=t.grant_id WHERE t.hash=?1",[digest(token.as_bytes())],|r|r.get(0)).optional()?;
+        let Some(raw) = raw else { return Ok(None) };
+        let g: Grant = serde_json::from_str(&raw)?;
+        Ok((secret_eq(&g.access_hash, &digest(token.as_bytes()))
+            && g.identity.revoked.is_none()
+            && g.expires > now()
+            && g.resource == issuer)
+            .then_some(g.identity))
     }
     pub fn refresh_oauth(
         &self,
         token: &str,
         client_id: &str,
         resource: &str,
-        requested_scope: Option<&str>,
+        requested: Option<&str>,
     ) -> Result<OAuthTokens> {
-        let (id, secret) = token
-            .strip_prefix("wfr_")
-            .and_then(|s| s.split_once('_'))
-            .ok_or_else(|| anyhow::anyhow!("invalid_grant"))?;
-        key_bytes(id)?;
-        key_bytes(secret)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        let mut updated = state.clone();
-        let r = updated
-            .records
-            .iter_mut()
-            .find(|r| r.client.id == id)
-            .ok_or_else(|| anyhow::anyhow!("invalid_grant"))?;
-        let g = r
-            .oauth
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("invalid_grant"))?;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let raw:String=tx.query_row("SELECT g.record FROM tokens t JOIN grants g ON g.chain=t.chain AND g.id=t.grant_id WHERE t.hash=?1",[digest(token.as_bytes())],|r|r.get(0))?;
+        let mut g: Grant = serde_json::from_str(&raw)?;
         ensure!(
-            r.client.revoked.is_none()
-                && g.client_id == client_id
+            g.identity.revoked.is_none()
+                && g.identity.client_id == client_id
                 && g.resource == resource
-                && now() < g.refresh_expires,
+                && g.refresh_expires > now(),
             "invalid_grant"
         );
-        let supplied = digest(secret.as_bytes());
-        if g.used_refreshes.contains(&supplied) {
-            r.client.revoked = Some(now());
-            atomic_write(&self.path, &updated)?;
-            *state = updated;
+        let hash = digest(token.as_bytes());
+        if g.used.contains(&hash) {
+            g.identity.revoked = Some(now());
+            tx.execute(
+                "UPDATE grants SET record=?3 WHERE chain=?1 AND id=?2",
+                params![
+                    g.identity.chain_id,
+                    g.identity.id,
+                    serde_json::to_string(&g)?
+                ],
+            )?;
+            tx.commit()?;
             anyhow::bail!("invalid_grant");
         }
         ensure!(
-            bool::from(supplied.as_bytes().ct_eq(g.refresh_sha256.as_bytes()))
-                && g.used_refreshes.len() < 4096,
+            secret_eq(&hash, &g.refresh_hash) && g.used.len() < 4096,
             "invalid_grant"
         );
-        if let Some(requested) = requested_scope {
-            let requested = crate::oauth::permissions(requested)?;
-            ensure!(requested.is_subset(&r.client.permissions), "invalid_scope");
-            r.client.permissions = requested;
+        if let Some(s) = requested {
+            let p = crate::oauth::permissions(s)?;
+            ensure!(p.is_subset(&g.identity.permissions), "invalid_scope");
+            g.identity.permissions = p;
         }
-        let secret = random_secret();
+        let access = random_secret();
         let refresh = random_secret();
-        g.used_refreshes.insert(supplied);
-        g.refresh_sha256 = digest(refresh.as_bytes());
-        let expires_in = 3600.min(g.refresh_expires.saturating_sub(now()));
-        g.expires = now() + expires_in;
-        r.secret_sha256 = digest(secret.as_bytes());
-        let scope = crate::oauth::scope(&r.client.permissions);
-        atomic_write(&self.path, &updated)?;
-        *state = updated;
-        Ok(OAuthTokens {
-            access_token: format!("wf_{id}_{secret}"),
-            refresh_token: format!("wfr_{id}_{refresh}"),
-            token_type: "Bearer",
-            expires_in,
-            scope,
-        })
-    }
-}
-
-impl CredentialStore {
-    pub fn oauth_clients(&self) -> Result<Vec<OAuthClientInfo>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        Ok(state
-            .oauth_clients
-            .iter()
-            .map(|c| OAuthClientInfo {
-                id: c.id.clone(),
-                name: c.name.clone(),
-                redirect_uri: c.redirect_uri.clone(),
-                revoked: c.revoked,
-            })
-            .collect())
-    }
-    pub fn revoke_oauth_client(&self, name: &str) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Credential store unavailable"))?;
-        let mut updated = state.clone();
-        let c = updated
-            .oauth_clients
-            .iter_mut()
-            .find(|c| c.name == name)
-            .ok_or_else(|| anyhow::anyhow!("OAuth client not found"))?;
-        c.revoked.get_or_insert_with(now);
-        let id = c.id.clone();
-        for r in &mut updated.records {
-            if r.oauth.as_ref().is_some_and(|g| g.client_id == id) {
-                r.client.revoked.get_or_insert_with(now);
-            }
+        tx.execute("DELETE FROM tokens WHERE hash=?1", [&g.access_hash])?;
+        g.used.insert(hash);
+        g.access_hash = digest(access.as_bytes());
+        g.refresh_hash = digest(refresh.as_bytes());
+        g.expires = (now() + 3600).min(g.refresh_expires);
+        tx.execute(
+            "UPDATE grants SET record=?3 WHERE chain=?1 AND id=?2",
+            params![
+                g.identity.chain_id,
+                g.identity.id,
+                serde_json::to_string(&g)?
+            ],
+        )?;
+        for hash in [&g.access_hash, &g.refresh_hash] {
+            tx.execute(
+                "INSERT INTO tokens VALUES(?1,?2,?3)",
+                params![hash, g.identity.chain_id, g.identity.id],
+            )?;
         }
-        atomic_write(&self.path, &updated)?;
-        *state = updated;
-        Ok(())
+        tx.commit()?;
+        Ok(OAuthTokens {
+            access_token: access,
+            refresh_token: refresh,
+            token_type: "Bearer",
+            expires_in: g.expires - now(),
+            scope: crate::oauth::scope(&g.identity.permissions),
+        })
     }
 }

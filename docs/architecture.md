@@ -1,104 +1,203 @@
-# Architecture
+# Sync Chain architecture, version 1
 
-## Composition
+## Components and boundaries
 
-The Tokio composition root is `crates/wayfinder`. It loads private state under a directory lock, binds MCP, peer, private administration and OS-local application listeners before publishing control discovery, and cancels services together on SIGINT/SIGTERM or listener failure. The foreground daemon is suitable for an OS supervisor. The TUI attaches to a live daemon or runs the same daemon in-process with a session-owned cancellation token. It waits for authenticated control readiness and shuts down only its own daemon on exit; ownership is never persisted.
+- `wayfinder-core`: identity, explicit protocol types, SQLite registry, OAuth flow,
+  execution contracts and restrictive atomic file storage.
+- `wayfinder-agent`: outbound WebSocket lifecycle and local shell dispatch.
+- `wayfinder-exec`: fresh shell, bounded output, deadline and process-group cleanup.
+- `wayfinder-mcp`: official rmcp Streamable HTTP server and OAuth HTTP endpoints.
+- `wayfinder-gateway`: shared registry/session routing and hosted/self-hosted binary.
+- `wayfinder`: enrollment, local approval, device/grant administration and terminal UI.
 
-| Crate | Responsibility |
-| --- | --- |
-| `wayfinder-core` | Versioned contracts, identity, configuration, signed membership validation, local credentials/OAuth grants, private atomic storage |
-| `wayfinder-exec` | Fresh local shell, input validation, bounded pipes, exit status, cancellation and process cleanup |
-| `wayfinder-network` | Noise transport, invitations, replicated membership, reachability, exact-target execution and generic peer services |
-| `wayfinder-api` | Private loopback administration, service registration and descriptor-based client |
-| `wayfinder-mcp` | Official rmcp Streamable HTTP adapter, OAuth HTTP endpoints; exactly `nodes` and `exec` |
-| `wayfinder-tui` | Terminal frontend using only the private API client |
-| `wayfinder` | CLI, initialization, daemon startup/shutdown, TUI attachment |
+All generic implementation is Apache-2.0 in this repository. The
+Wayfinder-Cloudflare repository contains only hosted ingress/deployment. No
+Cloudflare data store, account identifier or hostname participates in identity.
 
-There is no web dashboard, shell session store, filesystem API, central inventory, telemetry, coordinator, or cloud dependency. Every retained member has the same administrative authority. Any member can introduce another node and be an MCP gateway. Hosts remain responsible for shell capabilities and OS access control. External reverse proxies own HTTPS termination. Wayfinder owns client authentication locally; there is no tunnel dependency.
+```mermaid
+flowchart TD
+    Client[MCP clients] -->|HTTPS and OAuth| Gateway[Wayfinder Gateway]
+    Gateway --> Registry[(Private SQLite registry)]
+    A1[Chain A admin] -->|Outbound WSS and device proof| Gateway
+    A2[Chain A member] -->|Outbound WSS and device proof| Gateway
+    B1[Chain B admin] -->|Outbound WSS and device proof| Gateway
+    A1 -->|Signed local OAuth approval| Gateway
+```
 
-## Request paths
+## Identity construction
 
-**MCP:** `/` → Host/Origin validation → parse credential ID → SHA-256 secret
-verification in constant time → request-local client identity → rmcp → capability
-check → exact-target execution over the existing peer path. The raw bearer is
-removed before SDK dispatch and never sent to peers. Stateless requests are
-reauthenticated individually, including after revocation. A reverse proxy must
-rewrite Host to loopback. Unknown paths return 404. OAuth discovery routes are
-public when `mcp_public_url` is configured; MCP protocol discovery stays protected.
+All hex below is lowercase, full-length; Ed25519 public keys are 32 bytes and
+signatures 64 bytes. Signing uses `ed25519-dalek`, strict verification, and its
+zeroize feature. Entropy and key generation use the OS CSPRNG. Recovery encoding
+uses the established English BIP39 24-word/256-bit-entropy checksum format, via
+`bip39`. A BIP39 passphrase extension is not used.
 
-**OAuth:** locally pre-registered confidential client → exact registered redirect,
-resource and S256 PKCE validation → ten-minute browser request → explicit private
-CLI approval → one-minute single-use code → authenticated token exchange → same
-local client credential model. No browser action grants consent by itself. The
-issuer is a configured canonical HTTPS origin, never inferred from Host or proxy
-headers. No dynamic registration, URL fetching, hosted identity provider, or user
-account database is needed. Client secrets, access/refresh secrets and code/ticket
-verifiers use SHA-256 over high-entropy random values. Browser tickets/codes are
-memory-only and expire across restart. Callback includes exact `iss` and `state`.
+```text
+entropy = OS random 32 bytes
+phrase  = BIP39 English mnemonic(entropy), 24 words
+root_seed = HKDF-SHA256(
+    IKM  = entropy,
+    salt = UTF8("wayfinder/sync-chain/v1"),
+    info = UTF8("root-signing/ed25519"),
+    L    = 32)
+root_key = Ed25519(root_seed)
+ChainID = "wfc1_" + hex(SHA256(
+    UTF8("wayfinder/chain-id/v1\0") || root_public_key))
+DeviceID = "wfd1_" + hex(SHA256(
+    UTF8("wayfinder/device-id/v1\0") || device_public_key))
+```
 
-OAuth access tokens expire after one hour. Refresh tokens rotate with a fixed
-30-day grant lifetime; using an already-consumed refresh token revokes the grant.
-Refresh invalidates its previous access token. Revoking a credential invalidates
-both token types; revoking an OAuth client also revokes all its grants. Pending
-requests and codes share a 64-entry bound. There are at most 128 OAuth registrations
-and 1024 credential records, including revoked entries, and 4096 refreshes per
-grant. Exceeding a bound fails explicitly. Operators use new names for relinking.
-See [operator instructions](remote-mcp.md).
+The phrase decodes to entropy rather than using BIP39's wallet seed/PBKDF2 step.
+HKDF provides the explicit application/version separation. Chain ID is stable
+across gateways and devices, not reversible to recovery material. It exposes no
+private seed. A public key alone cannot sign enrollment certificates.
 
+Each installation generates a new independent random 32-byte Ed25519 device
+seed. Enrollment signs a membership certificate with the transient root key.
+The certificate's exact signed byte encoding is:
 
-**Control:** private `control.json` → loopback HTTP → distinct bearer → Origin and loopback Host validation → narrowly scoped network administration. The client disables HTTP proxies and redirects. There is no control operation for executing host commands. This separation prevents accidental credential reuse; it is not isolation from the same OS account.
+```text
+UTF8("wayfinder/membership/v1\0")
+|| u32be(version = 1)
+|| string(ChainID)
+|| root_public_key[32]
+|| string(DeviceID)
+|| device_public_key[32]
+|| role[1]                 # 1 = admin, 2 = member
+|| string(device_name)
+```
 
-**Peer execution:** pinned Noise connection → current membership authorization → exact current membership-head match → exact local target ID → local executor → encrypted result. The target never forwards again. The receiver checks authorization anew for every execution connection. A membership mismatch requires synchronization before another request. Commands are never retried automatically. Unknown and unreachable targets never fall back to the entry node.
+`string(s)` is `u32be(UTF8 byte length) || UTF8(s)`. The signature field is
+excluded. JSON object ordering never determines certificate signatures. Verify
+version, name, both public-key-to-ID relationships and root signature before use.
+Stored certificate bytes cannot be replaced for an existing `(chain, device)`.
+Certificates have no expiry; explicit durable revocation is authoritative.
+A revocation tombstone cannot be cleared by replaying or re-signing membership.
+A phrase holder can always enroll a **new** device, including an administrator.
 
-Connection establishment failure means nothing was dispatched. Connection loss after sending is an explicitly unknown outcome. TCP disconnect during execution cancels it on the receiver, but cancellation cannot undo side effects that already happened. Revocation does not retroactively cancel admitted executions.
+The first device is admin; joins default to member. Only admins can inspect and
+approve pairing requests, enumerate/revoke grants, or revoke devices. Members
+can list chain devices and receive commands. Role changes require fresh enrollment.
+If all admins are lost, the phrase can enroll a new admin. Root compromise requires
+a new chain; no root rotation, QR encoding or revocation federation is implemented.
 
-## Identity and transport
+## Local storage
 
-**Peer services:** live local application session → ephemeral named loopback endpoint;
-Local service open → exact stable node ID → existing pinned Noise and membership
-admission → registered application preface → bounded bidirectional byte stream.
-The automatic application endpoint (Linux Unix socket / Windows named pipe) is separate from MCP, administration and peer
-networking. Registrations belong to live sessions and are removed on disconnect.
-Both daemon and TUI startup expose the same interface. No application metadata,
-persistent service configuration or replicated service catalogue is maintained.
-See the [local application contract](peer-services.md) for discovery, authorization,
-frames, limits and cancellation. The per-request JSON limits below apply to
-setup/RPC messages; admitted service payloads use bounded stream records.
+One `installation.json` contains version, gateway URL, public certificate and
+this device's private seed. It contains no phrase or root private material.
+Corrupt/missing identity fails explicitly; reconnect never creates an identity.
+Root keys, phrases and entropy are transient and zeroized where practical.
+JSON serialization/read buffers containing local secrets are zeroized as well.
+The atomic writer uses create-new 0600 temporary files, fsync, rename and directory
+fsync on Unix; private directories use 0700. A directory lock excludes duplicate
+agents and configuration changes while the agent runs. `status.json` is a local
+last-observed display, not an authentication source.
 
-Each node generates an Ed25519 signing identity and a separate X25519 Noise static key locally using established libraries. The stable node ID is its Ed25519 verifying key in hex. Private keys are stored only in `identity.json`, never replicated, returned by MCP, logged, or injected into subprocess environments. Peer descriptors contain only public keys, display names and IP endpoints.
+## Agent protocol
 
-The transport uses [snow](https://docs.rs/snow/0.10.0/snow/), implementing `Noise_XX_25519_ChaChaPoly_BLAKE2s`, with a Wayfinder protocol prologue. The initiating side pins the responder's static key before completing the handshake or sending application data. The responder obtains the authenticated initiator static key from the handshake. Both then use Noise authenticated encryption; there is no custom cipher, key agreement, or signature algorithm.
+JSON frames have explicit tagged schemas. Connect outward to `/agent` using WSS.
+The gateway sends `{type: challenge, version: 1, gateway, nonce}`. Its nonce is
+256 random bits, scoped to that socket, expires in 15 seconds, and is consumed
+by the single authentication frame. The device verifies the exact configured
+gateway origin and version, then signs:
 
-One request/response uses one TCP connection. Length-prefixed Noise records are limited to 65535 bytes; larger JSON messages are chunked into authenticated records with a bounded total length of 16 MiB. Handshake and first-message reads have a five-second deadline. Sync connections are short-lived and bounded. Peer connections are not persistent shell sessions. This version supports direct reachable IP endpoints, not NAT traversal or multihop routing.
+```text
+UTF8("wayfinder/session/v1\0")
+|| string(gateway_origin)
+|| string(nonce_lowercase_hex)
+|| string(hex(SHA256(certificate_signed_bytes)))
+```
 
-## Linking
+The authentication frame carries only certificate and signature. The gateway
+verifies possession before registering the chain/device, rejects revoked devices,
+and sends `ready`. The gateway then routes `exec`, `cancel`, and `result` frames.
+A new connection for the same `(chain, device)` closes the previous one. Session
+cleanup checks its generation so an old socket cannot erase a new connection.
+`ping`/`pong` every 15 seconds maintain liveness; a 45-second lapse closes the
+session. Reconnect backs off from 1 to 30 seconds with up to one second of jitter,
+reset after a stable minute. No different gateway or chain is tried.
 
-The introducing daemon stores an in-memory hash of a random 256-bit invitation secret, expiry and network binding. A copy-safe base64url invitation carries the secret, network ID/name and full introducing public descriptor. The operator's private transfer of that invitation establishes the initial trust pin; Wayfinder does not trust a DNS response or arbitrary self-signed certificate.
+Each connection holds a bounded dispatch channel. The agent allows 16 concurrent
+commands, gateway limits pending dispatches and 1,024 simultaneous connections.
+Shell output is capped to 1 MiB per stream. Device messages have bounded sizes.
+A command is dispatched once: lost responses report an **unknown outcome** and
+never trigger replay. Cancellation on MCP HTTP disconnect propagates to the
+agent; dropping sessions cancels execution tasks and kills process groups.
+Cancellation is best effort over a failed network, bounded by command timeout.
 
-Preview connects with that pin and validates the outstanding invitation before displaying the network. Admission checks that the new descriptor's Noise key matches the authenticated connection, validates names/keys, synchronizes first, signs a one-node addition, atomically persists it, and consumes the invitation. The joining node verifies the signed history and invitation binding, persists its membership, then exchanges membership with other peers.
+## Chain isolation and persistence
 
-Invitations live for 1–600 seconds (TUI: 600), are single-use, and do not survive inviter restart. At most 64 may be outstanding. Expiry depends on local wall clocks. Network admission is not a distributed transaction: if the inviter commits but the response is lost or the joining disk write fails, the node may appear in membership without having completed its local join. Remove that incomplete admission through the introducer and issue a new invitation; do not assume a failed join response rolled back the introducing node.
+SQLite uses foreign keys, FULL synchronous commits, a rollback journal and an
+exclusive process directory lock. A single host owns the database; live sessions,
+nonces, pending OAuth requests and authorization codes stay in memory. Restart
+invalidates pending challenges/codes, while agents reconnect and grants survive.
+There is one current schema, no migration or obsolete-format reader.
 
-## Membership consistency and revocation
+- `chains(id, root)` stores only public root identity.
+- `devices(chain, id, certificate, revoked, last_seen)` has composite primary key.
+- `clients(id, info, secret_hash)` holds registered OAuth metadata.
+- `grants(chain, id, record)` stores chain/client/scopes, expiration and revocation.
+- `tokens(hash, chain, grant_id)` resolves opaque tokens to that composite grant key.
 
-Membership is a signed, append-only revision chain, rooted in the network's random 256-bit ID and signed one-node genesis. Each revision binds the exact parent hash, network ID/name, author and sorted full public member set. A revision must add or remove exactly one descriptor and be signed by a member of its parent. Retained descriptors cannot be rewritten. Names, IDs and Noise keys are unique. Validation rejects invalid signatures, unknown versions, malformed chains and duplicate identities. Limits are 128 members, 4096 revisions and 8 MiB of serialized history.
+All device and grant administration uses the caller's verified Chain ID. MCP
+extracts the chain exclusively from the authenticated grant, never request input.
+Token lookup first derives its chain from the unguessable hashed token index and
+joins on **both** chain and grant ID. Session routing uses `(Chain ID, Device ID)`.
+Stable IDs outside the authorized chain and ambiguous names fail. Public OAuth
+clients are global metadata; they confer no access without local chain approval.
 
-Sequential edits are serialized within the introducing/removing daemon and synchronize with reachable members before committing. Every three seconds each node exchanges its history directly with advertised peers, in parallel, with a three-second peer deadline. A valid extending chain replaces local state atomically. A shorter prefix never rolls state back. Membership converges across connected peers after sequential edits; reachability remains each observer's local view, and is not replicated as authority.
+## Signed administration and OAuth
 
-An offline **retained** node accepts a signed extension rooted in its existing history. A previously unknown peer can introduce itself by a valid extending chain proving its membership, so returning nodes can catch up even when other members joined during their absence. A removed peer cannot use stale membership to bypass a node's newer local chain. Synchronization traffic has no execution authority; execution separately requires current membership on the receiving node.
+Administrative HTTP operations request a 256-bit nonce from `/device/challenge`
+with 30-second expiry. It is removed on the first attempt. The proof is:
 
-**Revocation is eventual, not instantaneous or globally linearizable.** Once a receiver has persisted a removal, it rejects that peer for new execution connections. A disconnected receiver that has not learned the removal can still accept that peer using its old membership. Such nodes must synchronize before you can rely on the revocation there. A removed node may continue displaying stale membership, but possession of that stale state does not authorize it on updated receivers. Its separate local MCP bearer is not revoked by removal; it can still execute on its own host. Protect or stop that endpoint separately if needed.
+```text
+UTF8("wayfinder/administration/v1\0")
+|| string(gateway_origin) || string(nonce)
+|| string(hex(SHA256(certificate_signed_bytes)))
+|| string(operation_json)
+```
 
-**Concurrent edits on different members or disconnected partitions can fork the signed chain.** There is no quorum, leader election, Raft, or automatic fork selection. An observed divergent signed history durably sets `conflict`; the affected node blocks administration and peer execution, while standalone local MCP execution remains available. Ordinary sync continues to exchange histories but cannot clear that flag or choose a winning branch. An edit may have returned success before a competing edit is discovered. Do not perform concurrent membership edits; wait for all reachable views to show the new revision before the next operation.
+`operation_json` is compact UTF-8 serialization of the typed Operation enum, tag
+`operation` first, then fields in declaration order. Unknown fields are rejected;
+all operation fields are strings, so there are no numeric/map normalization rules.
+The registry requires the exact active certificate and a live session. Sensitive
+operations require admin role. Enrollment/session installation and administration
+are serialized to prevent an admin revocation/approval race.
 
-A true fork requires explicit operator recovery, not a blind retry: stop the affected daemons, select one trusted signed history as the shared baseline, restore **only** that public membership into each affected node's version-1 `state.json` with `conflict: false` using private atomic replacement, restart, synchronize, and then retry discarded edits. Keep each node's identity/config unchanged. Review discarded removals before resuming peer execution: choosing a branch without a removal would otherwise reauthorize that node. All retained members must converge on the selected history; an offline member returning with the discarded fork will surface the conflict again. There is deliberately no automatic conflict-reset button that could silently discard a revocation. For uncertain trust, initialize a fresh network and new identities instead. This is a rare administrative recovery limitation of this first implementation, not a consensus guarantee.
+OAuth binds exact registered redirect, client ID, resource origin, S256 challenge,
+state, requested scopes and expiry into one pending request. A 48-bit display code
+identifies it; the browser holds a separate random 256-bit continuation ticket.
+The device retrieves details and signs approval of their SHA-256 digest, including
+client ID, redirect, scopes, request ID and expiry. Human approval is explicit.
+The request is consumed once. An approved chain is carried into a one-minute,
+one-use authorization code and finally a durable grant. Access/refresh secrets
+are independent OS-random 256-bit values, indexed/stored only by SHA-256. Refresh
+rotates both tokens; reuse of a spent refresh token revokes the grant family.
 
-## Storage and host boundary
+The browser UI has no phrase input, no JavaScript, no third-party resources, no
+cache, no referrer and no frame embedding. Refreshing the page after local approval
+returns the OAuth redirect with the original state and issuer. Dynamic registration
+supports public and confidential clients. Pairing lookups are limited to ten per
+device per minute. Pending requests, nonce tables and client registrations are
+bounded. Distributed abuse prevention and production capacity tuning are future
+operational work, not an identity mechanism.
 
-Configuration, identity, membership and credentials are separate versioned JSON files in OS application data. A dedicated installation can use `/var/lib/wayfinder` via `--data-dir`. The daemon composition root owns one credential store shared with MCP and private control; the peer graph never receives it. Version-1 `credentials.json` contains credential identity/name/permissions/created/last-used/revoked metadata, SHA-256 verifiers, optional OAuth grant bindings/expiry/refresh verifiers, and OAuth client registrations with exact redirects and secret hashes. Last-use timestamps persist at most once a minute per credential; persistence failures fail authentication closed. No SQLite or second persistence mechanism is introduced. The control descriptor has its own distinct random credential generated per daemon start. Writes use a new private file, file fsync, atomic rename and parent-directory fsync on Unix. The directory lock prevents duplicate daemons from using the same state. Unknown formats and missing initialized identity/state fail closed. There are no prototype-format migrations.
+## Security boundary
 
-Unix file modes are enforced (0700 directory, 0600 private files). Windows ACL configuration remains the operator's responsibility; atomic rename portability and Windows descendant cleanup have not been validated in this pass. Backups must preserve private ownership and permissions. Rollback of a local membership backup also rolls back local revocation knowledge until it synchronizes again.
+TLS authenticates the configured gateway; the gateway verifies device signatures
+and membership without receiving private keys. Cloudflare terminates hosted TLS
+and therefore shares the traffic trust boundary. The trusted gateway sees command
+plaintext and results and decides which commands to send. A compromised gateway
+could misuse an active agent's command channel or lie about grants/revocations;
+ordinary MCP clients cannot provide end-to-end chain signatures/encryption.
+Self-host if that operator trust is unacceptable. Device signatures do not make
+the gateway incapable of command injection.
 
-The daemon's OS account is the capability boundary. All members can request arbitrary execution on each other, and all local administrators can change membership. A compromised authorized member or MCP client can read identity files through its shell access. This is not a hostile-multitenant network or a policy engine. The distinction among MCP, control and peer credentials prevents cross-protocol authentication, not consequences of already-authorized arbitrary command execution.
-
-Execution uses bounded separate stdout/stderr, stdin closed, fresh shell/cwd/env, timeout and cancellation. A process-group guard runs on cancellation or dropped execution futures; kill-on-drop also protects the shell. Ordinary descendants are cleaned up on Unix, including inherited output pipes; detached processes can escape. No commands, outputs, invitation secrets, bearer tokens or private keys are logged by the daemon. Logs are limited to local startup and operational failures.
+A compromised member key grants that device's membership and local OS access,
+not administrative approval authority. A compromised admin can approve grants
+and revoke devices; revoke its device **and** unwanted grants. A phrase holder
+has root enrollment authority. Revocations are gateway-local and restore from
+backup can restore earlier trust state: protect current backups and do not treat
+a fresh gateway as carrying historical revocations. Protect machine backups,
+terminal scrollback, swap/core dumps and service OS accounts accordingly.
