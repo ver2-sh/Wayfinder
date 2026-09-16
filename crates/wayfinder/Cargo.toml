@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -18,3 +19,10 @@ zeroize.workspace = true
 bip39.workspace = true
 rand.workspace = true
 crossterm.workspace = true
+
+axoupdater = "=0.10.2"
+semver = "1"
+update-http = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+directories.workspace = true
+serde.workspace = true
+fs2.workspace = true

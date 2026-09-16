@@ -224,3 +224,57 @@ A live persistent-connection test using invalid registration bodies returned ten
 During that source throttle, MCP `/` still returned the expected 401 and both
 metadata endpoints returned 200 with the correct issuer/resource. Native counters
 are approximate across edge isolates; the test does not claim a strict global cap.
+
+## Distribution, lifecycle and management TUI foundation (2026-09-16)
+
+Implemented on `feat/distribution-lifecycle`, starting from remote master
+`79d0ed5`. No push, tag, release, repository visibility change or hosted workflow
+execution was performed. Gateway/MCP/authentication protocol behavior is unchanged.
+
+Local validation (Rust 1.98.0; dependency manifests declare no MSRV above the
+workspace's Rust 1.88 minimum):
+
+- `./scripts/release-preflight.sh` with dist 0.33.0: passed formatting, workspace
+  check, strict Clippy, workspace tests/doc tests (8 unit tests), normal
+  `cargo build --release -p wayfinder`, exact version check, reproducible workflow
+  generation/check, dist plan and shell syntax checks. Plan assertions require
+  exactly the main binary, five targets, and one combined macOS job.
+- `cargo build --release -p wayfinder --target x86_64-unknown-linux-musl`:
+  passed; `file` confirmed a static PIE executable.
+- `cargo check -p wayfinder --target x86_64-pc-windows-gnu`: passed using MinGW;
+  includes Windows lifecycle, updater policy guard and upstream replacement code.
+- `cargo check -p wayfinder --target aarch64-unknown-linux-musl`: passed with a
+  temporary Zig C-compiler wrapper. Initial wrapper target/venv invocation errors
+  were fixed locally; they did not require repository changes or hosted builds.
+- `dist build --artifacts=lies`: generated all-platform installer/archive templates
+  locally. Fake artifacts were removed afterward. Then
+  `dist build --artifacts=host --target=x86_64-unknown-linux-musl` built the real
+  archive and installer successfully. A loopback-only artifact server exercised
+  actual shell installation, executable version, receipt creation and rejection
+  of corrupted archive contents.
+- `actionlint .github/workflows/release.yml`: passed. YAML permission/trigger
+  assertions passed. Both the version helper and dist plan rejected `v99.0.0`.
+- `tests/sync_chain.py`: all **49 checks passed** against a disposable local gateway.
+- Disposable CLI/PTY checks: version, no-subcommand nonterminal failure, private
+  release error reporting, service status, bare TUI rendering/quit; an independent
+  daemon survives TUI exit, a TUI-owned agent stops on exit, and a duplicate daemon
+  is rejected by the shared directory lock.
+- Local release API fixtures: latest stable/current version display, forced
+  rechecks, cached TUI notification without another request, missing/mismatched
+  receipt rejection, and requests without authorization or device/chain data.
+- Isolated user service definition install/uninstall with a fake `systemctl`:
+  passed; real `systemd-analyze --user verify` accepted the generated unit. No new
+  real startup service was installed during these tests.
+- `git diff --check` and shell syntax checks passed. Tests used disposable recovery
+  material; secret-bearing terminal output stayed in memory and was not printed.
+
+Native macOS LaunchAgent and Windows Task Scheduler/PowerShell runtime behavior,
+MSVC/macOS final linking/signing, and a real published-version upgrade remain
+unexercised. No hosted runner was used to fill these gaps. Public download access,
+code-signing/notarization, PowerShell checksum verification and policy-preserving
+Windows updating remain the release-readiness items described in [releases](releases.md).
+
+Environment side effect: installing local musl/MinGW compiler prerequisites caused
+Ubuntu's package-manager restart hook to restart the pre-existing system-level
+`wayfinder.service`. A read-only check confirmed it remained active/running. The
+new implementation was not deployed into that service; no identity was migrated.

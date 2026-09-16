@@ -19,3 +19,6 @@ futures-util.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+
+[package.metadata.dist]
+dist = false
