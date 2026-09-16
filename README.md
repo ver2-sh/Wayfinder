@@ -21,13 +21,54 @@ ChatGPT / other MCP client ── HTTPS + chain-bound OAuth ──┐
 
 ## Install the agent
 
-Requires Rust 1.88+ and a native build toolchain. Linux is exercised end-to-end;
-the agent also contains Windows shell/process support and uses portable Rust
-networking. Windows/macOS service packaging is not provided or validated here.
+**Private and unreleased today:** anonymous consumer downloads and update checks
+are not yet available. The following is the intended release installation path
+once public releases exist; it requires no Rust, Cargo, compiler or repository
+checkout. Do not supply private credentials to installer commands.
+
+Linux x64/ARM64, WSL (inside Linux), and macOS Intel/Apple Silicon:
 
 ```sh
-./build-production.sh
-sudo install -m 0755 target/release/wayfinder /usr/local/bin/wayfinder
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Made-by-Eugene/project-wayfinder/releases/latest/download/wayfinder-installer.sh -o wayfinder-installer.sh
+# Inspect the downloaded installer, then:
+sh wayfinder-installer.sh
+wayfinder
+```
+
+Windows x64, from PowerShell:
+
+```powershell
+Invoke-WebRequest https://github.com/Made-by-Eugene/project-wayfinder/releases/latest/download/wayfinder-installer.ps1 -OutFile wayfinder-installer.ps1
+# Inspect the downloaded installer, then run under your existing execution policy:
+./wayfinder-installer.ps1
+wayfinder
+```
+
+Installers place the binary in the current user's Cargo bin directory (normally
+`~/.cargo/bin`; Cargo itself is not required), update PATH, and write an install
+receipt for updates. Open a new terminal if PATH has not refreshed. Archives and
+SHA-256 sums also support manual installation. No MSI is generated. Windows ARM
+users may use x64 emulation. Signing/notarization and the upstream PowerShell
+checksum limitation are documented in [release readiness](docs/releases.md).
+Do not disable OS protections to install an unsigned build.
+
+## Normal usage
+
+Run `wayfinder` in a terminal to open the management TUI (`wayfinder tui` is
+also supported). Use its menu to create/join a chain, inspect devices and grants,
+approve pairing requests, manage the agent, change gateway or check/install
+updates. The overview shows version, identity, role, gateway and connectivity.
+Start a temporary agent from **Agent → start**, or enable startup with **install**.
+Closing the TUI stops only an agent it started temporarily; independently running
+agents continue. The menu uses single keys; forms use Enter. Quit with `q`, Escape
+or Ctrl-C at the menu. Recovery input has no echo or history. Use a private,
+unrecorded terminal; terminal clearing cannot erase an external recording.
+
+CLI commands remain available for servers and automation. Bare `wayfinder` fails
+clearly when input or output is redirected; scripts must supply a subcommand.
+For example:
+
+```sh
 wayfinder chain create --name laptop
 wayfinder daemon
 ```
@@ -76,10 +117,10 @@ wayfinder auth list
 wayfinder auth revoke GRANT_ID
 ```
 
-The TUI observes a running agent. Status includes the gateway, connection state,
+The TUI can manage a running agent or start a temporary one. Status includes the gateway, connection state,
 Chain ID, Device ID, name and role. Stale status is reported offline. Device and
 grant administration requires the local agent to be connected. Revocation is
-permanent for that Device ID at this gateway; it closes the session, cancels
+confirmed explicitly (use `--yes` for deliberate CLI automation) and permanent for that Device ID at this gateway; it closes the session, cancels
 in-flight work and prevents reconnect. To replace a revoked installation, join
 with a fresh device key in a fresh data directory. Grants already approved by a
 device are separate: revoke its grants too when responding to compromise.
@@ -114,21 +155,76 @@ Access tokens expire after one hour; rotating refresh tokens last up to 30 days.
 requests and refreshes. Already-dispatched commands are not undone by grant
 revocation. See [OAuth and self-hosting](docs/remote-mcp.md).
 
-## Run at boot on Linux
+## Background agent and automatic startup
 
-Run this as the OS account whose privileges commands should receive:
+Run as the OS account whose privileges remote commands should receive:
 
 ```sh
-./wayfinder-service.sh install
+wayfinder service install    # configure startup and start; enroll first
+wayfinder service status
+wayfinder service stop
+wayfinder service start
+wayfinder service restart
+wayfinder service uninstall  # stop and remove startup; preserve identity/config
 ```
 
-The script builds/installs **only the agent**, installs the native `wayfinder`
-command, and enables `wayfinder.service`. If no chain is enrolled, the service
-waits for `installation.json`; create/join interactively, then run
-`sudo systemctl start wayfinder.service`. It reconnects after boot with bounded
-backoff. `WAYFINDER_DATA_DIR` selects a non-default private data directory for the
-installer. The CLI accepts `--data-dir PATH` on every command. Default on Linux:
-`~/.local/share/wayfinder`. Private directories/files use 0700/0600.
+Linux uses **user-scoped systemd**, macOS a per-user **LaunchAgent**, and Windows
+a **Task Scheduler logon task** with interactive logon and limited run level.
+None requests elevation or installs a root/Administrator/SYSTEM service. Do not
+run installation under an elevated account unless that is deliberately the
+privilege boundary you want. Background installation is separate from downloading
+the binary and is never silently enabled by the installer.
+
+Linux user services normally depend on a user session. Headless boot operation
+may require an administrator deliberately enabling lingering for a dedicated
+unprivileged account (`loginctl enable-linger USER`). Wayfinder does not do this.
+WSL uses the same Linux path if systemd and a user manager are enabled; otherwise
+use a foreground daemon or a TUI-owned agent. macOS LaunchAgents and Windows
+logon tasks start at login, not before login, and need that user's session.
+Service command failures are reported; an absent user bus is not success.
+
+`--data-dir PATH` works for CLI and TUI. Each directory gets a distinct startup
+name and an exclusive agent lock; no duplicate agent can own that directory.
+The default Linux data directory is `~/.local/share/wayfinder`. Unix private
+state uses 0700 directories and 0600 files. Startup definitions retain absolute
+binary/data paths; reinstall them if you move the binary. Status distinguishes
+a startup definition from a running process; connectivity is reported separately.
+
+The previous source-building, `/usr/local/bin`, system-level installer is removed.
+If you previously deployed it, deliberately stop/disable its old system unit as
+administrator before enabling user startup. Existing identities are retained;
+there is no automatic privilege or installation migration.
+
+## Updates
+
+```sh
+wayfinder --version
+wayfinder update --check
+wayfinder update
+```
+
+Interactive startup checks the stable channel in the background at most daily,
+caching failures too. Explicit checks bypass the cache. No chain/device data,
+keys or telemetry are sent. Network failures and inaccessible private releases
+are reported without interrupting operation. No update installs automatically.
+
+`update` reports versions and asks for explicit confirmation. A matching dist
+receipt permits one-action updating through axoupdater and the release installer;
+users do not need to rerun the original installation command. On Windows, the
+current upstream updater is refused if it would relax the existing PowerShell
+execution policy; checks remain available. See the documented upstream limitation.
+Missing/mismatched
+receipts refuse replacement: use the owning package manager (for example
+`brew upgrade wayfinder` for a future Homebrew installation), or your source/manual
+installation process. No package-manager channel is provisioned yet.
+
+Updates stop/restart the managed agent for the selected data directory, including
+restarting after an update failure. Independently launched daemons must be stopped
+explicitly. Stop other Wayfinder instances using the same binary before updating,
+especially on Windows. The TUI stops its temporary agent before updating; reopen
+the TUI afterward to run the new executable and start another temporary agent.
+Identity, recovery material, grants and gateway configuration are not modified.
+See [release maintenance and platform limitations](docs/releases.md).
 
 ## Self-host the gateway
 
@@ -161,18 +257,10 @@ boundary. Neither gateway receives recovery phrases or private identity keys.
 Cloudflare provides the official deployment's ingress/TLS/private connectivity;
 it implements no Wayfinder identity or protocol semantics.
 
-## Development and validation
+## Development and release maintenance
 
-```sh
-./build-development.sh
-cargo build -p wayfinder-gateway
-./validate.sh
-python3 -m venv /tmp/wayfinder-validation
-/tmp/wayfinder-validation/bin/pip install cryptography mnemonic websockets
-/tmp/wayfinder-validation/bin/python tests/sync_chain.py
-```
-
-The process-level exercise uses disposable material, temporary state, real agent
-sessions, OAuth and MCP calls. It prints check names only, never secrets. It
-replaces the old peer/application integration exercise. See
-[validation and security review](docs/validation.md).
+Source builds and Rust requirements are in [development](docs/development.md).
+See [release maintenance](docs/releases.md) for version bumps, local preflight,
+intentional tags, artifact checks, hosted-minute controls and signing readiness.
+[Validation and security review](docs/validation.md) documents the disposable
+integration tests. Gateway self-hosting and provider-neutral operation are unchanged.
