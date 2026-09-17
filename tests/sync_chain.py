@@ -61,7 +61,11 @@ def port():
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
+def mcp_origin(origin):
+    return os.environ.get('WAYFINDER_TEST_MCP', origin) if origin == os.environ.get('WAYFINDER_TEST_GATEWAY') else origin
 def http(origin, path, data=None, token=None, form=False, headers=None):
+    if not path.startswith('/device/') and not path.startswith('/agent'):
+        origin = mcp_origin(origin)
     h = {'User-Agent':'Wayfinder-validation/1', **(headers or {})}
     body = None
     if data is not None:
@@ -93,7 +97,7 @@ def cert_bytes(c):
 def proof(i, origin, nonce, op):
     return b'wayfinder/administration/v1\0' + field(origin) + field(nonce) + field(hashlib.sha256(cert_bytes(i['certificate'])).hexdigest()) + field(compact(op).decode())
 def signed(i, origin, op, nonce=None):
-    nonce = nonce or http(origin, '/device/challenge', {})[2]['nonce']
+    nonce = nonce or http(origin, '/device/challenge?chain_id='+i['certificate']['chain_id'], {})[2]['nonce']
     key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(i['private_key']))
     return dict(certificate=i['certificate'],nonce=nonce,operation=op,signature=key.sign(proof(i,origin,nonce,op)).hex())
 def operation(i, origin, op):
@@ -117,7 +121,7 @@ def enroll(root, name, phrase, origin, admin=False):
 
 def start_auth(origin, client, scopes='read exec'):
     verifier=base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('=')
-    query=dict(response_type='code',client_id=client['client_id'],redirect_uri=client['redirect_uris'][0],scope=scopes,state='test-state',resource=origin,code_challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('='),code_challenge_method='S256')
+    query=dict(response_type='code',client_id=client['client_id'],redirect_uri=client['redirect_uris'][0],scope=scopes,state='test-state',resource=mcp_origin(origin),code_challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('='),code_challenge_method='S256')
     status,headers,_=http(origin,'/oauth/authorize?'+urllib.parse.urlencode(query))
     assert status==303
     ticket=headers['Location']
@@ -139,8 +143,8 @@ def finish_auth(origin, i, client, scopes='read exec'):
     status,h,_=http(origin,ticket)
     assert status==303
     params=urllib.parse.parse_qs(urllib.parse.urlparse(h['Location']).query)
-    check('OAuth state and issuer preserved',params['state']==['test-state'] and params['iss']==[origin])
-    request=dict(grant_type='authorization_code',client_id=client['client_id'],code=params['code'][0],redirect_uri=client['redirect_uris'][0],resource=origin,code_verifier=verifier)
+    check('OAuth state and issuer preserved',params['state']==['test-state'] and params['iss']==[mcp_origin(origin)])
+    request=dict(grant_type='authorization_code',client_id=client['client_id'],code=params['code'][0],redirect_uri=client['redirect_uris'][0],resource=mcp_origin(origin),code_verifier=verifier)
     status,_,tokens=http(origin,'/oauth/token',request,form=True)
     assert status==200
     check('authorization code is one-time',http(origin,'/oauth/token',request,form=True)[0]==400)
@@ -155,7 +159,7 @@ def tool(origin, token, name, args=None):
 def exec_input(target,command,timeout=30000):
     return dict(target=target,command=command,timeout=timeout,cwd=None,env=None)
 async def rejected_session(origin,i,mode):
-    async with websockets.connect(origin.replace('https://','wss://').replace('http://','ws://')+'/agent',user_agent_header='Wayfinder-validation/1') as ws:
+    async with websockets.connect(origin.replace('https://','wss://').replace('http://','ws://')+'/agent?chain_id='+i['certificate']['chain_id'],user_agent_header='Wayfinder-validation/1') as ws:
         c=json.loads(await ws.recv())
         certificate=dict(i['certificate'])
         if mode=='certificate':
@@ -249,7 +253,7 @@ def run():
     status,_,client=http(origin,'/oauth/register',dict(client_name='Validation MCP',redirect_uris=['http://127.0.0.1:19876/callback'],token_endpoint_auth_method='none'))
     assert status==201
     check('unknown redirect rejected',http(origin,'/oauth/authorize?'+urllib.parse.urlencode(dict(client_id=client['client_id'],redirect_uri='https://attacker.invalid')))[0]==400)
-    check('pending authorization cannot fabricate code',http(origin,'/oauth/token',dict(grant_type='authorization_code',client_id=client['client_id'],code='unapproved',redirect_uri=client['redirect_uris'][0],resource=origin,code_verifier='x'*43),form=True)[0]==400)
+    check('pending authorization cannot fabricate code',http(origin,'/oauth/token',dict(grant_type='authorization_code',client_id=client['client_id'],code='unapproved',redirect_uri=client['redirect_uris'][0],resource=mcp_origin(origin),code_verifier='x'*43),form=True)[0]==400)
     cli_ticket,cli_code,_=start_auth(origin,client)
     interactive([BIN/'wayfinder','--data-dir',a,'authorize',cli_code])
     check('CLI displays and explicitly approves OAuth request',http(origin,cli_ticket)[0]==303)
@@ -272,7 +276,7 @@ def run():
     # HTTP disconnect must cancel the shell, including descendants.
     started=root/'cancel-started'; late=root/'cancel-late'
     command=f'printf started > {shlex.quote(str(started))}; sleep 4; printf failed > {shlex.quote(str(late))}'
-    u=urllib.parse.urlparse(origin)
+    u=urllib.parse.urlparse(mcp_origin(origin))
     sock=socket.create_connection((u.hostname,u.port or 443))
     if u.scheme=='https':
         sock=ssl.create_default_context().wrap_socket(sock,server_hostname=u.hostname)
@@ -303,7 +307,7 @@ def run():
     assert operation(ia,origin,dict(operation='revoke_device',device_id=cb['device_id']))[0]==200
     check('revoked device cannot reconnect',asyncio.run(rejected_session(origin,ib,'revoked')))
     check('cross chain device revoke denied',operation(ia,origin,dict(operation='revoke_device',device_id=cc['device_id']))[0]==403)
-    refresh=dict(grant_type='refresh_token',client_id=client['client_id'],resource=origin,refresh_token=readonly['refresh_token'])
+    refresh=dict(grant_type='refresh_token',client_id=client['client_id'],resource=mcp_origin(origin),refresh_token=readonly['refresh_token'])
     status,_,rotated=http(origin,'/oauth/token',refresh,form=True)
     check('refresh rotates tokens',status==200 and rotated['refresh_token']!=readonly['refresh_token'])
     check('old access invalid after refresh',tool(origin,readonly['access_token'],'nodes')[0]==401)
@@ -319,7 +323,7 @@ def run():
     spawn([BIN/'wayfinder-gateway','--listen',other.removeprefix('http://'),'--public-url',other,'--data-dir',root/'other-gateway'])
     wait(lambda:http(other,'/.well-known/oauth-authorization-server')[0]==200)
     d,id_,pd=enroll(root,'self-hosted',phrase,other,True)
-    check('same Chain ID on independent generic gateway',id_['certificate']['chain_id']==ca['chain_id'])
+    check('same Chain ID on independent generic gateway; old certificates cannot self-admit',id_['certificate']['chain_id']==ca['chain_id'] and asyncio.run(rejected_session(other,ib,'revoked')))
     # Hosted validation leaves only explicitly revoked public disposable records.
     if external:
         operation(ic,origin,dict(operation='revoke_device',device_id=cc['device_id']))

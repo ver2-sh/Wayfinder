@@ -53,10 +53,6 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
-    /// Explicitly register this same identity at another gateway. Stop the agent first.
-    Gateway {
-        url: String,
-    },
 }
 #[derive(Subcommand)]
 enum ChainCommand {

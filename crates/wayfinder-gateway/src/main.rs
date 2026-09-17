@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 struct Args {
     #[arg(long, default_value = "127.0.0.1:3000")]
     listen: SocketAddr,
-    #[arg(long, default_value = "https://mcp.usewayfinder.app")]
+    #[arg(long)]
     public_url: String,
     #[arg(long)]
     data_dir: PathBuf,

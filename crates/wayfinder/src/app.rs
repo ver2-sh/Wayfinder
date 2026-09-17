@@ -183,22 +183,6 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
             )?;
             println!("Refresh the browser authorization page to return to your MCP client.");
         }
-        Command::Gateway { url } => {
-            let _lock = lock_dir(data)?;
-            validate_gateway(&url)?;
-            let mut i = load(data)?;
-            println!(
-                "Chain: {}\nCurrent gateway: {}\nNew gateway: {}",
-                i.certificate.chain_id, i.gateway, url
-            );
-            confirm(
-                "Move this device? Revocations and MCP grants are gateway-local; a fresh gateway has neither.",
-            )?;
-            i.gateway = url;
-            wayfinder_agent::register(&i).await?;
-            atomic_write(&data.join("installation.json"), &i)?;
-            println!("Gateway changed. Restart the agent.");
-        }
     }
     Ok(())
 }
@@ -220,8 +204,9 @@ pub(crate) async fn enroll(
     let root = root(phrase)?;
     let key = new_key();
     let cert = Certificate::issue(&root, &key, name, role)?;
-    drop(root);
     let i = Installation::new(gateway, cert, &key)?;
+    wayfinder_agent::admit(&i, &root).await?;
+    drop(root);
     atomic_write(&data.join("installation.json"), &i)?;
     wayfinder_agent::register(&i).await.context("Identity saved; gateway registration failed. Run wayfinder daemon to reconnect with this same identity")?;
     Ok(())

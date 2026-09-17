@@ -80,7 +80,6 @@ enum Task {
     RevokeGrant(String),
     Pending(String),
     Approve(String, String),
-    Gateway(String),
     Service(Action),
     Install,
     Enroll {
@@ -345,7 +344,7 @@ impl Ui {
                     !self.rows.is_empty(),
                 )],
                 3 => vec![("Look up pairing code (Enter)", KeyCode::Enter, true)],
-                4 => vec![("Change gateway (Enter)", KeyCode::Enter, true)],
+                4 => vec![],
                 5 => vec![
                     ("Start (S)", KeyCode::Char('s'), true),
                     ("Stop (X)", KeyCode::Char('x'), true),
@@ -374,7 +373,7 @@ impl Ui {
             match self.section {
                 0 => format!("Device       {}\nRole         {}\nDevice ID    {}\nSync Chain   {}\nGateway      {}\nObserved     {}\n\n{}\n\n{}", value(&self.status["name"]), value(&self.status["role"]), value(&self.status["device_id"]), value(&self.status["chain_id"]), value(&self.status["gateway"]), self.status["observed"].as_u64().map(|t|format!("{} seconds ago",wayfinder_core::now().saturating_sub(t))).unwrap_or("Not yet observed".into()), if self.owned {"Temporary agent • stops when this TUI exits"} else {"Attached agent • this TUI does not own it"}, self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
                 3 => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
-                4 => format!("Current gateway\n{}\n\nChanging gateway registers this identity at the new gateway. Revocations and MCP grants are gateway-local; a fresh gateway has neither.\n\nAn independently running agent must be stopped explicitly first.\n\nEnter: change gateway", value(&self.status["gateway"])),
+                4 => format!("Current gateway\n{}\n\nSelect a hosted or self-hosted gateway when creating or joining a Sync Chain. Recovery words are used only on this device.", value(&self.status["gateway"])),
                 5 => format!("{}\nAutomatic startup installed: {}\n\nService changes apply only to the current OS user.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, value(&self.status["service_installed"])),
                 6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())), _ => String::new() }
         };
@@ -660,24 +659,6 @@ async fn perform(
             .await?;
             return Ok("Approved. Refresh the browser authorization page.".into());
         }
-        Task::Gateway(url) => {
-            identity::validate_gateway(&url)?;
-            let restart = stop_owned(owned).await?;
-            let result = async {
-                let _lock = wayfinder_core::lock_dir(data)
-                    .context("Stop the independently running agent before changing gateway")?;
-                let mut i = app::load(data)?;
-                i.gateway = url;
-                tokio::time::timeout(Duration::from_secs(12), wayfinder_agent::register(&i))
-                    .await??;
-                wayfinder_core::atomic_write(&data.join("installation.json"), &i)
-            }
-            .await;
-            if restart {
-                *owned = Some(TemporaryAgent::start(data)?);
-            }
-            result?;
-        }
         Task::Service(action) => match action {
             Action::Start if !service::installed(data)? => {
                 ensure!(
@@ -948,7 +929,6 @@ async fn session(
                 KeyCode::Enter if ui.enrolled && matches!(ui.section, 1 | 2) => ui.focus = true,
                 KeyCode::Enter if !ui.enrolled => ui.prompt("Device name"),
                 KeyCode::Enter if ui.section == 3 => ui.prompt("Pairing code from your browser"),
-                KeyCode::Enter if ui.section == 4 => ui.prompt("New gateway URL"),
                 KeyCode::Char('d') if matches!(ui.section, 1 | 2) => {
                     if let Some(row) = ui.rows.get(ui.selected.selected().unwrap_or(0))
                         && let Some(id) = row["id"].as_str()
@@ -1054,13 +1034,7 @@ async fn session(
                     "Pairing code from your browser" => {
                         task = Some(Task::Pending(text.to_uppercase()))
                     }
-                    "New gateway URL" => {
-                        if let Err(e) = identity::validate_gateway(&text) {
-                            ui.message = e.to_string();
-                        } else {
-                            ui.confirm(Task::Gateway(text.clone()),format!("Move to {text}? Revocations and MCP grants are gateway-local. Temporary agent will restart; active commands may be interrupted."));
-                        }
-                    }
+
                     _ => {}
                 }
             }

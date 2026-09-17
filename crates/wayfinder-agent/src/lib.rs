@@ -29,10 +29,11 @@ async fn receive(s: &mut Socket) -> Result<Frame> {
 pub async fn connect(i: &Installation) -> Result<Socket> {
     i.validate()?;
     let url = format!(
-        "{}/agent",
+        "{}/agent?chain_id={}",
         i.gateway
             .replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1)
+            .replacen("http://", "ws://", 1),
+        i.certificate.chain_id
     );
     let (s, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(url)).await??;
     let mut s = s;
@@ -82,7 +83,10 @@ pub async fn operation(i: &Installation, op: Operation) -> Result<serde_json::Va
         .timeout(Duration::from_secs(20))
         .build()?;
     let c: serde_json::Value = client
-        .post(format!("{}/device/challenge", i.gateway))
+        .post(format!(
+            "{}/device/challenge?chain_id={}",
+            i.gateway, i.certificate.chain_id
+        ))
         .send()
         .await?
         .error_for_status()?
@@ -216,5 +220,51 @@ async fn session(path: &Path, i: &Installation, stop: CancellationToken) -> Resu
     }
     session.cancel();
     while tasks.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// Root authorization is generated locally. Only public state and a signature leave the device.
+pub async fn admit(i: &Installation, root: &ed25519_dalek::SigningKey) -> Result<()> {
+    ensure!(
+        hex::encode(root.verifying_key().as_bytes()) == i.certificate.root_public,
+        "Recovery phrase belongs to another chain"
+    );
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let c: serde_json::Value = client
+        .post(format!(
+            "{}/device/challenge?chain_id={}",
+            i.gateway, i.certificate.chain_id
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    ensure!(
+        c["version"] == 1 && c["gateway"] == i.gateway,
+        "Gateway mismatch"
+    );
+    let nonce = c["nonce"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing challenge"))?
+        .to_string();
+    ensure!(!nonce.is_empty() && nonce.len() <= 160, "Invalid challenge");
+    let signature = sign(
+        root,
+        &security::admission_proof(&i.certificate, &i.gateway, &nonce)?,
+    );
+    client
+        .post(format!("{}/device/admit", i.gateway))
+        .json(&security::Admission {
+            certificate: i.certificate.clone(),
+            nonce,
+            signature,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
     Ok(())
 }

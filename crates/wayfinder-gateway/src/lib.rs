@@ -84,6 +84,7 @@ impl Gateway {
             .route("/agent", get(upgrade))
             .route("/device/challenge", post(challenge))
             .route("/device/operation", post(operation))
+            .route("/device/admit", post(admit))
             .layer(DefaultBodyLimit::max(131072))
             .with_state(self.clone());
         wayfinder_mcp::router(self.clone(), self.store.clone(), self.oauth.clone())
@@ -350,6 +351,24 @@ async fn challenge(State(g): State<Arc<Gateway>>) -> Response {
     let nonce = g.challenge();
     Json(serde_json::json!({"version":1,"gateway":g.issuer,"nonce":nonce})).into_response()
 }
+async fn admit(
+    State(g): State<Arc<Gateway>>,
+    Json(a): Json<wayfinder_core::security::Admission>,
+) -> Response {
+    let result = (|| {
+        let _administration = g.administration.lock().unwrap();
+        let expiry = g.verify_challenge(&a.nonce)?;
+        g.store.admit(&a, &g.issuer, expiry)
+    })();
+    match result {
+        Ok(()) => Json(serde_json::json!({"admitted":true})).into_response(),
+        Err(_) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"Admission denied"})),
+        )
+            .into_response(),
+    }
+}
 async fn operation(State(g): State<Arc<Gateway>>, Json(s): Json<SignedOperation>) -> Response {
     match g.operate(s){Ok(v)=>Json(v).into_response(),Err(_)=>(StatusCode::FORBIDDEN,Json(serde_json::json!({"error":"Operation denied: check device role, connection, challenge, request and revocation"}))).into_response()}
 }
@@ -421,7 +440,20 @@ mod tests {
         }
         assert!(g.nonces.lock().unwrap().is_empty());
         let device = identity::new_key();
-        let cert = Certificate::issue(&identity::new_key(), &device, "Test".into(), Role::Admin)?;
+        let root = identity::new_key();
+        let cert = Certificate::issue(&root, &device, "Test".into(), Role::Admin)?;
+        let nonce = g.challenge();
+        let signature =
+            identity::sign(&root, &security::admission_proof(&cert, &g.issuer, &nonce)?);
+        store.admit(
+            &security::Admission {
+                certificate: cert.clone(),
+                nonce,
+                signature,
+            },
+            &g.issuer,
+            now() + 30,
+        )?;
         store.register(&cert)?;
         let key = (cert.chain_id.clone(), cert.device_id.clone());
         let (send, _) = mpsc::channel(1);

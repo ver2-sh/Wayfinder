@@ -111,7 +111,7 @@ def fault_audit(root, data):
         def log_message(self, *args): pass
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
-            if self.path == '/device/challenge':
+            if self.path.split('?')[0] == '/device/challenge':
                 result = dict(version=1, gateway=origin, nonce='disposable-challenge')
             else:
                 if body['operation']['operation'] == 'pending':
@@ -232,14 +232,8 @@ def mouse_audit(root, data, origin, phrase):
     check('yes plus mouse Confirm revokes selected device; Refresh reloads')
     t.resize(240, 40)
     t.click('Gateway')
-    t.click('[ Change gateway (Enter) ]')
-    t.click('[ Cancel ]')
     t.expect('Current gateway')
-    t.click('[ Change gateway (Enter) ]')
-    t.send(origin)
-    t.click('[ Continue ]')
-    t.expect('Move to')
-    t.click('[ Cancel ]')
+    check('gateway is informational; selection happens at enrollment', 'Change gateway' not in t.read())
     t.click('Updates')
     t.click('[ Install update (I) ]')
     check('unavailable update cannot open confirmation', 'Type yes' not in t.read())
