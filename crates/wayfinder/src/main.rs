@@ -103,6 +103,7 @@ async fn main() {
     }
 }
 async fn run() -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let c = Cli::parse();
     let data = c.data_dir.map(Ok).unwrap_or_else(default_data_dir)?;
     let command = c.command.unwrap_or(Command::Tui);
