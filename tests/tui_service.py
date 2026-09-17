@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux TUI ownership regression against a disposable systemd user service.
+"""Linux PTY mouse, terminal cleanup and ownership regression.
 
 Requires pyte, a running user service manager, and repository-built wayfinder and
 wayfinder-gateway binaries. Installs only a uniquely named disposable service.
@@ -7,6 +7,7 @@ Recovery material is kept in memory; all service/data resources are cleaned up.
 Run: python3 tests/tui_service.py
 """
 import pyte
+import base64, re, urllib.request, urllib.parse, urllib.error, signal, threading, http.server
 import fcntl, hashlib, json, os, pathlib, pty, select, shutil, socket, struct, subprocess, tempfile, termios, time
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -56,17 +57,43 @@ class Terminal:
         wait(lambda: ''.join(text.split()) in ''.join(self.read().split()), text)
     def send(self, text):
         os.write(self.master, text.encode())
+    def mouse(self, x, y, button=0):
+        self.send(f'\x1b[<{button};{x+1};{y+1}M')
+        if button == 0:
+            self.send(f'\x1b[<0;{x+1};{y+1}m')
+        time.sleep(.15)
+        self.read()
+    def click(self, label):
+        self.expect(label)
+        for y, line in enumerate(self.screen.display):
+            x = line.find(label)
+            if label in ('Overview', 'Devices', 'MCP Grants', 'Browser pairing', 'Gateway', 'Agent', 'Updates', 'Create Sync Chain', 'Join Sync Chain') and (y < 4 or x >= 22):
+                continue
+            if x >= 0:
+                self.mouse(x, y)
+                return
+        raise AssertionError('No clickable label: ' + label)
+    def resize(self, width, height):
+        self.screen.resize(height, width)
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', height, width, 0, 0))
+        os.kill(self.proc.pid, signal.SIGWINCH)
+        time.sleep(.2)
+        self.read()
     def action(self, key):
         self.read()
         self.output = b''
-        self.send(key)
+        self.click({'s':'[ Start (S) ]', 'x':'[ Stop (X) ]', 't':'[ Restart (T) ]', 'i':'[ Install automatic startup (I) ]', 'u':'[ Uninstall automatic startup (U) ]'}[key])
         self.expect('Type yes, then Enter to confirm')
-        self.send('yes\r')
+        self.send('yes')
+        self.click('[ Confirm ]')
         wait(lambda: 'Type yes, then Enter to confirm' not in self.read(), 'confirmation submitted')
-    def quit(self, key='q'):
-        self.send(key)
+    def quit(self, key=None):
+        if key is None:
+            self.click('[ Quit (Q) ]')
+        else:
+            self.send(key)
         wait(lambda: (self.read(), self.proc.poll() is not None)[1], 'TUI exit')
-        check('terminal attributes and screen/paste modes restored', self.proc.returncode == 0 and termios.tcgetattr(self.slave) == self.before and b'\x1b[?1049l' in self.output and b'\x1b[?2004l' in self.output)
+        check('terminal attributes and screen/paste/mouse modes restored', self.proc.returncode == 0 and termios.tcgetattr(self.slave) == self.before and b'\x1b[?1049l' in self.output and b'\x1b[?2004l' in self.output and all(f'\x1b[?{mode}l'.encode() in self.output for mode in (1000,1002,1003,1015,1006)))
         self.close()
     def close(self):
         if self.proc.poll() is None:
@@ -76,6 +103,207 @@ class Terminal:
             os.close(self.master)
             os.close(self.slave)
             self.master = None
+
+def fault_audit(root, data):
+    """Loopback fault injection: stalled lookup and malformed list response."""
+    release = threading.Event()
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
+            if self.path == '/device/challenge':
+                result = dict(version=1, gateway=origin, nonce='disposable-challenge')
+            else:
+                if body['operation']['operation'] == 'pending':
+                    release.wait(5)
+                result = {}  # Deliberately invalid list; session must unwind through Restore.
+            raw = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            try: self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError): pass
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    origin = f'http://127.0.0.1:{server.server_port}'
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    fault = root/'fault'
+    fault.mkdir(mode=0o700)
+    identity = json.loads((data/'installation.json').read_text())
+    identity['gateway'] = origin
+    (fault/'installation.json').write_text(json.dumps(identity))
+    (fault/'installation.json').chmod(0o600)
+    try:
+        t = Terminal([BIN, '--data-dir', fault, 'tui'])
+        t.expect('Temporary agent')
+        t.click('Browser pairing')
+        t.click('[ Look up pairing code (Enter) ]')
+        t.send('AAAA-BBBB')
+        t.click('[ Continue ]')
+        t.expect('Working')
+        t.click('[ Cancel ]')
+        t.expect('Lookup canceled')
+        check('busy pairing lookup remains mouse-cancellable')
+        release.set()
+        t.click('Devices')
+        wait(lambda: (t.read(), t.proc.poll() is not None)[1], 'malformed gateway error exit')
+        check('error exit restores raw, screen, paste and mouse modes', t.proc.returncode != 0 and termios.tcgetattr(t.slave) == t.before and all(f'\x1b[?{mode}l'.encode() in t.output for mode in (1049,2004,1000,1002,1003,1015,1006)))
+        t.close()
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+def mouse_audit(root, data, origin, phrase):
+    t = Terminal([BIN, '--data-dir', root/'create', 'tui'])
+    t.expect('Welcome to Wayfinder')
+    check('mouse capture enabled', all(f'\x1b[?{mode}h'.encode() in t.output for mode in (1000,1002,1003,1015,1006)))
+    t.click('Join Sync Chain')
+    t.expect('[ Join Sync Chain ]')
+    t.click('Create Sync Chain')
+    t.click('[ Create Sync Chain ]')
+    t.send('created-with-mouse')
+    t.click('[ Continue ]')
+    t.send(origin)
+    t.click('[ Continue ]')
+    t.expect('Store these 24 recovery words')
+    t.click("[ I've stored it ]")
+    t.expect('Have you stored the recovery phrase')
+    t.click('[ Confirm ]')
+    t.expect('Explicit confirmation requires typing yes')
+    t.click('[ Cancel ]')
+    check('Create keeps explicit storage confirmation')
+    t.quit('q')
+    t = Terminal([BIN, '--data-dir', root/'member', 'tui'])
+    t.expect('Welcome to Wayfinder')
+    t.click('Join Sync Chain')
+    t.click('[ Join Sync Chain ]')
+    t.send('mouse-member')
+    t.click('[ Continue ]')
+    t.send(origin)
+    t.click('[ Continue ]')
+    t.click('[ Continue ]')
+    t.expect('24 recovery words (hidden)')
+    t.output = b''
+    t.send('\x1b[200~' + phrase + '\x1b[201~')
+    time.sleep(.2)
+    t.read()
+    check('join paste hides phrase and length', phrase.encode() not in t.output and phrase not in t.read() and '*' not in t.read())
+    t.click('[ Join ]')
+    t.expect('Action completed')
+    t.quit('\x03')
+    t = Terminal([BIN, '--data-dir', data, 'tui'])
+    t.expect('Temporary agent')
+    for section, expected in [('Devices','entries'),('MCP Grants','entries'),('Browser pairing','Approve a browser'),('Gateway','Current gateway'),('Agent','Automatic startup installed'),('Updates','Source/package-manager'),('Overview','Device ID')]:
+        t.click(section)
+        t.expect(expected)
+    check('all seven sections clickable')
+    t.click('Devices')
+    t.expect('2 entries')
+    t.click('mouse-member')
+    t.expect('name: mouse-member')
+    # Wheel over list changes selection without scrolling details.
+    t.mouse(25, 5, 65)
+    t.mouse(25, 5, 64)
+    check('list wheel changes selected row', any('›' in line[22:] for line in t.screen.display))
+    t.click('mouse-member')
+    t.resize(80, 24)
+    t.expect('mouse-member')
+    before = t.read()
+    t.mouse(26, 16, 65)
+    check('details wheel scrolls independently', before != t.read())
+    t.click('[ Revoke selected (D) ]')
+    t.expect('Permanently revoke')
+    t.mouse(3, 9) # underlying Agent/section position is covered by modal
+    t.expect('Permanently revoke')
+    t.click('[ Confirm ]')
+    t.expect('Explicit confirmation requires typing yes')
+    t.click('[ Cancel ]')
+    t.expect('[ Revoke selected (D) ]')
+    check('revoke requires yes, Cancel works, modal prevents click-through')
+    t.click('[ Revoke selected (D) ]')
+    t.send('yes')
+    t.click('[ Confirm ]')
+    t.expect('Action completed')
+    t.click('[ Refresh (R) ]')
+    t.expect('REVOKED')
+    check('yes plus mouse Confirm revokes selected device; Refresh reloads')
+    t.resize(240, 40)
+    t.click('Gateway')
+    t.click('[ Change gateway (Enter) ]')
+    t.click('[ Cancel ]')
+    t.expect('Current gateway')
+    t.click('[ Change gateway (Enter) ]')
+    t.send(origin)
+    t.click('[ Continue ]')
+    t.expect('Move to')
+    t.click('[ Cancel ]')
+    t.click('Updates')
+    t.click('[ Install update (I) ]')
+    check('unavailable update cannot open confirmation', 'Type yes' not in t.read())
+    t.click('[ Check for updates (C) ]')
+    t.expect('Checking release channel')
+    check('update check clickable')
+    # Exercise real browser OAuth review and grant creation through mouse approval.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args): return None
+    opener = urllib.request.build_opener(NoRedirect)
+    def http(path, body=None, form=False):
+        raw = None if body is None else (urllib.parse.urlencode(body) if form else json.dumps(body)).encode()
+        req = urllib.request.Request(origin+path, raw, {'Content-Type':'application/x-www-form-urlencoded' if form else 'application/json'})
+        try: response = opener.open(req, timeout=10)
+        except urllib.error.HTTPError as e: response = e
+        with response:
+            return response.status, response.headers, response.read().decode()
+    status, _, raw = http('/oauth/register', dict(client_name='Mouse MCP',redirect_uris=['http://127.0.0.1:19876/callback'],token_endpoint_auth_method='none'))
+    assert status == 201
+    client = json.loads(raw)
+    verifier = 'v'*43
+    query = dict(response_type='code',client_id=client['client_id'],redirect_uri=client['redirect_uris'][0],scope='read exec',state='mouse-audit',resource=origin,code_challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('='),code_challenge_method='S256')
+    status, headers, _ = http('/oauth/authorize?'+urllib.parse.urlencode(query))
+    assert status == 303
+    ticket = headers['Location']
+    _, _, page = http(ticket)
+    code = re.search(r'wayfinder authorize ([A-F0-9]+-[A-F0-9]+)', page)[1]
+    t.click('Browser pairing')
+    t.click('[ Look up pairing code (Enter) ]')
+    t.send(code)
+    t.click('[ Continue ]')
+    t.expect('Mouse MCP')
+    t.expect('redirect uri:')
+    t.expect('read, exec')
+    before = t.read()
+    t.mouse(30, 8, 65)
+    check('modal wheel scrolls review content', before != t.read())
+    t.mouse(30, 8, 64)
+    t.click('[ Confirm ]')
+    t.expect('Explicit confirmation requires typing yes')
+    t.send('yes')
+    t.click('[ Confirm ]')
+    t.expect('Approved')
+    _, headers, _ = http(ticket)
+    authcode = urllib.parse.parse_qs(urllib.parse.urlparse(headers['Location']).query)['code'][0]
+    assert http('/oauth/token', dict(grant_type='authorization_code',client_id=client['client_id'],code=authcode,redirect_uri=client['redirect_uris'][0],resource=origin,code_verifier=verifier), True)[0] == 200
+    t.click('MCP Grants')
+    t.expect('1 entries')
+    t.click('Mouse MCP')
+    t.expect('name: Mouse MCP')
+    t.click('[ Revoke selected (D) ]')
+    t.click('[ Cancel ]')
+    t.click('[ Revoke selected (D) ]')
+    t.send('yes')
+    t.click('[ Confirm ]')
+    t.expect('Action completed')
+    t.click('[ Refresh (R) ]')
+    t.expect('REVOKED')
+    check('OAuth review, exact confirmation, grant row and revoke work by mouse')
+    t.send('\t\x1b[A')
+    t.expect('Devices • Tab')
+    t.send('\t\x1b[B')
+    check('keyboard navigation still available')
+    t.quit()
 
 terminals = []
 gateway = external = None
@@ -104,9 +332,7 @@ with tempfile.TemporaryDirectory(prefix='wayfinder-service-audit-') as tmp:
         t = Terminal([BIN, '--data-dir', data, 'tui'])
         t.expect('Temporary agent' if temporary else 'Attached agent')
         wait(locked, 'agent holds lock')
-        for _ in range(5):
-            t.send('\x1b[B')
-            time.sleep(.12)
+        t.click('Agent')
         t.expect('Automatic startup installed')
         return t
     try:
@@ -125,6 +351,7 @@ with tempfile.TemporaryDirectory(prefix='wayfinder-service-audit-') as tmp:
         enrollment = Terminal([BIN, '--data-dir', data, 'chain', 'create', '--name', 'disposable-tui-audit', '--gateway', origin])
         enrollment.expect('Type yes:')
         # Disposable recovery output stays in memory and is discarded, never logged.
+        phrase = next(line.strip() for line in enrollment.screen.display if re.fullmatch(r'[a-z]+(?: [a-z]+){23}', line.strip()))
         enrollment.send('yes\r')
         wait(lambda: (enrollment.read(), enrollment.proc.poll() is not None)[1], 'enrollment')
         check('disposable identity enrolled against loopback gateway', enrollment.proc.returncode == 0)
@@ -133,6 +360,9 @@ with tempfile.TemporaryDirectory(prefix='wayfinder-service-audit-') as tmp:
         cache = data / 'update-check.json'
         cache.write_text(json.dumps({'checked':int(time.time()), 'latest':None, 'error':'local lifecycle audit'}))
         cache.chmod(0o600)
+        fault_audit(root, data)
+        mouse_audit(root, data, origin, phrase)
+        del phrase
         unit = 'app.usewayfinder.agent.' + hashlib.sha256(str(data.resolve()).encode()).hexdigest()[:16] + '.service'
         definition = pathlib.Path(os.environ.get('XDG_CONFIG_HOME', str(pathlib.Path.home()/'.config'))) / 'systemd/user' / unit
         cli('service', 'install')
@@ -143,7 +373,7 @@ with tempfile.TemporaryDirectory(prefix='wayfinder-service-audit-') as tmp:
         marker = root / 'lock-released'
         failure = root / 'fail'
         break_identity = root / 'break-identity'
-        probe.write_text('import fcntl, pathlib, sys\nr=pathlib.Path(__file__).parent\nwith open(r/"agent/daemon.lock", "a") as f:\n fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)\n (r/"lock-released").write_text("released")\nif (r/"break-identity").exists():\n (r/"agent/installation.json").rename(r/"agent/installation.saved")\nif (r/"fail").exists(): sys.exit(1)\n')
+        probe.write_text('import fcntl, pathlib, sys, time\nr=pathlib.Path(__file__).parent\nif (r/"slow").exists(): time.sleep(3)\nwith open(r/"agent/daemon.lock", "a") as f:\n fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)\n (r/"lock-released").write_text("released")\nif (r/"break-identity").exists():\n (r/"agent/installation.json").rename(r/"agent/installation.saved")\nif (r/"fail").exists(): sys.exit(1)\n')
         dropin = pathlib.Path(str(definition) + '.d')
         dropin.mkdir()
         (dropin/'audit.conf').write_text(f'[Service]\nExecStartPre=/usr/bin/python3 {probe}\n')
@@ -217,12 +447,18 @@ with tempfile.TemporaryDirectory(prefix='wayfinder-service-audit-') as tmp:
         wait(lambda: not locked(), 'no-service owned agent exit')
         # Existing install handoff must also release the lock first.
         marker.unlink(missing_ok=True)
+        (root/'slow').touch()
         t = tui()
         t.action('i')
-        t.expect('Action completed')
+        t.click('[ Restart (T) ]')
+        check('busy mutation ignores another action click', 'Type yes' not in t.read())
+        t.click('[ Quit (Q) ]')
+        t.expect('Finishing the current action')
+        check('mouse Quit waits for mutation completion', t.proc.poll() is None)
+        t.quit('q')
+        (root/'slow').unlink()
         wait(active, 'TUI install starts service')
         check('Install still releases temporary lock before managed startup', marker.exists())
-        t.quit()
         check('TUI-installed managed service survives exit', active())
         cli('service', 'uninstall')
         definition.mkdir()
