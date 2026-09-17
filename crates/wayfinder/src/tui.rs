@@ -439,24 +439,51 @@ async fn perform(
             Action::Stop if owned.is_some() => {
                 stop_owned(owned).await?;
             }
-            Action::Restart if owned.is_some() => {
+            Action::Restart if owned.is_some() && !service::installed(data)? => {
                 stop_owned(owned).await?;
                 *owned = Some(TemporaryAgent::start(data)?);
             }
             _ => {
-                let restart = if matches!(action, Action::Install) {
-                    stop_owned(owned).await?
-                } else {
-                    false
-                };
+                let stopped_temporary =
+                    if matches!(action, Action::Install | Action::Start | Action::Restart) {
+                        stop_owned(owned).await?
+                    } else {
+                        false
+                    };
                 let path = data.to_owned();
                 let result =
                     tokio::task::spawn_blocking(move || service::manage_quiet(&path, action))
-                        .await?;
-                if restart && result.is_err() {
-                    start_if_needed(data, owned)?;
+                        .await
+                        .context("Managed service action task failed")
+                        .and_then(|result| result);
+                if let Err(error) = result {
+                    if stopped_temporary {
+                        let recovery: Result<()> = async {
+                            if matches!(action, Action::Start | Action::Restart) {
+                                // A failed native command may still have queued startup/retries.
+                                // Quiesce it before taking the directory lock back.
+                                let path = data.to_owned();
+                                tokio::task::spawn_blocking(move || {
+                                    service::manage_quiet(&path, Action::Stop)
+                                })
+                                .await
+                                .context("Managed service recovery stop task failed")??;
+                                service::wait_stopped(data).await?;
+                            }
+                            if !service::agent_running(data)? {
+                                *owned = Some(TemporaryAgent::start(data)?);
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(recovery) = recovery {
+                            return Err(error.context(format!(
+                                "Temporary agent recovery also failed: {recovery:#}"
+                            )));
+                        }
+                    }
+                    return Err(error);
                 }
-                result?;
             }
         },
         Task::Install => {
