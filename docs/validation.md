@@ -320,3 +320,33 @@ refreshes every two seconds without changing selection or input. Confirmed
 mutations finish before a queued quit so temporary-agent ownership can be restored.
 Native macOS/Windows execution and actual release replacement remain untested in
 this Linux environment. No update was installed during these checks.
+
+### Managed-service ownership follow-up (2026-09-17)
+
+TUI Start/Restart now stop an owned temporary agent before invoking installed
+managed startup. Success leaves no TUI ownership. On failure, Start/Restart stop
+any pending managed startup and wait for the directory to be released before
+restoring temporary operation. The original error is retained; a recovery error
+is reported alongside it. Install retains its stop-before-install and temporary
+recovery behavior; Uninstall leaves a TUI-owned temporary agent alone.
+
+- `./validate.sh` passed: formatting, workspace check, Clippy with
+  `--workspace --all-targets -- -D warnings`, and all workspace tests/doc tests.
+- `./build-development.sh` and `cargo build -p wayfinder-gateway` passed.
+- `tests/tui_service.py` passed 36 checks using repository debug binaries, a
+  loopback gateway, a disposable enrolled identity, and a real systemd user unit.
+  Both Start and Restart passed from installed-but-stopped / temporary-owned
+  state. An `ExecStartPre` lock probe verified release before managed startup;
+  the service stayed active with zero restarts beyond its restart interval while
+  the TUI remained open, and survived TUI exit.
+- The same harness covered native failure recovery for both actions, combined
+  native/restoration errors, no-service Start/Restart, managed and external attach,
+  Install success/failure, Uninstall, q/Ctrl-C exit, and terminal attribute,
+  alternate-screen, and bracketed-paste restoration. It requires Python `pyte`
+  and a running Linux user service manager. All disposable services/data were
+  removed. No installed production binary or GitHub Actions configuration changed.
+
+Native macOS/Windows lifecycle execution remains untested. Native service command
+success retains its existing meaning; this change adds no readiness supervisor.
+If recovery cannot stop managed startup or release the directory, it reports the
+recovery failure instead of starting a competing temporary agent.
