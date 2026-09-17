@@ -6,13 +6,15 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Style},
     widgets::{Block, List, ListState, Paragraph, Wrap},
 };
@@ -44,6 +46,7 @@ impl Drop for Restore {
         let _ = terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             io::stdout(),
+            event::DisableMouseCapture,
             event::DisableBracketedPaste,
             LeaveAlternateScreen,
             crossterm::cursor::Show
@@ -92,6 +95,29 @@ enum Mode {
     Confirm(Task, String),
     Phrase(Task, bool),
 }
+// Targets are rebuilt from the rendered rectangles, including ListState's viewport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hit {
+    Section(usize),
+    Row(usize),
+    Key(KeyCode),
+    List,
+    Content,
+}
+#[derive(Default)]
+struct Hits {
+    regions: Vec<(Rect, Hit)>,
+}
+impl Hits {
+    fn at(&self, mouse: MouseEvent) -> Option<Hit> {
+        self.regions
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(Position::new(mouse.column, mouse.row)))
+            .map(|(_, hit)| *hit)
+    }
+}
+
 struct Ui {
     section: usize,
     rows: Vec<Value>,
@@ -106,6 +132,8 @@ struct Ui {
     owned: bool,
     scroll: u16,
     quit: bool,
+    hits: Hits,
+    busy: Option<bool>,
 }
 impl Ui {
     fn new() -> Self {
@@ -123,6 +151,94 @@ impl Ui {
             owned: false,
             scroll: 0,
             quit: false,
+            hits: Hits::default(),
+            busy: None,
+        }
+    }
+    fn section(&mut self, section: usize) -> bool {
+        self.focus = false;
+        if self.section == section {
+            return false;
+        }
+        self.section = section;
+        self.scroll = 0;
+        self.rows.clear();
+        self.selected = ListState::default().with_selected(Some(0));
+        true
+    }
+    fn select(&mut self, index: usize) {
+        self.focus = true;
+        let index = index.min(self.rows.len().saturating_sub(1));
+        if self.selected.selected() != Some(index) {
+            self.scroll = 0;
+        }
+        self.selected.select(Some(index));
+    }
+    fn mouse(&mut self, mouse: MouseEvent, fetch: &mut bool) -> Option<KeyCode> {
+        let hit = self.hits.at(mouse)?;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => match hit {
+                Hit::Section(section) => {
+                    *fetch |= self.section(section);
+                    None
+                }
+                Hit::Row(index) => {
+                    self.select(index);
+                    None
+                }
+                Hit::Key(key) => Some(key),
+                _ => None,
+            },
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                match hit {
+                    Hit::List | Hit::Row(_) => {
+                        let old = self.selected.selected().unwrap_or(0);
+                        self.select(if down {
+                            old.saturating_add(1)
+                        } else {
+                            old.saturating_sub(1)
+                        });
+                    }
+                    Hit::Content => {
+                        self.scroll = if down {
+                            self.scroll.saturating_add(3)
+                        } else {
+                            self.scroll.saturating_sub(3)
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    fn buttons(&mut self, f: &mut ratatui::Frame, area: Rect, buttons: &[(&str, KeyCode, bool)]) {
+        // One row per action keeps even long labels usable in narrow terminals.
+        for (row, (label, key, enabled)) in buttons.iter().enumerate() {
+            if row >= usize::from(area.height) {
+                break;
+            }
+            let rect = Rect::new(
+                area.x,
+                area.y + row as u16,
+                area.width.min((label.len() + 4) as u16),
+                1,
+            );
+            let enabled =
+                *enabled && (self.busy.is_none() || (*key == KeyCode::Char('q') && !self.quit));
+            f.render_widget(
+                Paragraph::new(format!("[ {label} ]")).style(Style::default().fg(if enabled {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })),
+                rect,
+            );
+            if enabled {
+                self.hits.regions.push((rect, Hit::Key(*key)));
+            }
         }
     }
     fn refresh(&mut self, data: &Path, owned: bool) {
@@ -150,6 +266,7 @@ impl Ui {
     }
 
     fn render(&mut self, f: &mut ratatui::Frame) {
+        self.hits.regions.clear();
         let width = usize::from(f.area().width.saturating_sub(2).max(1));
         let notice_lines: usize = self
             .message
@@ -188,6 +305,8 @@ impl Ui {
         } else {
             vec!["Create Sync Chain", "Join Sync Chain"]
         };
+        let mut sections = ListState::default().with_selected(Some(self.section));
+        let section_count = names.len();
         f.render_stateful_widget(
             List::new(names)
                 .block(Block::bordered().title(" Sections "))
@@ -198,8 +317,57 @@ impl Ui {
                     Color::Cyan
                 })),
             body[0],
-            &mut ListState::default().with_selected(Some(self.section)),
+            &mut sections,
         );
+        let inner = Block::bordered().inner(body[0]);
+        for row in 0..usize::from(inner.height).min(section_count.saturating_sub(sections.offset()))
+        {
+            self.hits.regions.push((
+                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                Hit::Section(sections.offset() + row),
+            ));
+        }
+        let actions = if !self.enrolled {
+            vec![(
+                if self.section == 0 {
+                    "Create Sync Chain"
+                } else {
+                    "Join Sync Chain"
+                },
+                KeyCode::Enter,
+                true,
+            )]
+        } else {
+            match self.section {
+                1 | 2 => vec![(
+                    "Revoke selected (D)",
+                    KeyCode::Char('d'),
+                    !self.rows.is_empty(),
+                )],
+                3 => vec![("Look up pairing code (Enter)", KeyCode::Enter, true)],
+                4 => vec![("Change gateway (Enter)", KeyCode::Enter, true)],
+                5 => vec![
+                    ("Start (S)", KeyCode::Char('s'), true),
+                    ("Stop (X)", KeyCode::Char('x'), true),
+                    ("Restart (T)", KeyCode::Char('t'), true),
+                    ("Install automatic startup (I)", KeyCode::Char('i'), true),
+                    ("Uninstall automatic startup (U)", KeyCode::Char('u'), true),
+                ],
+                6 => vec![
+                    ("Check for updates (C)", KeyCode::Char('c'), true),
+                    (
+                        "Install update (I)",
+                        KeyCode::Char('i'),
+                        self.update.as_ref().is_some_and(|s| s.available()),
+                    ),
+                ],
+                _ => vec![],
+            }
+        };
+        let right =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(actions.len() as u16)])
+                .split(body[1]);
+        self.buttons(f, right[1], &actions);
         let content = if !self.enrolled {
             "Welcome to Wayfinder\n\nCreate a Sync Chain or join with your recovery phrase.\nUse a private, unrecorded terminal. Recovery words are never saved or copied.\n\nEnter to begin. Joining defaults to the member role.".into()
         } else {
@@ -207,12 +375,12 @@ impl Ui {
                 0 => format!("Device       {}\nRole         {}\nDevice ID    {}\nSync Chain   {}\nGateway      {}\nObserved     {}\n\n{}\n\n{}", value(&self.status["name"]), value(&self.status["role"]), value(&self.status["device_id"]), value(&self.status["chain_id"]), value(&self.status["gateway"]), self.status["observed"].as_u64().map(|t|format!("{} seconds ago",wayfinder_core::now().saturating_sub(t))).unwrap_or("Not yet observed".into()), if self.owned {"Temporary agent • stops when this TUI exits"} else {"Attached agent • this TUI does not own it"}, self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
                 3 => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
                 4 => format!("Current gateway\n{}\n\nChanging gateway registers this identity at the new gateway. Revocations and MCP grants are gateway-local; a fresh gateway has neither.\n\nAn independently running agent must be stopped explicitly first.\n\nEnter: change gateway", value(&self.status["gateway"])),
-                5 => format!("{}\nAutomatic startup installed: {}\n\nS  Start     X  Stop     T  Restart\nI  Install automatic startup\nU  Uninstall automatic startup\n\nService changes apply only to the current OS user.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, value(&self.status["service_installed"])),
-                6 => format!("{}\n\nC  Check for updates\nI  Install available update (explicit confirmation required)\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())), _ => String::new() }
+                5 => format!("{}\nAutomatic startup installed: {}\n\nService changes apply only to the current OS user.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, value(&self.status["service_installed"])),
+                6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())), _ => String::new() }
         };
         if self.enrolled && matches!(self.section, 1 | 2) {
             let panes = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-                .split(body[1]);
+                .split(right[0]);
             let rows: Vec<String> = self
                 .rows
                 .iter()
@@ -228,8 +396,13 @@ impl Ui {
                             r.get("name")
                                 .or_else(|| r.get("client_name"))
                                 .unwrap_or(&r["id"])
-                        ),
-                        if r["revoked"] == true { "REVOKED" } else { "" }
+                        )
+                        .replace('\n', " "),
+                        if r["revoked"] == true || r["revoked"].is_u64() {
+                            "REVOKED"
+                        } else {
+                            ""
+                        }
                     )
                 })
                 .collect();
@@ -248,6 +421,17 @@ impl Ui {
                 panes[0],
                 &mut self.selected,
             );
+            self.hits.regions.push((panes[0], Hit::List));
+            let inner = Block::bordered().inner(panes[0]);
+            for row in 0..usize::from(inner.height)
+                .min(self.rows.len().saturating_sub(self.selected.offset()))
+            {
+                self.hits.regions.push((
+                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                    Hit::Row(self.selected.offset() + row),
+                ));
+            }
+            self.hits.regions.push((panes[1], Hit::Content));
             f.render_widget(
                 Paragraph::new(
                     self.rows
@@ -261,12 +445,13 @@ impl Ui {
                 panes[1],
             );
         } else {
+            self.hits.regions.push((right[0], Hit::Content));
             f.render_widget(
                 Paragraph::new(safe(&content))
                     .wrap(Wrap { trim: false })
                     .scroll((self.scroll, 0))
                     .block(Block::bordered().title(" Details ")),
-                body[1],
+                right[0],
             );
         }
         // The create screen contains recovery words: wipe temporary formatting buffers too.
@@ -307,7 +492,24 @@ impl Ui {
                 area[1].width,
                 area[1].height + area[2].height,
             );
+            self.hits.regions.clear();
+            self.hits.regions.push((modal, Hit::Content));
             f.render_widget(ratatui::widgets::Clear, modal);
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(modal);
+            let label = match self.mode {
+                Mode::Confirm(..) => "Confirm",
+                Mode::Phrase(_, false) => "Join",
+                Mode::Phrase(_, true) => "I've stored it",
+                _ => "Continue",
+            };
+            self.buttons(
+                f,
+                parts[1],
+                &[
+                    (label, KeyCode::Enter, true),
+                    ("Cancel", KeyCode::Esc, true),
+                ],
+            );
             let modal_text =
                 Zeroizing::new(format!("{}\n\n{}", prompt.as_str(), safe(&self.message)));
             f.render_widget(
@@ -316,10 +518,35 @@ impl Ui {
                     .scroll((self.scroll, 0))
                     .block(Block::bordered().title(" Action • PgUp/PgDn scroll • Esc cancel "))
                     .style(Style::default().fg(Color::Yellow)),
-                modal,
+                parts[0],
             );
         }
-        f.render_widget(Paragraph::new(" ↑↓ Navigate   Tab/←→ Focus   Enter Select   R Refresh   Q Quit\n PgUp/PgDn Scroll   Esc Cancel   Ctrl-C Quit safely"), area[3]);
+        if self.busy.is_some() {
+            self.hits
+                .regions
+                .retain(|(_, hit)| matches!(hit, Hit::Content));
+        }
+        let footer = Layout::horizontal([
+            Constraint::Length(15),
+            Constraint::Length(12),
+            Constraint::Min(0),
+        ])
+        .split(area[3]);
+        if matches!(self.mode, Mode::Browse) {
+            self.buttons(f, footer[0], &[("Refresh (R)", KeyCode::Char('r'), true)]);
+            self.buttons(f, footer[1], &[("Quit (Q)", KeyCode::Char('q'), true)]);
+        }
+        if self.busy == Some(true) {
+            f.render_widget(
+                Paragraph::new("[ Cancel ]").style(Style::default().fg(Color::Cyan)),
+                footer[0],
+            );
+            self.hits.regions.push((
+                Rect::new(footer[0].x, footer[0].y, footer[0].width.min(10), 1),
+                Hit::Key(KeyCode::Esc),
+            ));
+        }
+        f.render_widget(Paragraph::new("Click sections, rows & actions • Wheel scroll\n↑↓ Navigate • Tab Focus • Enter Select • PgUp/PgDn • Esc • Ctrl-C"), footer[2]);
     }
 }
 
@@ -351,7 +578,8 @@ pub async fn run(data: &Path) -> Result<()> {
     crossterm::execute!(
         io::stdout(),
         EnterAlternateScreen,
-        event::EnableBracketedPaste
+        event::EnableBracketedPaste,
+        event::EnableMouseCapture
     )?;
     let mut screen = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut owned = None;
@@ -368,6 +596,18 @@ async fn busy<T>(
     cancellable: bool,
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<(T, bool)> {
+    ui.busy = Some(cancellable);
+    ui.draw(screen)?;
+    let result = busy_loop(ui, screen, cancellable, future).await;
+    ui.busy = None;
+    result
+}
+async fn busy_loop<T>(
+    ui: &mut Ui,
+    screen: &mut Screen,
+    cancellable: bool,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<(T, bool)> {
     tokio::pin!(future);
     let mut quit = false;
     loop {
@@ -375,9 +615,19 @@ async fn busy<T>(
             result = &mut future => return result.map(|v|(v,quit)),
             _ = app::stop_signal() => { quit = true; ui.quit = true; },
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                if event::poll(Duration::from_millis(1))? && let Event::Key(k) = event::read()? && k.kind == KeyEventKind::Press {
-                    if matches!(k.code, KeyCode::Char('q' | 'Q')) || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL)) { quit = true; ui.quit = true; }
-                    if cancellable && k.code == KeyCode::Esc { anyhow::bail!("Lookup canceled"); }
+                if event::poll(Duration::from_millis(1))? {
+                    let key = match event::read()? {
+                        Event::Key(k) if k.kind == KeyEventKind::Press => {
+                            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) { quit = true; ui.quit = true; }
+                            Some(k.code)
+                        }
+                        Event::Mouse(m) => ui.mouse(m, &mut false),
+                        _ => None,
+                    };
+                    if matches!(key, Some(KeyCode::Char('q' | 'Q'))) { quit = true; ui.quit = true; }
+                    if cancellable && key == Some(KeyCode::Esc) { anyhow::bail!("Lookup canceled"); }
+                    if key == Some(KeyCode::PageDown) { ui.scroll = ui.scroll.saturating_add(5); }
+                    if key == Some(KeyCode::PageUp) { ui.scroll = ui.scroll.saturating_sub(5); }
                 }
                 if cancellable && quit { anyhow::bail!("Lookup canceled"); }
                 if quit { ui.message = "Finishing the current action before safely exiting…".into(); }
@@ -628,6 +878,14 @@ async fn session(
                 }
                 k.code
             }
+            Event::Mouse(mouse) => {
+                // A resize can precede its queued event: redraw before interpreting coordinates.
+                ui.draw(screen)?;
+                match ui.mouse(mouse, &mut fetch) {
+                    Some(key) => key,
+                    None => continue,
+                }
+            }
             Event::Paste(mut text) => {
                 if matches!(ui.mode, Mode::Input(_) | Mode::Phrase(_, false)) {
                     for c in text.chars().filter(|c| !c.is_control()) {
@@ -669,24 +927,18 @@ async fn session(
                     let down = key == KeyCode::Down;
                     if ui.focus && matches!(ui.section, 1 | 2) && ui.enrolled {
                         let old = ui.selected.selected().unwrap_or(0);
-                        ui.selected.select(Some(if down {
-                            (old + 1).min(ui.rows.len().saturating_sub(1))
+                        ui.select(if down {
+                            old.saturating_add(1)
                         } else {
                             old.saturating_sub(1)
-                        }));
+                        });
                     } else {
-                        let old = ui.section;
-                        ui.section = if down {
-                            (old + 1).min(if ui.enrolled { 6 } else { 1 })
+                        let section = if down {
+                            (ui.section + 1).min(if ui.enrolled { 6 } else { 1 })
                         } else {
-                            old.saturating_sub(1)
+                            ui.section.saturating_sub(1)
                         };
-                        if old != ui.section {
-                            ui.scroll = 0;
-                            ui.rows.clear();
-                            ui.selected.select(Some(0));
-                            fetch = true;
-                        }
+                        fetch |= ui.section(section);
                     }
                 }
                 KeyCode::Char('r') => {
@@ -896,6 +1148,108 @@ async fn session(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    fn mouse_at(rect: Rect, kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_targets_follow_viewport_resize_and_modal_exclusivity() {
+        let mut ui = Ui::new();
+        ui.enrolled = true;
+        ui.section = 1;
+        ui.rows = (0..40)
+            .map(|i| serde_json::json!({"id":i.to_string(),"name":format!("Device {i}")}))
+            .collect();
+        ui.select(30);
+        let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        terminal.draw(|f| ui.render(f)).unwrap();
+        let (rect, hit) = *ui
+            .hits
+            .regions
+            .iter()
+            .find(|(_, hit)| matches!(hit, Hit::Row(_)))
+            .unwrap();
+        let Hit::Row(index) = hit else { unreachable!() };
+        assert!(index > 0);
+        let mut fetch = false;
+        ui.mouse(
+            mouse_at(rect, MouseEventKind::Down(MouseButton::Left)),
+            &mut fetch,
+        );
+        assert_eq!(ui.selected.selected(), Some(index));
+        ui.mouse(mouse_at(rect, MouseEventKind::ScrollDown), &mut fetch);
+        assert_eq!(ui.selected.selected(), Some(index + 1));
+        assert_eq!(ui.scroll, 0);
+        let details = ui
+            .hits
+            .regions
+            .iter()
+            .find(|(_, hit)| *hit == Hit::Content)
+            .unwrap()
+            .0;
+        ui.mouse(mouse_at(details, MouseEventKind::ScrollDown), &mut fetch);
+        assert_eq!(ui.scroll, 3);
+        assert_eq!(ui.selected.selected(), Some(index + 1));
+        ui.confirm(Task::RevokeDevice("test".into()), "Revoke?".into());
+        terminal.backend_mut().resize(60, 18);
+        terminal.draw(|f| ui.render(f)).unwrap();
+        assert!(ui.hits.regions.iter().all(|(rect, hit)| rect.right() <= 60
+            && rect.bottom() <= 18
+            && !matches!(hit, Hit::Section(_) | Hit::Row(_) | Hit::List)));
+        let confirm = ui
+            .hits
+            .regions
+            .iter()
+            .find(|(_, hit)| *hit == Hit::Key(KeyCode::Enter))
+            .unwrap()
+            .0;
+        assert_eq!(
+            ui.mouse(
+                mouse_at(confirm, MouseEventKind::Drag(MouseButton::Left)),
+                &mut fetch
+            ),
+            None
+        );
+        assert_eq!(
+            ui.mouse(
+                mouse_at(confirm, MouseEventKind::Down(MouseButton::Right)),
+                &mut fetch
+            ),
+            None
+        );
+        assert_eq!(
+            ui.mouse(
+                mouse_at(confirm, MouseEventKind::Down(MouseButton::Left)),
+                &mut fetch
+            ),
+            Some(KeyCode::Enter)
+        );
+        assert!(ui.input.is_empty());
+        assert!(matches!(ui.mode, Mode::Confirm(..)));
+        ui.mode = Mode::Browse;
+        ui.busy = Some(false);
+        terminal.draw(|f| ui.render(f)).unwrap();
+        assert!(
+            ui.hits
+                .regions
+                .iter()
+                .all(|(_, hit)| matches!(hit, Hit::Content | Hit::Key(KeyCode::Char('q'))))
+        );
+        ui.busy = Some(true);
+        terminal.draw(|f| ui.render(f)).unwrap();
+        assert!(
+            ui.hits
+                .regions
+                .iter()
+                .any(|(_, hit)| *hit == Hit::Key(KeyCode::Esc))
+        );
+    }
 
     #[test]
     fn hidden_phrase_never_enters_terminal_frames() {

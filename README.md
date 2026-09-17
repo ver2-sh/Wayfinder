@@ -65,15 +65,16 @@ Do not disable OS protections to install an unsigned build.
 Run `wayfinder` in a terminal to open the management TUI (`wayfinder tui` is
 also supported). The full-screen sections cover Overview, Devices, MCP Grants,
 Browser pairing, Gateway, Agent and Updates. Before enrollment, choose Create Sync
-Chain or Join Sync Chain. Use arrows to select a section, Tab or Enter to focus a
-list, and PgUp/PgDn to scroll details. Context keys appear in each view; `r`
-refreshes, Esc cancels a prompt, and `q` or Ctrl-C quits. Destructive actions and
+Chain or Join Sync Chain. Click sections, list rows and action buttons; use the
+mouse wheel to navigate lists or scroll details and dialogs. Keyboard shortcuts
+remain available: arrows navigate, Tab or Enter focuses a list, PgUp/PgDn scrolls,
+`r` refreshes, Esc cancels a prompt, and `q` or Ctrl-C quits. Destructive actions and
 pairing approvals require typing `yes` after reviewing their details.
 
 For an enrolled installation, opening the TUI automatically starts a temporary
 agent if none is running. Closing it stops only that temporary agent; attached
-agents and installed services continue running. **Agent → I** enables automatic
-startup for the current OS user. Gateway changes restart an owned temporary agent,
+agents and installed services continue running. **Agent → Install automatic
+startup** (or `I`) enables automatic startup for the current OS user. Gateway changes restart an owned temporary agent,
 including after a failed change; an independently running agent must be stopped
 explicitly first.
 
