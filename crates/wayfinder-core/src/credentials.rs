@@ -65,8 +65,8 @@ struct Registration {
 }
 pub struct CredentialStore {
     registrations: Mutex<BTreeMap<String, Registration>>,
-    admissions: Mutex<VecDeque<(Instant, String)>>,
     db: Mutex<Connection>,
+    admissions: Mutex<VecDeque<(Instant, String)>>,
 }
 impl CredentialStore {
     pub fn open(path: PathBuf) -> Result<Self> {
@@ -96,14 +96,15 @@ impl CredentialStore {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
   CREATE TABLE IF NOT EXISTS chains(id TEXT PRIMARY KEY, root TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS admissions(nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS devices(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, certificate TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY(chain,id));
   CREATE TABLE IF NOT EXISTS clients(id TEXT PRIMARY KEY, info TEXT NOT NULL, secret_hash TEXT);
   CREATE TABLE IF NOT EXISTS grants(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(chain,id));
   CREATE TABLE IF NOT EXISTS tokens(hash TEXT PRIMARY KEY, chain TEXT NOT NULL, grant_id TEXT NOT NULL, FOREIGN KEY(chain,grant_id) REFERENCES grants(chain,id));")?;
         Ok(Self {
             db: Mutex::new(db),
-            registrations: Mutex::new(BTreeMap::new()),
             admissions: Mutex::new(VecDeque::new()),
+            registrations: Mutex::new(BTreeMap::new()),
         })
     }
     fn db(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -111,14 +112,80 @@ impl CredentialStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("Registry unavailable"))
     }
-    pub fn register(&self, c: &Certificate) -> Result<()> {
-        c.verify()?;
+    pub fn admit(
+        &self,
+        admission: &crate::security::Admission,
+        gateway: &str,
+        expires: u64,
+    ) -> Result<()> {
+        admission.verify(gateway)?;
+        let c = &admission.certificate;
         let mut db = self.db()?;
         let tx = db.transaction()?;
+        tx.execute("DELETE FROM admissions WHERE expires<=?1", [now()])?;
+        tx.execute(
+            "INSERT INTO admissions VALUES(?1,?2)",
+            params![admission.nonce, expires],
+        )?;
         tx.execute(
             "INSERT OR IGNORE INTO chains(id,root) VALUES(?1,?2)",
             params![c.chain_id, c.root_public],
         )?;
+        let root: String =
+            tx.query_row("SELECT root FROM chains WHERE id=?1", [&c.chain_id], |r| {
+                r.get(0)
+            })?;
+        ensure!(root == c.root_public, "Root mismatch");
+        let cert = serde_json::to_string(c)?;
+        let old: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT certificate,revoked FROM devices WHERE chain=?1 AND id=?2",
+                params![c.chain_id, c.device_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        ensure!(
+            old.as_ref()
+                .is_none_or(|(v, revoked)| *v == cert && !revoked),
+            "Device revoked or certificate changed"
+        );
+        if old.is_none() {
+            let mut admissions = self.admissions.lock().unwrap();
+            while admissions
+                .front()
+                .is_some_and(|(t, _)| t.elapsed() >= Duration::from_secs(60))
+            {
+                admissions.pop_front();
+            }
+            ensure!(
+                admissions.len() < 60
+                    && admissions
+                        .iter()
+                        .filter(|(_, chain)| *chain == c.chain_id)
+                        .count()
+                        < 10,
+                "Admission rate exceeded"
+            );
+            admissions.push_back((Instant::now(), c.chain_id.clone()));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO devices(chain,id,certificate,last_seen) VALUES(?1,?2,?3,?4)",
+            params![c.chain_id, c.device_id, cert, now()],
+        )?;
+        let count: u64 = tx.query_row(
+            "SELECT count(*) FROM devices WHERE chain=?1",
+            [&c.chain_id],
+            |r| r.get(0),
+        )?;
+        ensure!(count <= 256, "Chain device capacity exceeded");
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn register(&self, c: &Certificate) -> Result<()> {
+        c.verify()?;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+
         let root: String =
             tx.query_row("SELECT root FROM chains WHERE id=?1", [&c.chain_id], |r| {
                 r.get(0)
@@ -142,29 +209,7 @@ impl CredentialStore {
                 params![c.chain_id, c.device_id, now()],
             )?;
         } else {
-            // Rate-limit new durable trust state, never delete it to make room.
-            // Existing devices reconnect and heartbeat without this admission budget.
-            let mut admissions = self.admissions.lock().unwrap();
-            while admissions
-                .front()
-                .is_some_and(|(t, _)| t.elapsed() >= Duration::from_secs(60))
-            {
-                admissions.pop_front();
-            }
-            ensure!(
-                admissions.len() < 60
-                    && admissions
-                        .iter()
-                        .filter(|(_, chain)| chain == &c.chain_id)
-                        .count()
-                        < 10,
-                "New device admission rate exceeded; retry later"
-            );
-            admissions.push_back((Instant::now(), c.chain_id.clone()));
-            tx.execute(
-                "INSERT INTO devices(chain,id,certificate,last_seen) VALUES(?1,?2,?3,?4)",
-                params![c.chain_id, c.device_id, cert, now()],
-            )?;
+            anyhow::bail!("Device needs root-authorized admission at this gateway");
         }
         tx.commit()?;
         Ok(())
@@ -475,12 +520,35 @@ impl CredentialStore {
 mod tests {
     use super::*;
     use crate::identity::{Role, new_key};
+    fn admit(
+        store: &CredentialStore,
+        root: &ed25519_dalek::SigningKey,
+        cert: &Certificate,
+    ) -> Result<()> {
+        let gateway = "https://gateway.example.com";
+        let nonce = random_secret();
+        let signature = crate::identity::sign(
+            root,
+            &crate::security::admission_proof(cert, gateway, &nonce)?,
+        );
+        store.admit(
+            &crate::security::Admission {
+                certificate: cert.clone(),
+                nonce,
+                signature,
+            },
+            gateway,
+            now() + 30,
+        )
+    }
     #[test]
     fn public_registrations_expire_and_approved_clients_persist() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("wayfinder-registration-{}", random_secret()));
         let path = dir.join("registry.sqlite");
         let store = CredentialStore::open(path.clone())?;
-        let cert = Certificate::issue(&new_key(), &new_key(), "Test".into(), Role::Admin)?;
+        let root = new_key();
+        let cert = Certificate::issue(&root, &new_key(), "Test".into(), Role::Admin)?;
+        admit(&store, &root, &cert)?;
         store.register(&cert)?;
         let register = || {
             store.register_oauth_client("Test".into(), "http://127.0.0.1/callback".into(), false)
@@ -565,27 +633,28 @@ mod tests {
         let store = CredentialStore::open(dir.join("registry.sqlite"))?;
         let root = new_key();
         let first = Certificate::issue(&root, &new_key(), "First".into(), Role::Admin)?;
+        assert!(store.register(&first).is_err());
+        admit(&store, &root, &first)?;
         store.register(&first)?;
         for _ in 0..9 {
-            store.register(&Certificate::issue(
+            admit(
+                &store,
                 &root,
-                &new_key(),
-                "Other".into(),
-                Role::Member,
-            )?)?;
+                &Certificate::issue(&root, &new_key(), "Other".into(), Role::Member)?,
+            )?;
         }
         assert!(
-            store
-                .register(&Certificate::issue(
-                    &root,
-                    &new_key(),
-                    "Excess".into(),
-                    Role::Member
-                )?)
-                .is_err()
+            admit(
+                &store,
+                &root,
+                &Certificate::issue(&root, &new_key(), "Excess".into(), Role::Member)?
+            )
+            .is_err()
         );
         store.register(&first)?;
-        let other = Certificate::issue(&new_key(), &new_key(), "Other chain".into(), Role::Admin)?;
+        let other_root = new_key();
+        let other = Certificate::issue(&other_root, &new_key(), "Other chain".into(), Role::Admin)?;
+        admit(&store, &other_root, &other)?;
         store.register(&other)?;
         store.revoke_device(&first.chain_id, &first.device_id)?;
         store.admissions.lock().unwrap().clear();

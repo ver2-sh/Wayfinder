@@ -3266,7 +3266,9 @@ name = "wayfinder-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "futures-util",
+ "hex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

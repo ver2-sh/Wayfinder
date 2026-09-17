@@ -1,23 +1,26 @@
 # Wayfinder
 
-Wayfinder is an accountless Sync Chain of devices that an MCP client can discover
-and run shell commands on. Install the **agent** on each device. Every agent makes
-an outbound encrypted connection to a gateway; no inbound device port, peer IP,
-public hostname, VPN or personal MCP server is required.
+Wayfinder connects an accountless Sync Chain of devices through outbound encrypted
+agent connections. Devices expose no inbound ports. MCP is an optional interface
+for ChatGPT and other clients; a chain works without any MCP client.
 
-The default gateway and MCP URL is **https://mcp.usewayfinder.app**. The same
-open-source gateway can be self-hosted. No email, password or hosted account is
-required. Apache-2.0 licensed; unreleased, with no legacy-state compatibility.
+- **Sync Chain:** cryptographic identity and trust rooted in a private 24-word phrase.
+- **Agent:** `wayfinder.service` on each enrolled machine.
+- **Gateway:** coordination and routing, either Wayfinder-hosted or self-hosted.
+- **MCP:** optional, explicitly authorized access to one chain.
 
 ```text
-ChatGPT / other MCP client ── HTTPS + chain-bound OAuth ──┐
-                                                       v
-                                    Wayfinder Gateway (MCP, OAuth, SQLite)
-                                          ^            ^            ^
-                                          | outbound WSS sessions    |
-                                     Chain A       Chain A       Chain B
-                                     device 1      device 2       device 1
+Hosted:      devices -> https://gateway.usewayfinder.app
+             ChatGPT -> https://mcp.usewayfinder.app -> same chain state
+Self-hosted: devices -> https://wayfinder.example.com
+             ChatGPT -> https://wayfinder.example.com
+Downloads:   https://usewayfinder.app (independent)
 ```
+
+The hosted gateway runs entirely on Cloudflare Workers and SQLite-backed Durable
+Objects. It has no private origin or dependency on any user's machine. The Rust
+`wayfinder-gateway` is the first-class self-hosted implementation of the same
+protocol. Neither mode needs email, passwords or a Wayfinder account. Apache-2.0.
 
 ## Install the agent
 
@@ -264,20 +267,21 @@ caching/logging of credential-bearing requests. Keep the origin on loopback.
 See [deployment details](docs/remote-mcp.md) and
 [the generic systemd unit](deploy/wayfinder-gateway.service).
 
-Create/join with `--gateway https://wayfinder.example.com`. To move an existing
-device, stop its agent, run `wayfinder gateway https://wayfinder.example.com`,
-confirm the destination, and restart. This reuses the device and Chain ID.
-Revocations and grants are gateway-local: a fresh gateway has neither; moving a
-chain does not copy revocation history or trust old OAuth tokens. Move every
-wanted device deliberately and reconnect MCP clients to the new URL. No silent
-fallback occurs. HTTP is allowed only for explicit loopback development origins.
+Create/join with `--gateway https://wayfinder.example.com`. Gateway selection is
+part of enrollment. The same recovery phrase derives the same Chain ID everywhere,
+but every installation gets an independent device key. Fresh enrollment requires
+a local root signature bound to a new gateway challenge; copying an old device
+certificate to an empty gateway cannot admit it. The phrase/root private key
+never leaves the device. Revocations and MCP grants remain at their gateway;
+there is no gateway-switch or state-transfer workflow. Authorize MCP separately
+at each gateway. HTTP is allowed only for explicit loopback development origins.
 
 The gateway handles plaintext commands and results at the application layer.
 This is **not end-to-end encryption past the gateway**. Hosted users trust its
 operator with MCP traffic and command routing. Self-hosters control this trust
 boundary. Neither gateway receives recovery phrases or private identity keys.
-Cloudflare provides the official deployment's ingress/TLS/private connectivity;
-it implements no Wayfinder identity or protocol semantics.
+Cloudflare hosts the official coordination service. Protocol and security rules
+remain defined in this repository; see [the architecture](docs/architecture.md).
 
 ## Development and release maintenance
 

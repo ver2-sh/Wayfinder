@@ -8,7 +8,7 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
-pub const DEFAULT_GATEWAY: &str = "https://mcp.usewayfinder.app";
+pub const DEFAULT_GATEWAY: &str = "https://gateway.usewayfinder.app";
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {

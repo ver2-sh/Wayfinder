@@ -1,352 +1,47 @@
-# Implementation, security review and deployment record
+# Validation
 
-Date: 2026-09-16. The sections below record the original implementation; the
-material abuse-resistance follow-up at the end records the subsequent audit.
-No real Sync Chain recovery phrase was generated during either validation.
-All automated enrollment used disposable material kept out of transcripts/logs.
-
-## Repository changes
-
-`project-wayfinder`:
-
-- Added `wayfinder-agent` and `wayfinder-gateway` crates and gateway service unit.
-- Replaced core peer identity/state with `identity.rs`, `protocol.rs`, chain-bound
-  OAuth and SQLite `credentials.rs`; retained restrictive atomic local storage.
-- Adapted MCP to authenticated chain-scoped routing, required explicit exec target,
-  added dynamic OAuth registration and local signed out-of-band approval.
-- Replaced CLI/TUI/service UX with chain/device/gateway/grant concepts.
-- Preserved the shell executor's stdout/stderr, status, timeout and cancellation.
-- Removed `wayfinder-network`, `wayfinder-api`, and old `wayfinder-tui` crates,
-  Noise peer transport, graph revisions, invite/link/advertise configuration,
-  inbound agent MCP/control/peer listeners, old static bearer administration,
-  entry-node semantics and peer-application transport/example documentation.
-- Replaced/renamed the existing `tests/dynamic_apps.py` integration exercise with
-  `tests/sync_chain.py`. Added an expiry boundary test inside existing OAuth source,
-  because waiting/changing the system clock is inappropriate for this security check.
-- Updated README and architecture, OAuth/self-hosting and validation documentation.
-  Cargo manifests/lockfile now reflect the new dependencies and removed crates.
-
-`Wayfinder-Cloudflare`: corrected current deployment documentation and binding
-comment; added the exact, **not yet applied** hostname-only Browser Integrity Check
-configuration rule. The existing streaming Worker code, private VPC binding,
-tunnel and Custom Domain were retained; live WebSocket testing proved them useful.
-No Worker code deployment was required.
-
-`Norted-Utils`: unchanged. No OpenAI Tunnel dependency was reintroduced.
-
-## Final architecture and identity
-
-Agents connect outward to the shared gateway; MCP/OAuth clients use the same
-public URL. SQLite stores public roots/certificates, device revocations, last-seen
-metadata and chain-bound grants. Connections, nonces and pending OAuth are
-in-memory. All device routing uses composite `(Chain ID, Device ID)` keys.
-OAuth bearer lookup resolves a hash to a chain/grant pair and joins both keys.
-
-Exact cryptography and signed-byte encodings are in [architecture.md](architecture.md):
-256 OS-random bits → 24-word English BIP39 → HKDF-SHA256, salt
-`wayfinder/sync-chain/v1`, info `root-signing/ed25519`, 32-byte Ed25519 signing seed.
-Chain ID is `wfc1_` plus the full lowercase hex SHA-256 of
-`wayfinder/chain-id/v1\0 || root_public_key`. Device IDs use the analogous
-`wayfinder/device-id/v1\0` domain and `wfd1_` prefix. Gateway URLs are absent from
-identity derivation. They are included in authentication/administration proofs.
-
-Each independent device key receives a root-signed versioned membership certificate
-binding chain, root, device ID/key, role and name. Creation produces an admin;
-join defaults to member. No root secret persists. Revocation is a permanent
-per-gateway device tombstone and closes the session. Existing grants remain
-separately revocable. Possession of the root phrase can enroll new administrators.
-
-WSS challenge-response proves device possession with a one-use 256-bit nonce,
-5-second authentication deadline, exact gateway audience and certificate digest.
-Heartbeat is 15 seconds, liveness deadline 45 seconds, reconnect 1–30 seconds plus
-jitter. Dispatch never retries after uncertain delivery. HTTP disconnect and
-session loss propagate cancellation to process groups where transport permits.
-
-OAuth uses exact registered redirects, S256 PKCE, state/issuer, resource and scope
-binding. An admin confirms the client and scopes locally and signs their digest
-with a one-use, 30-second administrative nonce. The 48-bit pairing code expires
-in ten minutes. One-use authorization codes expire in one minute. Access tokens
-expire in an hour, rotating refresh credentials within 30 days; stored verifiers
-are SHA-256, and refresh replay revokes the grant. Grant listing includes scopes,
-active status and access/refresh expiration. No account or browser phrase input.
-
-## Validation results
-
-- `./validate.sh`: formatting, workspace check, strict Clippy (`--all-targets`,
-  `-D warnings`), workspace tests/doc tests passed.
-- `cargo build --release --workspace`: both release binaries built.
-- Release process-level validation: **49 checks passed locally**; **46 passed
-  against https://mcp.usewayfinder.app**. The hosted run omits stopping/reading
-  the gateway process/database because those are deployment-owned. The origin Host
-  rejection test is local; Cloudflare path/Host handling is covered by proxy tests.
-- The existing Cloudflare `npm run check` passed TypeScript, Wrangler dry-run and
-  all three proxy contract tests.
-- Agent installer passed shell syntax check and ran successfully on norted.
-  Gateway systemd unit passed verification after binary installation (host emits
-  unrelated existing xfs system unit deprecation warnings).
-- Additional hosted checks exercised exact gateway audience, tampered signed
-  operation rejection, absence of inbound agent listeners, grant activity/scope/
-  expiry metadata, administrative nonce expiry and idle heartbeat updates.
-
-The integration exercise verifies:
-
-1. Interactive chain creation and explicit CLI OAuth approval without printing
-   captured disposable phrases; join via protected stdin.
-2. Independent reconstruction of HKDF/root key and full Chain ID in Python;
-   deterministic phrase identity, different chain material, independent device keys.
-3. Invalid root certificate, mismatched Chain ID, device signature and replay rejection.
-4. Both same-chain devices visible; other-chain ID/name exec and revocation denied.
-5. Member administration denied; grant chain/scopes exact; read-only exec denied.
-6. Unknown redirects/unapproved codes denied, one-use approvals/codes, state/issuer
-   preservation, refresh rotation/replay handling and immediate grant revocation.
-7. Real stdout, stderr, nonzero exit, signal, timeout, process-group cancellation,
-   and two full 1 MiB control-byte streams (worst-case JSON escaping).
-8. Agent offline/restart behavior; gateway restart reconnect and durable revocation;
-   no retry after dispatch uncertainty.
-9. A second independent generic gateway with the same Chain ID and no Cloudflare code.
-10. TLS-verified hosted HTTPS/WSS, correct unauthenticated challenge and metadata,
-    private loopback origin, and scans confirming no phrase/root/device private key
-    or raw bearer/refresh secret in the local gateway database.
-
-The expiry unit test exercises the exact `expires == now` boundary for both pending
-approval and authorization code, including code consumption. This is not a full
-third-party cryptographic audit or distributed load test.
-
-## Security review findings
-
-| Concern | Result / boundary |
-| --- | --- |
-| Recovery/key leakage | No protocol field carries private identity material; no phrase argv/env/log output. Creation requires a terminal. Transient secret buffers zeroized where practical. |
-| Identity forgery | Strict Ed25519 verification and root/device-to-ID checks precede registration. Stored membership cannot be rewritten. |
-| Replay | Session-local challenge once; stateless admin challenge; replay consumption after verified live-device authentication; code/approval one-use and bounded TTL. |
-| Cross-chain IDOR | Device/grant queries and socket maps use verified chain keys. No target input selects chain. Negative live tests passed. |
-| Revoked reconnect | Durable tombstones reject registration; active socket terminated; gateway restart preserves revocation. |
-| Approval confused deputy | Admin-only, connected device required; exact request digest, client, redirect, scopes, gateway and expiry bound; no browser-only consent. |
-| PKCE/redirect/state | Existing exact redirect, S256, verifier validation, state/issuer return and one-use code protections retained. |
-| Origin exposure | Only 127.0.0.1:3000 listens; old peer port 3001 removed. Worker cannot derive origin from user path/host. |
-| Uncertain exec | Error explicitly states unknown outcome; no retry; cancellation tested locally and through Cloudflare. |
-| Hosted confidentiality | No E2E claim: gateway and TLS terminator see payloads, gateway is trusted to route commands. |
-| Local OS privilege | norted agent is configured as root; commands will run as root. Gateway uses an unprivileged dynamic service user. |
-
-Intentional limits: no root rotation or QR format; no revocation synchronization
-across gateways; no high availability/distributed database; bounded authenticated replay/client/session state plus hosted native source limits;
-no comprehensive distributed denial-of-service guarantee; no OS protection against a
-compromised device, swap or core dumps; Windows/macOS service packaging untested.
-A malicious gateway can send commands through an active authenticated channel;
-self-hosting changes who is trusted, not that application-layer boundary.
-
-## Live deployment and remaining operator steps
-
-- `wayfinder-gateway.service`: enabled and active on norted, unprivileged dynamic
-  user, private SQLite state in `/var/lib/wayfinder-gateway`, origin 127.0.0.1:3000.
-- `cloudflared-wayfinder.service`: active and unchanged; existing VPC/Worker/
-  Custom Domain reaches the shared gateway over the private tunnel.
-- `wayfinder.service`: new agent unit installed and enabled, intentionally inactive
-  because `installation.json` does not exist. Obsolete unreleased local state was
-  removed after successful hosted validation. No real chain was initialized.
-- Disposable hosted test records were audited as revoked and cleared after checks;
-  the live registry is fresh for real enrollment.
-- Native `/usr/local/bin/wayfinder` and `/usr/local/bin/wayfinder-gateway` installed.
-- Old peer/control/MCP agent listeners are gone. No new public port was exposed.
-
-Run this **locally on norted, as root, in a private unrecorded terminal**:
+Run the existing checks with current source:
 
 ```sh
-wayfinder --data-dir /root/.local/share/wayfinder chain create --name norted
-systemctl start wayfinder.service
-wayfinder status
-wayfinder devices
+./validate.sh
+cargo build --workspace
+python3 tests/sync_chain.py
+python3 tests/tui_service.py
 ```
 
-Save the phrase securely when displayed. To use a different OS privilege boundary,
-install/enroll the agent under the intended non-root account instead. Additional
-devices use `wayfinder chain join --name NAME` and a hidden phrase prompt.
+The Python suites need `cryptography`, `mnemonic`, `websockets`, and `pyte` in a
+private development virtual environment. They create disposable chains and
+services and suppress recovery phrases, device keys and bearer credentials.
 
-Reconnect/reauthorize ChatGPT using `https://mcp.usewayfinder.app`; run the displayed
-`wayfinder authorize CODE` on the connected admin device, verify details, type
-`yes`, then refresh the browser. Old OAuth clients/grants are intentionally invalid.
+For hosted integration, use the same agent binaries and suite with separate
+public origins:
 
-One Cloudflare operator step remains: default `Python-urllib` requests receive
-edge error **1010**, while Wayfinder and the validation product User-Agent work.
-The current Wrangler credential returns **403** for zone security settings and
-rulesets, preventing an automatic adjustment. Add the hostname-only configuration
-rule in Wayfinder-Cloudflare's `deploy/browser-integrity-rule.json` to disable
-Browser Integrity Check for `mcp.usewayfinder.app`, leaving other hosts unchanged.
-Then verify default urllib metadata requests. See that repository's README for
-the exact policy and Cloudflare documentation. This is an external permission
-limitation, not an application auth workaround.
+```sh
+WAYFINDER_TEST_GATEWAY=https://gateway.usewayfinder.app \
+WAYFINDER_TEST_MCP=https://mcp.usewayfinder.app \
+python3 tests/sync_chain.py
+```
 
+The suite exercises real enrollment, two devices in one chain, an isolated second
+chain, independently derived HKDF/Chain IDs, invalid certificates/signatures,
+explicit CLI OAuth approval, chain-bound grants, maximum-size output, deadlines,
+process-group cancellation on HTTP disconnect, disconnect without command replay,
+scopes, device/grant revocation, refresh rotation and replay detection. It also
+enrolls a fresh device with the same phrase at an independent Rust gateway and
+checks that old device certificates cannot self-admit there.
 
-## Material abuse-resistance follow-up (2026-09-16)
+Self-hosted runs additionally restart the Rust gateway and inspect only the
+private disposable SQLite file for accidental persistence of recovery material,
+private keys or raw bearer tokens. Hosted restart/deployment and hibernation
+checks belong to the infrastructure validation record in Wayfinder-Cloudflare.
+No migration workflow, state-transfer format or old-layout migration is present.
 
-The follow-up keeps the existing database schema and permanent device trust state.
-Public challenge issuance is stateless; signed-operation replay records survive
-reconnects and expire with the challenge. Handshakes and authenticated sessions
-have separate capacity, with chain limits. Public DCR is temporary until a grant
-is approved. OAuth pending/approved budgets are separate and expired OAuth state
-is collected. Durable device creation has a rate budget, not destructive GC.
+The TUI suite validates hidden phrase input, modal confirmation, mouse/keyboard
+interaction, nonblocking lookups, terminal restoration, managed/temporary agent
+ownership, update failure recovery and service cleanup. Gateway display is
+informational; the URL is selected at enrollment.
 
-The existing 49-check process suite remains unchanged. Additional tests in existing
-Rust source files cover challenge floods, forged proofs, reconnect/restart replay,
-expiry, DCR saturation without durable writes, client persistence, refresh replay
-through maintenance, and preservation of revoked devices during expiry/admission.
-OAuth tests also saturate the unapproved pool and exercise reserved approved capacity.
-
-There is no reset, migration or device re-enrollment requirement. Deploy gateway
-and CLI together because administrative challenges are now opaque MAC-bearing
-values. In-progress authorizations and registrations without grants restart;
-existing grants and device identity survive. Do not clear live disposable device
-tombstones after validation.
-
-
-Follow-up validation passed `cargo fmt --check`, `cargo check --workspace`,
-`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`
-(five unit tests plus doc tests). Both current debug binaries were explicitly
-built before the unchanged `tests/sync_chain.py`: **49 local checks passed** and
-**46 hosted checks passed**. A separate disposable local saturation exercise held
-128 unauthenticated sockets, verified a live admin's operations still worked,
-and verified admission recovered after the five-second handshake expiry.
-
-The release gateway/CLI and Cloudflare Worker were deployed. Before/after hashes
-confirmed the original live device trust rows were unchanged, and the original
-grant survived. The actual connected Wayfinder client listed `norted` and executed
-a harmless command after deployment. Hosted checks used real Rust agents and WSS,
-including cancellation, isolation, scopes, revocation and refresh replay. No live
-database was reset; disposable test devices were revoked, leaving their tombstones.
-Cloudflare `npm run check` passed all four proxy tests, TypeScript and dry-run build.
-Live settings confirm three native rate-limit bindings, no observability, no
-Logpush and no tail consumers. Browser Integrity remains a material external
-permission blocker: stock urllib still receives 403/1010 and Configuration Rules
-access receives 403. The hostname-only rule remains correct and unapplied.
-
-A live persistent-connection test using invalid registration bodies returned ten
-422 responses followed by 429 with `Retry-After: 60`, without creating clients.
-During that source throttle, MCP `/` still returned the expected 401 and both
-metadata endpoints returned 200 with the correct issuer/resource. Native counters
-are approximate across edge isolates; the test does not claim a strict global cap.
-
-## Distribution, lifecycle and management TUI foundation (2026-09-16)
-
-Implemented on `feat/distribution-lifecycle`, starting from remote master
-`79d0ed5`. No push, tag, release, repository visibility change or hosted workflow
-execution was performed. Gateway/MCP/authentication protocol behavior is unchanged.
-
-Local validation (Rust 1.98.0; dependency manifests declare no MSRV above the
-workspace's Rust 1.88 minimum):
-
-- `./scripts/release-preflight.sh` with dist 0.33.0: passed formatting, workspace
-  check, strict Clippy, workspace tests/doc tests (8 unit tests), normal
-  `cargo build --release -p wayfinder`, exact version check, reproducible workflow
-  generation/check, dist plan and shell syntax checks. Plan assertions require
-  exactly the main binary, five targets, and one combined macOS job.
-- `cargo build --release -p wayfinder --target x86_64-unknown-linux-musl`:
-  passed; `file` confirmed a static PIE executable.
-- `cargo check -p wayfinder --target x86_64-pc-windows-gnu`: passed using MinGW;
-  includes Windows lifecycle, updater policy guard and upstream replacement code.
-- `cargo check -p wayfinder --target aarch64-unknown-linux-musl`: passed with a
-  temporary Zig C-compiler wrapper. Initial wrapper target/venv invocation errors
-  were fixed locally; they did not require repository changes or hosted builds.
-- `dist build --artifacts=lies`: generated all-platform installer/archive templates
-  locally. Fake artifacts were removed afterward. Then
-  `dist build --artifacts=host --target=x86_64-unknown-linux-musl` built the real
-  archive and installer successfully. A loopback-only artifact server exercised
-  actual shell installation, executable version, receipt creation and rejection
-  of corrupted archive contents.
-- `actionlint .github/workflows/release.yml`: passed. YAML permission/trigger
-  assertions passed. Both the version helper and dist plan rejected `v99.0.0`.
-- `tests/sync_chain.py`: all **49 checks passed** against a disposable local gateway.
-- Disposable CLI/PTY checks: version, no-subcommand nonterminal failure, private
-  release error reporting, service status, bare TUI rendering/quit; an independent
-  daemon survives TUI exit, a TUI-owned agent stops on exit, and a duplicate daemon
-  is rejected by the shared directory lock.
-- Local release API fixtures: latest stable/current version display, forced
-  rechecks, cached TUI notification without another request, missing/mismatched
-  receipt rejection, and requests without authorization or device/chain data.
-- Isolated user service definition install/uninstall with a fake `systemctl`:
-  passed; real `systemd-analyze --user verify` accepted the generated unit. No new
-  real startup service was installed during these tests.
-- `git diff --check` and shell syntax checks passed. Tests used disposable recovery
-  material; secret-bearing terminal output stayed in memory and was not printed.
-
-Native macOS LaunchAgent and Windows Task Scheduler/PowerShell runtime behavior,
-MSVC/macOS final linking/signing, and a real published-version upgrade remain
-unexercised. No hosted runner was used to fill these gaps. Public download access,
-code-signing/notarization, PowerShell checksum verification and policy-preserving
-Windows updating remain the release-readiness items described in [releases](releases.md).
-
-Environment side effect: installing local musl/MinGW compiler prerequisites caused
-Ubuntu's package-manager restart hook to restart the pre-existing system-level
-`wayfinder.service`. A read-only check confirmed it remained active/running. The
-new implementation was not deployed into that service; no identity was migrated.
-
-## Full-screen TUI restoration — 2026-09-17
-
-The current Sync Chain/gateway model now uses a ratatui/crossterm alternate-screen
-interface in the existing `wayfinder` crate. Historical TUI code was used only as
-a visual reference. Navigation, readable lists/details, explicit confirmations,
-secure enrollment and temporary-agent ownership use the current operations.
-
-Local validation used the repository-built `target/debug/wayfinder` and a
-loopback gateway with disposable identities. No release, tag or GitHub Actions
-run was created.
-
-- `./validate.sh` passed: `cargo fmt --check`, `cargo check --workspace`, strict
-  workspace Clippy and workspace tests/doc tests. Two tests in the existing TUI
-  source verify hidden input never enters rendered frames and rendering preserves
-  selection and incomplete confirmation input.
-- `./build-development.sh` and `cargo build -p wayfinder-gateway` passed.
-- The existing `tests/sync_chain.py` process-level security exercise passed all
-  49 checks locally.
-- A disposable PTY harness passed 25 interaction/lifecycle checks: both entry
-  points; automatic temporary startup and shutdown; attaching to a pre-existing
-  daemon; selection persistence; Devices and populated MCP Grants; explicit
-  device/grant confirmation and grant revocation; pairing errors and approval
-  with visible scopes, client, redirect, gateway and Chain ID; gateway validation,
-  cancellation, success and failure recovery; unavailable updates and source-build
-  replacement refusal; Create/Join, explicit phrase-storage confirmation, hidden
-  bracketed-paste input, invalid phrase errors, cancellation and Ctrl-C in a secret
-  field. Secret-bearing terminal output remained in memory and was never logged.
-- Three additional checks installed a disposable Linux user service, verified
-  that q and Ctrl-C leave it running, then uninstalled it and verified cleanup.
-  No pre-existing service was stopped or modified.
-- Five further PTY checks covered resizing to 80×24, invalid cached status,
-  canceling a stalled pairing lookup, quitting while the gateway accepts sockets
-  but never replies, and the 12-second remote-list timeout. PTY exit checks compare
-  terminal attributes with their initial values and verify alternate-screen and
-  bracketed-paste cleanup.
-
-Remote lists load on entering their section or explicit refresh; local status
-refreshes every two seconds without changing selection or input. Confirmed
-mutations finish before a queued quit so temporary-agent ownership can be restored.
-Native macOS/Windows execution and actual release replacement remain untested in
-this Linux environment. No update was installed during these checks.
-
-### Managed-service ownership follow-up (2026-09-17)
-
-TUI Start/Restart now stop an owned temporary agent before invoking installed
-managed startup. Success leaves no TUI ownership. On failure, Start/Restart stop
-any pending managed startup and wait for the directory to be released before
-restoring temporary operation. The original error is retained; a recovery error
-is reported alongside it. Install retains its stop-before-install and temporary
-recovery behavior; Uninstall leaves a TUI-owned temporary agent alone.
-
-- `./validate.sh` passed: formatting, workspace check, Clippy with
-  `--workspace --all-targets -- -D warnings`, and all workspace tests/doc tests.
-- `./build-development.sh` and `cargo build -p wayfinder-gateway` passed.
-- `tests/tui_service.py` passed 36 checks using repository debug binaries, a
-  loopback gateway, a disposable enrolled identity, and a real systemd user unit.
-  Both Start and Restart passed from installed-but-stopped / temporary-owned
-  state. An `ExecStartPre` lock probe verified release before managed startup;
-  the service stayed active with zero restarts beyond its restart interval while
-  the TUI remained open, and survived TUI exit.
-- The same harness covered native failure recovery for both actions, combined
-  native/restoration errors, no-service Start/Restart, managed and external attach,
-  Install success/failure, Uninstall, q/Ctrl-C exit, and terminal attribute,
-  alternate-screen, and bracketed-paste restoration. It requires Python `pyte`
-  and a running Linux user service manager. All disposable services/data were
-  removed. No installed production binary or GitHub Actions configuration changed.
-
-Native macOS/Windows lifecycle execution remains untested. Native service command
-success retains its existing meaning; this change adds no readiness supervisor.
-If recovery cannot stop managed startup or release the directory, it reports the
-recovery failure instead of starting a competing temporary agent.
+Do not treat local Worker emulation as proof of public transport behavior. Verify
+HTTP cancellation and proxy propagation against the public MCP origin, and
+verify the hosted service with the former private gateway/tunnel stopped. Keep
+live disposable credentials private and revoke their devices after validation.

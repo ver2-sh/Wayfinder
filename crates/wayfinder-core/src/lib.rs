@@ -18,6 +18,7 @@ pub mod oauth;
 pub const VERSION: u32 = 1;
 pub mod identity;
 pub mod protocol;
+pub mod security;
 pub fn random_secret() -> String {
     let mut b = [0u8; 32];
     OsRng.fill_bytes(&mut b);

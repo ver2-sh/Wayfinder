@@ -7,11 +7,13 @@
 - `wayfinder-agent`: outbound WebSocket lifecycle and local shell dispatch.
 - `wayfinder-exec`: fresh shell, bounded output, deadline and process-group cleanup.
 - `wayfinder-mcp`: official rmcp Streamable HTTP server and OAuth HTTP endpoints.
-- `wayfinder-gateway`: shared registry/session routing and hosted/self-hosted binary.
+- `wayfinder-gateway`: generic self-hosted registry/session routing.
 - `wayfinder`: enrollment, local approval, device/grant administration and terminal UI.
 
 All generic implementation is Apache-2.0 in this repository. The
-Wayfinder-Cloudflare repository contains only hosted ingress/deployment. No
+Wayfinder-Cloudflare repository contains the hosted runtime adapter and Cloudflare deployment.
+`packages/protocol` provides the shared Web-runtime wire codec without Cloudflare
+dependencies. Rust core definitions and this document remain normative. No
 Cloudflare data store, account identifier or hostname participates in identity.
 
 ```mermaid
@@ -81,6 +83,31 @@ can list chain devices and receive commands. Role changes require fresh enrollme
 If all admins are lost, the phrase can enroll a new admin. Root compromise requires
 a new chain; no root rotation, QR encoding or revocation federation is implemented.
 
+## Fresh gateway admission
+
+Enrollment requests `POST /device/challenge?chain_id=<Chain ID>` and signs locally:
+
+```text
+UTF8("wayfinder/admission/v1\0")
+|| string(gateway_origin) || string(nonce)
+|| string(hex(SHA256(certificate_signed_bytes)))
+```
+
+`POST /device/admit` carries `{certificate, nonce, signature}`. The signature is
+made by the transient root key, not the device key. Verify the certificate, root
+signature, gateway-bound challenge and deadline before recording admission.
+Challenge consumption is one-time and durable. An existing revoked device ID
+cannot be readmitted, including by a new root signature. Unknown fields fail.
+After admission, the root key is discarded and only the independent device key
+is saved. Reconnect uses device authentication, never a recovery phrase.
+
+A device certificate alone cannot create or join a chain at an empty gateway.
+This prevents revoked device keys from bypassing revocation by changing the URL.
+Root holders can deliberately enroll new devices, including admins, at their
+chosen gateway. Gateway selection occurs at enrollment; no gateway-switch,
+security-state export/import, or automatic trust-state transfer is implemented.
+Chain IDs remain gateway-independent; gateway-local grants require new approval.
+
 ## Local storage
 
 One `installation.json` contains version, gateway URL, public certificate and
@@ -95,7 +122,8 @@ last-observed display, not an authentication source.
 
 ## Agent protocol
 
-JSON frames have explicit tagged schemas. Connect outward to `/agent` using WSS.
+JSON frames have explicit tagged schemas. Connect outward to `/agent?chain_id=<public Chain ID>` using WSS.
+The public routing hint is not authentication.
 The gateway sends `{type: challenge, version: 1, gateway, nonce}`. Its nonce is
 256 random bits, scoped to that socket, expires in 5 seconds, and is consumed
 by the single authentication frame. The device verifies the exact configured
@@ -109,7 +137,7 @@ UTF8("wayfinder/session/v1\0")
 ```
 
 The authentication frame carries only certificate and signature. The gateway
-verifies possession before registering the chain/device, rejects revoked devices,
+verifies possession and prior root-authorized admission, rejects revoked devices,
 and sends `ready`. The gateway then routes `exec`, `cancel`, and `result` frames.
 A new connection for the same `(chain, device)` closes the previous one. Session
 cleanup checks its generation so an old socket cannot erase a new connection.
@@ -150,7 +178,7 @@ clients are global metadata; they confer no access without local chain approval.
 
 Administrative HTTP operations request an opaque challenge from `/device/challenge`.
 It contains a 30-second deadline, 256 random bits and an HMAC-SHA256 tag under a
-process-local random gateway key. Issuance allocates no server state. After MAC,
+process-local random gateway key. Issuance allocates no per-challenge server state. After MAC,
 expiry, device signature, active certificate, role and live-session validation,
 the gateway records consumption in a per-device replay cache (at most 128
 unexpired consumption records). The cache survives reconnects; gateway restart rotates the MAC key,
@@ -172,8 +200,8 @@ operations require admin role. Enrollment/session installation and administratio
 are serialized to prevent an admin revocation/approval race.
 
 OAuth binds exact registered redirect, client ID, resource origin, S256 challenge,
-state, requested scopes and expiry into one pending request. A 48-bit display code
-identifies it; the browser holds a separate random 256-bit continuation ticket.
+state, requested scopes and expiry into one pending request. An opaque display code identifies it; hosted codes include a public OAuth-client
+routing prefix followed by 48 random bits; the browser holds a separate random 256-bit continuation ticket.
 The device retrieves details and signs approval of their SHA-256 digest, including
 client ID, redirect, scopes, request ID and expiry. Human approval is explicit.
 The request is consumed once. An approved chain is carried into a one-minute,
@@ -210,6 +238,35 @@ self-hosted gateways must configure equivalent source controls for `/agent`,
 Hosted deployment uses native edge rate limits. Accountless root creation cannot
 prevent distributed Sybil attacks; these are proportionate controls, not a global
 quota or a claim of distributed denial-of-service immunity.
+
+## Hosted storage and lifecycle
+
+Hosted agents connect to `gateway.usewayfinder.app`; MCP/OAuth clients connect to
+`mcp.usewayfinder.app`. Both use the same chain coordination boundary. Hosted
+SQLite-backed Durable Objects shard devices, grants, replay protection and job
+status by public Chain ID. An OAuth-client object holds bounded registration and
+pairing state; only an authenticated chain object can approve it. OAuth-client
+metadata confers no chain access. Routing prefixes in tokens are untrusted until
+the complete token hash, scope, resource and grant are verified in that chain.
+
+Agent sockets use the WebSocket Hibernation API. Certificate, nonce deadline,
+session generation and last-seen state attach to each socket. Durable alarms
+expire unauthenticated sockets and check liveness; object eviction does not erase
+identity, revocation, challenges or grants. Deploys may reconnect sockets.
+
+Execution records are persisted before dispatch. Live HTTP response bodies and
+continuations are ephemeral. A lost response never replays a command. Deadlines
+and cancellation clear outstanding work after restart. Command output is bounded
+by the same agent limits and is not retained in the registry. A single large
+output must not be inserted into a SQLite row.
+
+Hosted unapproved registrations expire after one hour; pairing requests expire
+after ten minutes and codes after one minute. They are durable until expiry;
+self-hosted pending flows may instead be invalidated on process restart. Either
+lifecycle fails closed. Approved grants remain chain-bound and durable. Both
+implementations cap per-chain devices at 256 and sessions at 64. Hosted native
+edge limits protect anonymous admission; limits never evict revocation tombstones.
+The exact infrastructure configuration belongs in Wayfinder-Cloudflare.
 
 ## Security boundary
 

@@ -3,6 +3,8 @@
 ## Hosted setup
 
 Install Wayfinder agents, create a chain on the first device, and join the others.
+Agents use `https://gateway.usewayfinder.app`; MCP is optional and uses a separate
+origin backed by the same hosted Sync Chain state.
 Keep at least one administrative device connected. Use
 `https://mcp.usewayfinder.app` as the MCP URL in ChatGPT or another MCP client.
 Everyone uses this URL; OAuth grants distinguish chains. No personal MCP server,
@@ -19,7 +21,7 @@ Register additional callback URIs as separate clients. Metadata URLs:
 - `/.well-known/oauth-authorization-server`
 
 The MCP endpoint is `/`. The authorization request uses `response_type=code`,
-`resource` equal to the exact gateway origin, the registered `client_id` and
+`resource` equal to the exact MCP origin, the registered `client_id` and
 `redirect_uri`, an S256 PKCE challenge, desired `scope` (`read`, `exec`, or both),
 and the MCP client's state. The token request uses the same resource and redirect
 and the original verifier. Tokens are never accepted in URLs.
@@ -44,7 +46,7 @@ requests, but does not undo a command already dispatched.
 
 ## Self-hosting
 
-Build the exact same open-source gateway used by the hosted deployment:
+Build the open-source Rust implementation of the same Wayfinder protocol:
 
 ```sh
 cargo build --release -p wayfinder-gateway
@@ -89,22 +91,12 @@ wayfinder chain create --name laptop --gateway https://wayfinder.example.com
 wayfinder chain join --name workstation --gateway https://wayfinder.example.com
 ```
 
-The gateway URL is independent of identity. To move an existing device:
-
-```sh
-sudo systemctl stop wayfinder.service
-wayfinder gateway https://wayfinder.example.com
-sudo systemctl start wayfinder.service
-```
-
-The command requires interactive destination confirmation, re-registers this
-same key/certificate, and saves the new URL only after successful registration.
-A failed move leaves the old configuration intact. No automatic fallback exists.
-Other devices need the same explicit move; configure the MCP client for the new
-URL and reauthorize. A new gateway does not inherit revocations or grants. To
-preserve those, move a consistent private database backup to the new gateway
-instead. Grants have a resource origin binding: changing the public origin
-requires new OAuth authorization.
+Gateway selection happens during enrollment. A recovery phrase derives the same
+Chain ID independently of the URL; each enrollment creates a new device key and
+locally signs fresh gateway admission. An old device certificate alone cannot
+bootstrap a chain or register at an empty gateway. Device revocations and MCP
+grants are durable within that deployment. There is no gateway-change or
+state-transfer command. MCP clients need explicit authorization at each gateway.
 
 For local development, `http://127.0.0.1:PORT` and explicit IPv6 loopback HTTP
 origins are allowed. Remote plaintext origins and noncanonical URLs are rejected.
@@ -124,9 +116,9 @@ keys. Already-dispatched execution can have an uncertain outcome and is never
 retried. Revocation terminates device sessions; network failures can delay
 cancellation until the agent detects loss or reaches the command deadline.
 
-The official Cloudflare Worker/VPC/tunnel remains deployment infrastructure.
-Self-hosting needs none of it. See Wayfinder-Cloudflare for its hosted deployment
-contract. No OpenAI Tunnel or peer-address configuration is part of Wayfinder.
+The hosted deployment runs Workers and per-chain SQLite Durable Objects entirely
+on Cloudflare. Self-hosting needs no Cloudflare service, metadata, account, tunnel
+or Wayfinder-operated endpoint. See Wayfinder-Cloudflare for hosted deployment.
 
 
 ## Admission and registration lifetime
