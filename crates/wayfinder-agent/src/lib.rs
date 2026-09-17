@@ -122,6 +122,20 @@ fn status(path: &Path, i: &Installation, online: bool) -> Result<()> {
     )
 }
 pub async fn run(path: &Path, i: &Installation, stop: CancellationToken) -> Result<()> {
+    run_inner(path, i, stop, false).await
+}
+
+/// Run embedded in a terminal UI; connection status remains available in status.json.
+pub async fn run_quiet(path: &Path, i: &Installation, stop: CancellationToken) -> Result<()> {
+    run_inner(path, i, stop, true).await
+}
+
+async fn run_inner(
+    path: &Path,
+    i: &Installation,
+    stop: CancellationToken,
+    quiet: bool,
+) -> Result<()> {
     i.validate()?;
     let mut backoff = 1u64;
     status(path, i, false)?;
@@ -132,7 +146,7 @@ pub async fn run(path: &Path, i: &Installation, stop: CancellationToken) -> Resu
         if stop.is_cancelled() {
             break;
         }
-        if result.is_err() {
+        if result.is_err() && !quiet {
             eprintln!("Gateway session unavailable; retrying with the same device identity");
         }
         if started.elapsed() > Duration::from_secs(60) {

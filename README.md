@@ -63,14 +63,24 @@ Do not disable OS protections to install an unsigned build.
 ## Normal usage
 
 Run `wayfinder` in a terminal to open the management TUI (`wayfinder tui` is
-also supported). Use its menu to create/join a chain, inspect devices and grants,
-approve pairing requests, manage the agent, change gateway or check/install
-updates. The overview shows version, identity, role, gateway and connectivity.
-Start a temporary agent from **Agent → start**, or enable startup with **install**.
-Closing the TUI stops only an agent it started temporarily; independently running
-agents continue. The menu uses single keys; forms use Enter. Quit with `q`, Escape
-or Ctrl-C at the menu. Recovery input has no echo or history. Use a private,
-unrecorded terminal; terminal clearing cannot erase an external recording.
+also supported). The full-screen sections cover Overview, Devices, MCP Grants,
+Browser pairing, Gateway, Agent and Updates. Before enrollment, choose Create Sync
+Chain or Join Sync Chain. Use arrows to select a section, Tab or Enter to focus a
+list, and PgUp/PgDn to scroll details. Context keys appear in each view; `r`
+refreshes, Esc cancels a prompt, and `q` or Ctrl-C quits. Destructive actions and
+pairing approvals require typing `yes` after reviewing their details.
+
+For an enrolled installation, opening the TUI automatically starts a temporary
+agent if none is running. Closing it stops only that temporary agent; attached
+agents and installed services continue running. **Agent → I** enables automatic
+startup for the current OS user. Gateway changes restart an owned temporary agent,
+including after a failed change; an independently running agent must be stopped
+explicitly first.
+
+Recovery input is hidden and has no history. Creation displays the recovery words
+and requires explicit confirmation that they have been stored securely. Nothing is
+copied automatically. Use a private, unrecorded terminal; terminal cleanup cannot
+erase an external recording.
 
 CLI commands remain available for servers and automation. Bare `wayfinder` fails
 clearly when input or output is redirected; scripts must supply a subcommand.
@@ -125,9 +135,9 @@ wayfinder auth list
 wayfinder auth revoke GRANT_ID
 ```
 
-The TUI can manage a running agent or start a temporary one. Status includes the gateway, connection state,
+The TUI attaches to a running agent or starts a temporary one automatically. Status includes the gateway, connection state,
 Chain ID, Device ID, name and role. Stale status is reported offline. Device and
-grant administration requires the local agent to be connected. Revocation is
+grant administration requires a reachable gateway. Revocation is
 confirmed explicitly (use `--yes` for deliberate CLI automation) and permanent for that Device ID at this gateway; it closes the session, cancels
 in-flight work and prevents reconnect. To replace a revoked installation, join
 with a fresh device key in a fresh data directory. Grants already approved by a
@@ -231,8 +241,9 @@ installation process. No package-manager channel is provisioned yet.
 Updates stop/restart the managed agent for the selected data directory, including
 restarting after an update failure. Independently launched daemons must be stopped
 explicitly. Stop other Wayfinder instances using the same binary before updating,
-especially on Windows. The TUI stops its temporary agent before updating; reopen
-the TUI afterward to run the new executable and start another temporary agent.
+especially on Windows. The TUI stops its temporary agent before updating and
+resumes it afterward, including after failure. Reopen the TUI after a successful
+update to run the new executable.
 Identity, recovery material, grants and gateway configuration are not modified.
 See [release maintenance and platform limitations](docs/releases.md).
 

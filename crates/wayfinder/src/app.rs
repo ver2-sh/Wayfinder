@@ -53,6 +53,7 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
             );
             confirm("Have you stored the recovery phrase securely?")?;
             enroll(data, &phrase, name, gateway, Role::Admin).await?;
+            enrollment_notice(data)?;
         }
         Command::Chain {
             command:
@@ -92,6 +93,7 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
                 if admin { Role::Admin } else { Role::Member },
             )
             .await?;
+            enrollment_notice(data)?;
         }
         Command::Chain {
             command: ChainCommand::Show,
@@ -200,7 +202,15 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
     }
     Ok(())
 }
-async fn enroll(
+fn enrollment_notice(data: &std::path::Path) -> Result<()> {
+    let i = load(data)?;
+    println!(
+        "Sync Chain: {}\nDevice: {}\nRegistered. Start `wayfinder daemon` or install the agent service.",
+        i.certificate.chain_id, i.certificate.device_id
+    );
+    Ok(())
+}
+pub(crate) async fn enroll(
     data: &std::path::Path,
     phrase: &str,
     name: String,
@@ -213,18 +223,19 @@ async fn enroll(
     drop(root);
     let i = Installation::new(gateway, cert, &key)?;
     atomic_write(&data.join("installation.json"), &i)?;
-    println!(
-        "Sync Chain: {}\nDevice: {}",
-        i.certificate.chain_id, i.certificate.device_id
-    );
     wayfinder_agent::register(&i).await.context("Identity saved; gateway registration failed. Run wayfinder daemon to reconnect with this same identity")?;
-    println!("Registered. Start `wayfinder daemon` or install the agent service.");
     Ok(())
 }
 pub fn show_status(data: &std::path::Path) -> Result<()> {
+    display(&status(data)?)
+}
+pub fn status(data: &std::path::Path) -> Result<serde_json::Value> {
     let i = load(data)?;
     let mut s: serde_json::Value = read_private(&data.join("status.json"))
         .unwrap_or_else(|_| serde_json::json!({"online":false}));
+    if !s.is_object() {
+        s = serde_json::json!({"online":false});
+    }
     if s["observed"]
         .as_u64()
         .is_none_or(|t| now().saturating_sub(t) > 30)
@@ -237,11 +248,12 @@ pub fn show_status(data: &std::path::Path) -> Result<()> {
     s["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     s["role"] = serde_json::json!(i.certificate.role);
     s["name"] = serde_json::json!(i.certificate.name);
+    s["service_installed"] = serde_json::json!(service::installed(data)?);
     s["agent_running"] = serde_json::json!(service::agent_running(data)?);
     if s["agent_running"] == false {
         s["online"] = serde_json::json!(false);
     }
-    display(&s)
+    Ok(s)
 }
 pub async fn stop_signal() {
     #[cfg(unix)]

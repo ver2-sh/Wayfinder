@@ -15,6 +15,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 directories = "6"
 ed25519-dalek = "2"
 fs2 = "0.4"

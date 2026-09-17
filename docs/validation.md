@@ -278,3 +278,45 @@ Environment side effect: installing local musl/MinGW compiler prerequisites caus
 Ubuntu's package-manager restart hook to restart the pre-existing system-level
 `wayfinder.service`. A read-only check confirmed it remained active/running. The
 new implementation was not deployed into that service; no identity was migrated.
+
+## Full-screen TUI restoration — 2026-09-17
+
+The current Sync Chain/gateway model now uses a ratatui/crossterm alternate-screen
+interface in the existing `wayfinder` crate. Historical TUI code was used only as
+a visual reference. Navigation, readable lists/details, explicit confirmations,
+secure enrollment and temporary-agent ownership use the current operations.
+
+Local validation used the repository-built `target/debug/wayfinder` and a
+loopback gateway with disposable identities. No release, tag or GitHub Actions
+run was created.
+
+- `./validate.sh` passed: `cargo fmt --check`, `cargo check --workspace`, strict
+  workspace Clippy and workspace tests/doc tests. Two tests in the existing TUI
+  source verify hidden input never enters rendered frames and rendering preserves
+  selection and incomplete confirmation input.
+- `./build-development.sh` and `cargo build -p wayfinder-gateway` passed.
+- The existing `tests/sync_chain.py` process-level security exercise passed all
+  49 checks locally.
+- A disposable PTY harness passed 25 interaction/lifecycle checks: both entry
+  points; automatic temporary startup and shutdown; attaching to a pre-existing
+  daemon; selection persistence; Devices and populated MCP Grants; explicit
+  device/grant confirmation and grant revocation; pairing errors and approval
+  with visible scopes, client, redirect, gateway and Chain ID; gateway validation,
+  cancellation, success and failure recovery; unavailable updates and source-build
+  replacement refusal; Create/Join, explicit phrase-storage confirmation, hidden
+  bracketed-paste input, invalid phrase errors, cancellation and Ctrl-C in a secret
+  field. Secret-bearing terminal output remained in memory and was never logged.
+- Three additional checks installed a disposable Linux user service, verified
+  that q and Ctrl-C leave it running, then uninstalled it and verified cleanup.
+  No pre-existing service was stopped or modified.
+- Five further PTY checks covered resizing to 80×24, invalid cached status,
+  canceling a stalled pairing lookup, quitting while the gateway accepts sockets
+  but never replies, and the 12-second remote-list timeout. PTY exit checks compare
+  terminal attributes with their initial values and verify alternate-screen and
+  bracketed-paste cleanup.
+
+Remote lists load on entering their section or explicit refresh; local status
+refreshes every two seconds without changing selection or input. Confirmed
+mutations finish before a queued quit so temporary-agent ownership can be restored.
+Native macOS/Windows execution and actual release replacement remain untested in
+this Linux environment. No update was installed during these checks.

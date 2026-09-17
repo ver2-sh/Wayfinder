@@ -125,6 +125,11 @@ pub async fn check(data: &Path, force: bool) -> Result<State> {
     Ok(state)
 }
 pub async fn install(data: &Path) -> Result<()> {
+    install_quiet(data).await?;
+    println!("Updated. Exit and reopen Wayfinder to use the new version.");
+    Ok(())
+}
+pub async fn install_quiet(data: &Path) -> Result<()> {
     let mut u = updater(true)?;
     // Complete discovery before interrupting any agent. axoupdater retains this exact release.
     ensure!(
@@ -137,7 +142,7 @@ pub async fn install(data: &Path) -> Result<()> {
             crate::service::installed(data)?,
             "Stop the independently launched daemon before updating"
         );
-        crate::service::manage(data, crate::service::Action::Stop)?;
+        crate::service::manage_quiet(data, crate::service::Action::Stop)?;
     }
     let result = async {
         if restart {
@@ -159,13 +164,12 @@ pub async fn install(data: &Path) -> Result<()> {
     }
     .await;
     // Restart even after a failed update; surface both failures if needed.
-    if restart && let Err(e) = crate::service::manage(data, crate::service::Action::Start) {
+    if restart && let Err(e) = crate::service::manage_quiet(data, crate::service::Action::Start) {
         anyhow::bail!(
             "Update result: {result:?}; agent restart failed: {e:#}. Run wayfinder service start"
         );
     }
     result?;
-    println!("Updated. Exit and reopen Wayfinder to use the new version.");
     Ok(())
 }
 
