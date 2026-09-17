@@ -89,6 +89,12 @@ pub fn manage(data: &Path, action: Action) -> Result<()> {
         );
         return Ok(());
     }
+    manage_quiet(data, action)?;
+    println!("Service operation completed for the current OS user.");
+    Ok(())
+}
+
+pub fn manage_quiet(data: &Path, action: Action) -> Result<()> {
     if matches!(action, Action::Install | Action::Start | Action::Restart) {
         crate::app::load(data)?;
     }
@@ -98,9 +104,7 @@ pub fn manage(data: &Path, action: Action) -> Result<()> {
             "Stop the existing agent before configuring startup"
         );
     }
-    native(data, action)?;
-    println!("Service operation completed for the current OS user.");
-    Ok(())
+    native(data, action)
 }
 
 #[cfg(target_os = "linux")]
@@ -295,7 +299,7 @@ pub async fn wait_stopped(data: &Path) -> Result<()> {
 
 pub struct TemporaryAgent {
     stop: tokio_util::sync::CancellationToken,
-    task: tokio::task::JoinHandle<Result<()>>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 impl TemporaryAgent {
     pub fn start(data: &Path) -> Result<Self> {
@@ -306,14 +310,25 @@ impl TemporaryAgent {
         let data = data.to_owned();
         let task = tokio::spawn(async move {
             let _lock = lock;
-            wayfinder_agent::run(&data, &installation, token).await
+            wayfinder_agent::run_quiet(&data, &installation, token).await
         });
-        Ok(Self { stop, task })
+        Ok(Self {
+            stop,
+            task: Some(task),
+        })
     }
-    pub async fn stop(self) -> Result<()> {
+    pub async fn stop(mut self) -> Result<()> {
         self.stop.cancel();
-        self.task.await??;
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
         Ok(())
+    }
+}
+
+impl Drop for TemporaryAgent {
+    fn drop(&mut self) {
+        self.stop.cancel();
     }
 }
 
