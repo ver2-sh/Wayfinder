@@ -233,7 +233,54 @@ def mouse_audit(root, data, origin, phrase):
     t.resize(240, 40)
     t.click('Gateway')
     t.expect('Current gateway')
-    check('gateway is informational; selection happens at enrollment', 'Change gateway' not in t.read())
+    before = (data/'installation.json').read_bytes()
+    t.click('[ Migrate this device (M) ]')
+    t.expect('Destination gateway URL')
+    t.send('https://migration.invalid\r')
+    t.expect('Type yes')
+    t.send('no\r')
+    t.expect('Explicit confirmation requires typing yes')
+    t.send('\x7f\x7fyes\r')
+    t.expect('24 recovery words (hidden)')
+    t.send('private-migration-secret')
+    check('migration secret is hidden', 'private-migration-secret' not in t.read())
+    t.send('\x1b')
+    check('migration cancellation preserves installation', (data/'installation.json').read_bytes()==before)
+    t.click('[ Migrate this device (M) ]')
+    t.send('https://migration.invalid\r')
+    t.send('yes\r')
+    t.expect('24 recovery words (hidden)')
+    t.send('invalid recovery words\r')
+    t.expect('Invalid 24-word')
+    wait(locked, 'temporary agent restored after migration failure')
+    check('failed migration preserves installation and restores temporary agent', (data/'installation.json').read_bytes()==before)
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        destination=f'http://127.0.0.1:{sock.getsockname()[1]}'
+    target = subprocess.Popen([str(GATEWAY), '--listen', destination.removeprefix('http://'), '--public-url', destination, '--data-dir', str(root/'migration-gateway')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        def destination_ready():
+            try:
+                return urllib.request.urlopen(destination+'/.well-known/oauth-authorization-server').status==200
+            except OSError:
+                return False
+        wait(destination_ready, 'migration gateway')
+        for url in (destination, origin):
+            t.click('[ Migrate this device (M) ]')
+            t.send(url+'\r')
+            t.send('yes\r')
+            t.expect('24 recovery words (hidden)')
+            t.output=b''
+            t.send('\x1b[200~'+phrase+'\x1b[201~')
+            t.read()
+            check('migration paste hides phrase and length', phrase.encode() not in t.output and phrase not in t.read() and '*' not in t.read())
+            t.click('[ Migrate ]')
+            t.expect('This device migrated')
+            expected={**json.loads(before),'gateway':url}
+            check('TUI migration preserves same device identity', json.loads((data/'installation.json').read_text())==expected)
+            wait(lambda: run([BIN, '--data-dir', data, 'devices'], ok=False).returncode==0, 'migrated temporary agent reconnects')
+    finally:
+        target.terminate();target.wait(timeout=15)
     t.click('Updates')
     t.click('[ Install update (I) ]')
     check('unavailable update cannot open confirmation', 'Type yes' not in t.read())

@@ -82,6 +82,7 @@ enum Task {
     Approve(String, String),
     Service(Action),
     Install,
+    Migrate(String),
     Enroll {
         name: String,
         gateway: String,
@@ -344,7 +345,7 @@ impl Ui {
                     !self.rows.is_empty(),
                 )],
                 3 => vec![("Look up pairing code (Enter)", KeyCode::Enter, true)],
-                4 => vec![],
+                4 => vec![("Migrate this device (M)", KeyCode::Char('m'), true)],
                 5 => vec![
                     ("Start (S)", KeyCode::Char('s'), true),
                     ("Stop (X)", KeyCode::Char('x'), true),
@@ -373,7 +374,7 @@ impl Ui {
             match self.section {
                 0 => format!("Device       {}\nRole         {}\nDevice ID    {}\nSync Chain   {}\nGateway      {}\nObserved     {}\n\n{}\n\n{}", value(&self.status["name"]), value(&self.status["role"]), value(&self.status["device_id"]), value(&self.status["chain_id"]), value(&self.status["gateway"]), self.status["observed"].as_u64().map(|t|format!("{} seconds ago",wayfinder_core::now().saturating_sub(t))).unwrap_or("Not yet observed".into()), if self.owned {"Temporary agent • stops when this TUI exits"} else {"Attached agent • this TUI does not own it"}, self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
                 3 => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
-                4 => format!("Current gateway\n{}\n\nSelect a hosted or self-hosted gateway when creating or joining a Sync Chain. Recovery words are used only on this device.", value(&self.status["gateway"])),
+                4 => format!("Current gateway\n{}\n\nMigrate this device with local recovery-root authorization. Device identity stays the same. Other devices move deliberately; MCP requires destination authorization. Stop an independently owned agent first.", value(&self.status["gateway"])),
                 5 => format!("{}\nAutomatic startup installed: {}\n\nService changes apply only to the current OS user.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, value(&self.status["service_installed"])),
                 6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())), _ => String::new() }
         };
@@ -472,7 +473,7 @@ impl Ui {
                         self.input.as_str()
                     )
                 } else {
-                    "24 recovery words (hidden)\nInput is hidden, including its length. Enter joins • Esc cancels".into()
+                    "24 recovery words (hidden)\nInput is hidden, including its length. Enter continues • Esc cancels".into()
                 }
             }
         });
@@ -497,6 +498,7 @@ impl Ui {
             let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(modal);
             let label = match self.mode {
                 Mode::Confirm(..) => "Confirm",
+                Mode::Phrase(Task::Migrate(_), false) => "Migrate",
                 Mode::Phrase(_, false) => "Join",
                 Mode::Phrase(_, true) => "I've stored it",
                 _ => "Continue",
@@ -717,6 +719,21 @@ async fn perform(
                 }
             }
         },
+        Task::Migrate(gateway) => {
+            let restart = stop_owned(owned).await?;
+            let result = async {
+                let _lock = wayfinder_core::lock_dir(data)
+                    .context("Stop the independently running agent before migration")?;
+                app::migrate(data, app::load(data)?, gateway, phrase.trim()).await
+            }
+            .await;
+            drop(phrase);
+            if restart {
+                start_if_needed(data, owned)?;
+            }
+            result?;
+            return Ok("This device migrated. Authorize MCP separately at the destination.".into());
+        }
         Task::Install => {
             update::ensure_owned()?;
             let restart = stop_owned(owned).await?;
@@ -929,6 +946,7 @@ async fn session(
                 KeyCode::Enter if ui.enrolled && matches!(ui.section, 1 | 2) => ui.focus = true,
                 KeyCode::Enter if !ui.enrolled => ui.prompt("Device name"),
                 KeyCode::Enter if ui.section == 3 => ui.prompt("Pairing code from your browser"),
+                KeyCode::Char('m') if ui.section == 4 => ui.prompt("Destination gateway URL"),
                 KeyCode::Char('d') if matches!(ui.section, 1 | 2) => {
                     if let Some(row) = ui.rows.get(ui.selected.selected().unwrap_or(0))
                         && let Some(id) = row["id"].as_str()
@@ -983,6 +1001,13 @@ async fn session(
             Mode::Input(label) if key == KeyCode::Enter => {
                 let text = ui.input.trim().to_owned();
                 match *label {
+                    "Destination gateway URL" => {
+                        if let Err(e) = identity::validate_gateway(&text) {
+                            ui.message = e.to_string();
+                        } else {
+                            ui.confirm(Task::Migrate(text.clone()), format!("Migrate only this device to {text}? Other devices stay put. MCP requires new authorization. Active commands may be interrupted. Recovery words stay local."));
+                        }
+                    }
                     "Device name" => match wayfinder_core::valid_name(&text) {
                         Ok(()) => {
                             name = text;
@@ -1049,7 +1074,12 @@ async fn session(
             }
             Mode::Confirm(t, _) if key == KeyCode::Enter => {
                 if ui.input.as_str() == "yes" {
-                    task = Some(t.clone());
+                    if matches!(t, Task::Migrate(_)) {
+                        ui.mode = Mode::Phrase(t.clone(), false);
+                        ui.input = Zeroizing::new(String::with_capacity(4096));
+                    } else {
+                        task = Some(t.clone());
+                    }
                 } else {
                     ui.message = "Explicit confirmation requires typing yes.".into();
                 }

@@ -95,8 +95,14 @@ Gateway selection happens during enrollment. A recovery phrase derives the same
 Chain ID independently of the URL; each enrollment creates a new device key and
 locally signs fresh gateway admission. An old device certificate alone cannot
 bootstrap a chain or register at an empty gateway. Device revocations and MCP
-grants are durable within that deployment. There is no gateway-change or
-state-transfer command. MCP clients need explicit authorization at each gateway.
+grants are durable within that deployment. `wayfinder gateway migrate <origin>`
+(or TUI Gateway → Migrate this device) requires local recovery-root authorization
+and preserves this device’s certificate, private key and Device ID. It commits
+the URL only after target admission and registration; failures keep the old local
+configuration. Stop independently owned agents first. Target tombstones remain
+permanent. Other devices move deliberately, and no revocation/grant databases are
+transferred. MCP clients need explicit authorization at each gateway/resource.
+The recovery phrase never leaves the local device.
 
 For local development, `http://127.0.0.1:PORT` and explicit IPv6 loopback HTTP
 origins are allowed. Remote plaintext origins and noncanonical URLs are rejected.

@@ -5,6 +5,8 @@ Never prints recovery material, private keys or bearer credentials.
 import asyncio
 import base64
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 import json
 import os
 from pathlib import Path
@@ -322,8 +324,55 @@ def run():
     other=f'http://127.0.0.1:{port()}'
     spawn([BIN/'wayfinder-gateway','--listen',other.removeprefix('http://'),'--public-url',other,'--data-dir',root/'other-gateway'])
     wait(lambda:http(other,'/.well-known/oauth-authorization-server')[0]==200)
-    d,id_,pd=enroll(root,'self-hosted',phrase,other,True)
-    check('same Chain ID on independent generic gateway; old certificates cannot self-admit',id_['certificate']['chain_id']==ca['chain_id'] and asyncio.run(rejected_session(other,ib,'revoked')))
+    check('old revoked certificate cannot bootstrap fresh target', http(other, '/device/operation', signed(ib, other, dict(operation='devices')))[0] == 403 and asyncio.run(rejected_session(other,ib,'revoked')))
+    def migrate(data, target, secret=phrase):
+        result = subprocess.run([str(BIN/'wayfinder'), '--data-dir', str(data), 'gateway', 'migrate', target, '--phrase-stdin'], input=secret.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert secret.encode() not in result.stdout + result.stderr
+        return result.returncode
+    before=(a/'installation.json').read_bytes()
+    check('migration refuses independently owned agent', migrate(a, other) != 0 and (a/'installation.json').read_bytes()==before)
+    pa.terminate();pa.wait(timeout=10)
+    check('wrong recovery root leaves old installation intact', migrate(a, other, phrase_b) != 0 and (a/'installation.json').read_bytes()==before)
+    check('unreachable target leaves old installation intact', migrate(a, f'http://127.0.0.1:{port()}') != 0 and (a/'installation.json').read_bytes()==before)
+    class RejectRegistration(BaseHTTPRequestHandler):
+        admitted = False
+        def log_message(self, *args): pass
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            assert phrase.encode() not in raw
+            if self.path.startswith('/device/challenge'):
+                result = dict(version=1, gateway=failed_origin, nonce='disposable-target-challenge')
+            else:
+                RejectRegistration.admitted = True
+                result = dict(admitted=True)
+            encoded = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(encoded)))
+            self.end_headers();self.wfile.write(encoded)
+        def do_GET(self): self.send_error(403)
+    with ThreadingHTTPServer(('127.0.0.1', 0), RejectRegistration) as server:
+        failed_origin=f'http://127.0.0.1:{server.server_port}'
+        thread=threading.Thread(target=server.serve_forever, daemon=True);thread.start()
+        try:
+            check('registration failure after target admission preserves old installation', migrate(a,failed_origin)!=0 and RejectRegistration.admitted and (a/'installation.json').read_bytes()==before)
+        finally:
+            server.shutdown();thread.join()
+    check('explicit root-authorized migration succeeds', migrate(a, other)==0)
+    moved=json.loads((a/'installation.json').read_text())
+    check('migration preserves Chain ID Device ID certificate role and private key', moved == {**ia, 'gateway':other})
+    pa=spawn([BIN/'wayfinder','--data-dir',a,'daemon'])
+    wait(lambda:operation(moved,other,dict(operation='devices'))[0]==200)
+    check('same device connects at target', any(n['id']==ca['device_id'] and n['online'] for n in operation(moved,other,dict(operation='devices'))[2]))
+    pb.terminate();pb.wait(timeout=10)
+    check('root authorizes formerly revoked device at fresh destination', migrate(b,other)==0)
+    assert operation(moved,other,dict(operation='revoke_device',device_id=cb['device_id']))[0]==200
+    before_b=(b/'installation.json').read_bytes()
+    check('target tombstone rejects even recovery-root migration', migrate(b,origin)!=0 and (b/'installation.json').read_bytes()==before_b)
+    pa.terminate();pa.wait(timeout=10)
+    check('same installation migrates back to original gateway', migrate(a,origin)==0 and json.loads((a/'installation.json').read_text())==ia)
+    pa=spawn([BIN/'wayfinder','--data-dir',a,'daemon'])
+    wait(lambda:operation(ia,origin,dict(operation='devices'))[0]==200)
     # Hosted validation leaves only explicitly revoked public disposable records.
     if external:
         operation(ic,origin,dict(operation='revoke_device',device_id=cc['device_id']))

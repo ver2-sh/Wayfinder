@@ -40,6 +40,11 @@ enum Command {
         #[command(subcommand)]
         command: service::Action,
     },
+    /// Move this device with local recovery-root authorization.
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommand,
+    },
     Devices,
     Device {
         #[command(subcommand)]
@@ -73,6 +78,14 @@ enum ChainCommand {
         phrase_stdin: bool,
     },
     Show,
+}
+#[derive(Subcommand)]
+enum GatewayCommand {
+    Migrate {
+        gateway: String,
+        #[arg(long)]
+        phrase_stdin: bool,
+    },
 }
 #[derive(Subcommand)]
 enum DeviceCommand {
