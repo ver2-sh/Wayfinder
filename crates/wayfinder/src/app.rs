@@ -1,4 +1,4 @@
-use crate::{AuthCommand, ChainCommand, Command, DeviceCommand, service, update};
+use crate::{AuthCommand, ChainCommand, Command, DeviceCommand, GatewayCommand, service, update};
 use anyhow::{Context, Result, ensure};
 use std::io::{self, IsTerminal, Read, Write};
 use wayfinder_core::{identity::*, protocol::Operation, *};
@@ -69,22 +69,7 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
                 !data.join("installation.json").exists(),
                 "An installation already exists"
             );
-            let phrase = if phrase_stdin {
-                ensure!(
-                    !io::stdin().is_terminal(),
-                    "Use redirected stdin for --phrase-stdin"
-                );
-                let mut s = Zeroizing::new(String::new());
-                io::stdin().take(1025).read_to_string(&mut s)?;
-                ensure!(s.len() <= 1024, "Phrase input too long");
-                s
-            } else {
-                ensure!(
-                    io::stdin().is_terminal(),
-                    "Use --phrase-stdin for a protected pipe"
-                );
-                Zeroizing::new(rpassword::prompt_password("24 recovery words (hidden): ")?)
-            };
+            let phrase = read_phrase(phrase_stdin)?;
             enroll(
                 data,
                 phrase.trim(),
@@ -122,6 +107,21 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
                 confirm("Install this update? Running commands may be interrupted.")?;
                 update::install(data).await?;
             }
+        }
+        Command::Gateway {
+            command:
+                GatewayCommand::Migrate {
+                    gateway,
+                    phrase_stdin,
+                },
+        } => {
+            let _lock =
+                lock_dir(data).context("Stop the independently running agent before migration")?;
+            validate_gateway(&gateway)?;
+            let i = load(data)?;
+            let phrase = read_phrase(phrase_stdin)?;
+            migrate(data, i, gateway, phrase.trim()).await?;
+            println!("This device migrated. Authorize MCP separately at the destination.");
         }
         Command::Devices => {
             display(&wayfinder_agent::operation(&load(data)?, Operation::Devices).await?)?
@@ -253,4 +253,52 @@ pub async fn stop_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+fn read_phrase(phrase_stdin: bool) -> Result<Zeroizing<String>> {
+    Ok(if phrase_stdin {
+        ensure!(
+            !io::stdin().is_terminal(),
+            "Use redirected stdin for --phrase-stdin"
+        );
+        let mut s = Zeroizing::new(String::new());
+        io::stdin().take(1025).read_to_string(&mut s)?;
+        ensure!(s.len() <= 1024, "Phrase input too long");
+        s
+    } else {
+        ensure!(
+            io::stdin().is_terminal(),
+            "Use --phrase-stdin for a protected pipe"
+        );
+        Zeroizing::new(rpassword::prompt_password("24 recovery words (hidden): ")?)
+    })
+}
+
+/// Caller holds the installation lock for the whole transaction.
+pub(crate) async fn migrate(
+    data: &std::path::Path,
+    i: Installation,
+    gateway: String,
+    phrase: &str,
+) -> Result<()> {
+    validate_gateway(&gateway)?;
+    ensure!(
+        gateway != i.gateway,
+        "This device already uses that gateway"
+    );
+    let root = root(phrase)?;
+    ensure!(
+        root.verifying_key().to_bytes() == key_bytes(&i.certificate.root_public)?,
+        "Recovery phrase does not match this installation root"
+    );
+    let target = Installation::new(gateway, i.certificate.clone(), &i.key()?)?;
+    wayfinder_agent::admit(&target, &root).await.context(
+        "Target admission denied; an existing revocation tombstone cannot be overridden",
+    )?;
+    drop(root);
+    wayfinder_agent::register(&target)
+        .await
+        .context("Target registration failed; local gateway unchanged")?;
+    atomic_write(&data.join("installation.json"), &target)?;
+    Ok(())
 }

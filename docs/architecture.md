@@ -104,9 +104,15 @@ is saved. Reconnect uses device authentication, never a recovery phrase.
 A device certificate alone cannot create or join a chain at an empty gateway.
 This prevents revoked device keys from bypassing revocation by changing the URL.
 Root holders can deliberately enroll new devices, including admins, at their
-chosen gateway. Gateway selection occurs at enrollment; no gateway-switch,
-security-state export/import, or automatic trust-state transfer is implemented.
-Chain IDs remain gateway-independent; gateway-local grants require new approval.
+chosen gateway. `wayfinder gateway migrate <origin>` uses that same local root
+authority to admit the current certificate at a destination, preserving its Device
+ID and private key. The installation lock excludes an independent agent; the new
+URL is saved atomically only after target admission and registration. Target
+tombstones still reject admission. Other devices move deliberately; there is no
+security-state export/import or automatic trust-state transfer. Chain IDs and
+recovery phrases remain gateway-independent; gateway/resource-bound grants need
+new approval. Recovery words are entered locally with hidden input or protected
+stdin, never sent to either gateway.
 
 ## Local storage
 

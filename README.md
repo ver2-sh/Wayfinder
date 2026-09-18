@@ -267,14 +267,37 @@ caching/logging of credential-bearing requests. Keep the origin on loopback.
 See [deployment details](docs/remote-mcp.md) and
 [the generic systemd unit](deploy/wayfinder-gateway.service).
 
-Create/join with `--gateway https://wayfinder.example.com`. Gateway selection is
-part of enrollment. The same recovery phrase derives the same Chain ID everywhere,
-but every installation gets an independent device key. Fresh enrollment requires
-a local root signature bound to a new gateway challenge; copying an old device
-certificate to an empty gateway cannot admit it. The phrase/root private key
-never leaves the device. Revocations and MCP grants remain at their gateway;
-there is no gateway-switch or state-transfer workflow. Authorize MCP separately
-at each gateway. HTTP is allowed only for explicit loopback development origins.
+Create/join with `--gateway https://wayfinder.example.com`. To move an existing
+installation, stop its independently running agent and run:
+
+```sh
+wayfinder gateway migrate https://wayfinder.example.com
+```
+
+The TUI Gateway section also offers **Migrate this device**, with explicit
+confirmation and hidden recovery input. The CLI prompts for the 24 recovery words
+with hidden input; `--phrase-stdin` accepts a protected pipe for headless use, as
+with `chain join`. Never put the phrase in arguments, environment variables,
+browser fields, MCP values or logs. It never leaves the local device.
+
+Chain ID and recovery phrase are gateway-independent. Migration verifies the
+local recovery root against the existing certificate, then root-signs fresh
+admission bound to the destination origin and challenge. It preserves the exact
+certificate, device private key, Device ID, role and Chain ID. Only after target
+admission and device registration succeed is the gateway URL atomically saved.
+Failures leave the old installation intact; target admission may already have
+succeeded if registration or local persistence fails. The TUI restarts its own
+temporary agent after success or failure; it does not stop an independently
+owned service. Start that service deliberately after CLI migration.
+
+Every other device migrates deliberately. Revocation and MCP/OAuth grant databases
+are not copied. Grants are gateway/resource-bound and require authorization at
+the destination. Merely changing a URL or possessing a device certificate/key
+cannot bootstrap a fresh gateway. Possession of the recovery phrase is root
+authority and can authorize this existing device at a fresh destination, even if
+another gateway revoked it. A destination that already tombstoned this Device ID
+still rejects it; the root holder must deliberately enroll a new device instead.
+HTTP is allowed only for explicit loopback development origins.
 
 The gateway handles plaintext commands and results at the application layer.
 This is **not end-to-end encryption past the gateway**. Hosted users trust its

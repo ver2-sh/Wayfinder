@@ -34,12 +34,19 @@ Self-hosted runs additionally restart the Rust gateway and inspect only the
 private disposable SQLite file for accidental persistence of recovery material,
 private keys or raw bearer tokens. Hosted restart/deployment and hibernation
 checks belong to the infrastructure validation record in Wayfinder-Cloudflare.
-No migration workflow, state-transfer format or old-layout migration is present.
+The process suite migrates the same installation between independent gateways,
+checking unchanged certificate/key/Chain ID/Device ID, destination connectivity,
+wrong-root and target-failure rollback (including admission succeeding before
+registration fails), agent lock exclusion, and permanent
+target tombstones. No state-transfer format or old-layout migration is present.
 
 The TUI suite validates hidden phrase input, modal confirmation, mouse/keyboard
 interaction, nonblocking lookups, terminal restoration, managed/temporary agent
-ownership, update failure recovery and service cleanup. Gateway display is
-informational; the URL is selected at enrollment.
+ownership, update failure recovery and service cleanup. Gateway migration
+requires explicit confirmation and hidden recovery input; cancellation and failed
+migration preserve the installation and restore a TUI-owned temporary agent.
+Successful TUI migration in both directions preserves the device identity and
+reconnects its temporary agent.
 
 Do not treat local Worker emulation as proof of public transport behavior. Verify
 HTTP cancellation and proxy propagation against the public MCP origin, and
