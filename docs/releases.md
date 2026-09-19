@@ -1,7 +1,7 @@
 # Release maintenance
 
-The repository is private and unreleased. This configuration is a foundation, not
-an accessible public download channel. Do not change visibility or publish a tag
+The repository is public and unreleased. This configuration is a foundation, not
+yet an accessible release download channel. Do not change visibility or publish a tag
 as a validation step. Ordinary future users need neither GitHub accounts/tokens
 nor Rust. No update server or telemetry is required.
 
