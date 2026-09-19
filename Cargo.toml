@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.88"
-repository = "https://github.com/Made-by-Eugene/project-wayfinder"
+repository = "https://github.com/ver2-sh/Wayfinder"
 
 [workspace.dependencies]
 anyhow = "1"
