@@ -8,8 +8,8 @@ use wayfinder_core::{atomic_write, now, private_dir, read_private};
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 // Official release origin, independent of the user's gateway. Future mirrors belong here
 // and in dist-workspace.toml, never in identity or gateway configuration.
-const OWNER: &str = "Made-by-Eugene";
-const REPOSITORY: &str = "project-wayfinder";
+const OWNER: &str = "ver2-sh";
+const REPOSITORY: &str = "Wayfinder";
 #[derive(Serialize, Deserialize, Clone)]
 pub struct State {
     checked: u64,
