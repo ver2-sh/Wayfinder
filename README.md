@@ -24,10 +24,10 @@ protocol. Neither mode needs email, passwords or a Wayfinder account. Apache-2.0
 
 ## Install the agent
 
-**Private and unreleased today:** anonymous consumer downloads and update checks
-are not yet available. The following is the intended release installation path
-once public releases exist; it requires no Rust, Cargo, compiler or repository
-checkout. `usewayfinder.app` is the stable public install front door and redirects
+**Public but unreleased today:** the source repository is public, but consumer
+downloads and update checks are not yet available. The following is the intended
+release installation path once the first public release exists; it requires no
+Rust, Cargo, compiler or repository checkout. `usewayfinder.app` is the stable public install front door and redirects
 to the corresponding public GitHub Release assets. Do not supply private
 credentials to installer commands.
 
