@@ -170,9 +170,10 @@ async def rejected_session(origin,i,mode):
             certificate['chain_id']='wfc1_'+'0'*64
         key=Ed25519PrivateKey.from_private_bytes(bytes.fromhex(i['private_key']))
         nonce=c['nonce'] if mode!='replay' else '0'*64
-        data=b'wayfinder/session/v1\0'+field(origin)+field(nonce)+field(hashlib.sha256(cert_bytes(certificate)).hexdigest())
+        metadata=dict(platform='other',arch='x86_64')
+        data=b'wayfinder/session/v2\0'+field(origin)+field(nonce)+field(hashlib.sha256(cert_bytes(certificate)).hexdigest())+field(metadata['platform'])+field(metadata['arch'])
         sig=key.sign(data).hex() if mode!='signature' else '0'*128
-        await ws.send(json.dumps(dict(type='authenticate',certificate=certificate,signature=sig)))
+        await ws.send(json.dumps(dict(type='authenticate',certificate=certificate,metadata=metadata,signature=sig)))
         try:
             reply=await asyncio.wait_for(ws.recv(),3)
             return json.loads(reply).get('type')!='ready'

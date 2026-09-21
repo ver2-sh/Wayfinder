@@ -3,6 +3,32 @@ use crate::{
     identity::{Certificate, field},
 };
 use serde::{Deserialize, Serialize};
+/// Informational, self-reported connection metadata; not hardware attestation.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformDescriptor {
+    pub platform: String,
+    pub arch: String,
+}
+impl PlatformDescriptor {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(
+                self.platform.as_str(),
+                "windows" | "linux" | "macos" | "other"
+            ) && !self.arch.is_empty()
+                && self.arch.len() <= 32
+                && self
+                    .arch
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "Invalid platform descriptor"
+        );
+        Ok(())
+    }
+}
+pub const SESSION_VERSION: u32 = 2;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
@@ -13,6 +39,7 @@ pub enum Frame {
     },
     Authenticate {
         certificate: Certificate,
+        metadata: PlatformDescriptor,
         signature: String,
     },
     Ready,
@@ -30,11 +57,19 @@ pub enum Frame {
     Ping,
     Pong,
 }
-pub fn session_proof(gateway: &str, nonce: &str, cert: &Certificate) -> anyhow::Result<Vec<u8>> {
-    let mut b = b"wayfinder/session/v1\0".to_vec();
+pub fn session_proof(
+    gateway: &str,
+    nonce: &str,
+    cert: &Certificate,
+    metadata: &PlatformDescriptor,
+) -> anyhow::Result<Vec<u8>> {
+    metadata.validate()?;
+    let mut b = b"wayfinder/session/v2\0".to_vec();
     field(&mut b, gateway);
     field(&mut b, nonce);
     field(&mut b, &crate::digest(&cert.bytes()?));
+    field(&mut b, &metadata.platform);
+    field(&mut b, &metadata.arch);
     Ok(b)
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -73,6 +108,8 @@ pub struct Device {
     pub id: String,
     pub name: String,
     pub role: crate::identity::Role,
+    pub platform: Option<String>,
+    pub arch: Option<String>,
     pub last_seen: u64,
     pub revoked: bool,
     pub online: bool,

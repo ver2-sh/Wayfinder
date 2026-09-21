@@ -1,5 +1,11 @@
 //! Single-host SQLite registry. All device and grant administration is chain-scoped.
-use crate::{digest, identity::Certificate, now, protocol::Device, random_secret, secret_eq};
+use crate::{
+    digest,
+    identity::Certificate,
+    now,
+    protocol::{Device, PlatformDescriptor},
+    random_secret, secret_eq,
+};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -98,6 +104,7 @@ impl CredentialStore {
   CREATE TABLE IF NOT EXISTS chains(id TEXT PRIMARY KEY, root TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS admissions(nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS devices(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, certificate TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY(chain,id));
+  CREATE TABLE IF NOT EXISTS device_metadata(chain TEXT NOT NULL, id TEXT NOT NULL, platform TEXT NOT NULL, arch TEXT NOT NULL, PRIMARY KEY(chain,id), FOREIGN KEY(chain,id) REFERENCES devices(chain,id));
   CREATE TABLE IF NOT EXISTS clients(id TEXT PRIMARY KEY, info TEXT NOT NULL, secret_hash TEXT);
   CREATE TABLE IF NOT EXISTS grants(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(chain,id));
   CREATE TABLE IF NOT EXISTS tokens(hash TEXT PRIMARY KEY, chain TEXT NOT NULL, grant_id TEXT NOT NULL, FOREIGN KEY(chain,grant_id) REFERENCES grants(chain,id));")?;
@@ -181,8 +188,11 @@ impl CredentialStore {
         tx.commit()?;
         Ok(())
     }
-    pub fn register(&self, c: &Certificate) -> Result<()> {
+    pub fn register(&self, c: &Certificate, metadata: Option<&PlatformDescriptor>) -> Result<()> {
         c.verify()?;
+        if let Some(metadata) = metadata {
+            metadata.validate()?;
+        }
         let mut db = self.db()?;
         let tx = db.transaction()?;
 
@@ -211,6 +221,12 @@ impl CredentialStore {
         } else {
             anyhow::bail!("Device needs root-authorized admission at this gateway");
         }
+        if let Some(metadata) = metadata {
+            tx.execute(
+                "INSERT INTO device_metadata(chain,id,platform,arch) VALUES(?1,?2,?3,?4) ON CONFLICT(chain,id) DO UPDATE SET platform=excluded.platform,arch=excluded.arch",
+                params![c.chain_id, c.device_id, metadata.platform, metadata.arch],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -233,23 +249,27 @@ impl CredentialStore {
     pub fn devices(&self, chain: &str) -> Result<Vec<Device>> {
         let db = self.db()?;
         let mut s = db.prepare(
-            "SELECT certificate,revoked,last_seen FROM devices WHERE chain=?1 ORDER BY id",
+            "SELECT d.certificate,d.revoked,d.last_seen,m.platform,m.arch FROM devices d LEFT JOIN device_metadata m ON m.chain=d.chain AND m.id=d.id WHERE d.chain=?1 ORDER BY d.id",
         )?;
         let rows = s.query_map([chain], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, bool>(1)?,
                 r.get::<_, u64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut out = vec![];
         for r in rows {
-            let (c, revoked, last_seen) = r?;
+            let (c, revoked, last_seen, platform, arch) = r?;
             let c: Certificate = serde_json::from_str(&c)?;
             out.push(Device {
                 id: c.device_id,
                 name: c.name,
                 role: c.role,
+                platform,
+                arch,
                 last_seen,
                 revoked,
                 online: false,
@@ -549,7 +569,7 @@ mod tests {
         let root = new_key();
         let cert = Certificate::issue(&root, &new_key(), "Test".into(), Role::Admin)?;
         admit(&store, &root, &cert)?;
-        store.register(&cert)?;
+        store.register(&cert, None)?;
         let register = || {
             store.register_oauth_client("Test".into(), "http://127.0.0.1/callback".into(), false)
         };
@@ -617,7 +637,7 @@ mod tests {
         )?;
         store.expire_oauth()?;
         assert!(store.oauth_client(&client.id, None).is_err());
-        assert!(store.register(&cert).is_err());
+        assert!(store.register(&cert, None).is_err());
         assert_eq!(store.devices(&cert.chain_id)?.len(), 1);
         let count: u64 = store
             .db()?
@@ -633,9 +653,9 @@ mod tests {
         let store = CredentialStore::open(dir.join("registry.sqlite"))?;
         let root = new_key();
         let first = Certificate::issue(&root, &new_key(), "First".into(), Role::Admin)?;
-        assert!(store.register(&first).is_err());
+        assert!(store.register(&first, None).is_err());
         admit(&store, &root, &first)?;
-        store.register(&first)?;
+        store.register(&first, None)?;
         for _ in 0..9 {
             admit(
                 &store,
@@ -651,14 +671,14 @@ mod tests {
             )
             .is_err()
         );
-        store.register(&first)?;
+        store.register(&first, None)?;
         let other_root = new_key();
         let other = Certificate::issue(&other_root, &new_key(), "Other chain".into(), Role::Admin)?;
         admit(&store, &other_root, &other)?;
-        store.register(&other)?;
+        store.register(&other, None)?;
         store.revoke_device(&first.chain_id, &first.device_id)?;
         store.admissions.lock().unwrap().clear();
-        assert!(store.register(&first).is_err());
+        assert!(store.register(&first, None).is_err());
         drop(store);
         std::fs::remove_dir_all(dir)?;
         Ok(())

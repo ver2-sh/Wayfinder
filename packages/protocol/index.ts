@@ -1,4 +1,4 @@
-/** Normative Web-runtime wire codec. The Rust core owns the same v1 byte layout.
+/** Normative Web-runtime wire codec. The Rust core owns the same byte layouts.
  * No Cloudflare dependencies, credentials, phrase handling, or root key material.
  */
 export interface Certificate {
@@ -172,16 +172,30 @@ export async function verifyCertificate(c: Certificate) {
   );
   await verify(c.root_public, certificateBytes(c), c.signature);
 }
+export const SESSION_VERSION = 2;
+export interface PlatformDescriptor {
+  platform: "windows" | "linux" | "macos" | "other";
+  arch: string;
+}
 export async function sessionProof(
   gateway: string,
   nonce: string,
   c: Certificate,
+  metadata: PlatformDescriptor,
 ) {
+  exact(metadata, ["platform", "arch"]);
+  requireThat(
+    ["windows", "linux", "macos", "other"].includes(metadata.platform) &&
+      typeof metadata.arch === "string" &&
+      /^[a-z0-9_]{1,32}$/.test(metadata.arch),
+  );
   return cat(
-    encoder.encode("wayfinder/session/v1\0"),
+    encoder.encode("wayfinder/session/v2\0"),
     field(gateway),
     field(nonce),
     field(await hash(certificateBytes(c))),
+    field(metadata.platform),
+    field(metadata.arch),
   );
 }
 export function operationJSON(op: Operation) {

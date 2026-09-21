@@ -198,12 +198,12 @@ impl Gateway {
         mut socket: WebSocket,
         handshake: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()> {
-        let certificate = tokio::time::timeout(Duration::from_secs(5), async {
+        let (certificate, metadata) = tokio::time::timeout(Duration::from_secs(5), async {
             let nonce = random_secret();
             send(
                 &mut socket,
                 &Frame::Challenge {
-                    version: 1,
+                    version: SESSION_VERSION,
                     gateway: self.issuer.clone(),
                     nonce: nonce.clone(),
                 },
@@ -212,6 +212,7 @@ impl Gateway {
             let frame = receive(&mut socket).await?;
             let Frame::Authenticate {
                 certificate,
+                metadata,
                 signature,
             } = frame
             else {
@@ -220,10 +221,10 @@ impl Gateway {
             certificate.verify()?;
             verify(
                 &certificate.device_public,
-                &session_proof(&self.issuer, &nonce, &certificate)?,
+                &session_proof(&self.issuer, &nonce, &certificate, &metadata)?,
                 &signature,
             )?;
-            Ok::<_, anyhow::Error>(certificate)
+            Ok::<_, anyhow::Error>((certificate, metadata))
         })
         .await??;
         drop(handshake);
@@ -245,7 +246,7 @@ impl Gateway {
                 "Chain connection capacity reached"
             );
             drop(sessions);
-            self.store.register(&certificate)?;
+            self.store.register(&certificate, Some(&metadata))?;
             if let Some(old) = self.sessions.lock().unwrap().insert(
                 key.clone(),
                 Session {
@@ -308,7 +309,7 @@ impl Gateway {
                     pending.insert(d.id, (d.response, d.cancel));
                 },
                 frame = receive(socket) => match frame? {
-                    Frame::Pong => { last = tokio::time::Instant::now(); self.store.register(c)?; },
+                    Frame::Pong => { last = tokio::time::Instant::now(); self.store.register(c, None)?; },
                     Frame::Result { id, result } => {
                         if let Some((tx, _)) = pending.remove(&id) { let _ = tx.send(result); }
                     },
@@ -454,7 +455,7 @@ mod tests {
             &g.issuer,
             now() + 30,
         )?;
-        store.register(&cert)?;
+        store.register(&cert, None)?;
         let key = (cert.chain_id.clone(), cert.device_id.clone());
         let (send, _) = mpsc::channel(1);
         let session = Session {

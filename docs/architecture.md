@@ -130,19 +130,21 @@ last-observed display, not an authentication source.
 
 JSON frames have explicit tagged schemas. Connect outward to `/agent?chain_id=<public Chain ID>` using WSS.
 The public routing hint is not authentication.
-The gateway sends `{type: challenge, version: 1, gateway, nonce}`. Its nonce is
+The gateway sends `{type: challenge, version: 2, gateway, nonce}`. Its nonce is
 256 random bits, scoped to that socket, expires in 5 seconds, and is consumed
 by the single authentication frame. The device verifies the exact configured
 gateway origin and version, then signs:
 
 ```text
-UTF8("wayfinder/session/v1\0")
+UTF8("wayfinder/session/v2\0")
 || string(gateway_origin)
 || string(nonce_lowercase_hex)
 || string(hex(SHA256(certificate_signed_bytes)))
+|| string(platform)
+|| string(arch)
 ```
 
-The authentication frame carries only certificate and signature. The gateway
+The authentication frame carries the certificate, metadata and signature. The gateway
 verifies possession and prior root-authorized admission, rejects revoked devices,
 and sends `ready`. The gateway then routes `exec`, `cancel`, and `result` frames.
 A new connection for the same `(chain, device)` closes the previous one. Session
@@ -159,6 +161,19 @@ never trigger replay. Cancellation on MCP HTTP disconnect propagates to the
 agent; dropping sessions cancels execution tasks and kills process groups.
 Cancellation is best effort over a failed network, bounded by command timeout.
 
+Agents send `{type: authenticate, certificate, metadata: {platform, arch}, signature}`.
+`platform` is `windows`, `linux`, `macos`, or `other`; `arch` is the Rust
+architecture constant (1–32 lowercase ASCII letters, digits or underscores).
+The agent uses Rust OS/architecture constants without executing commands.
+These fields are signed connection metadata, never certificate fields. The gateway
+stores the latest authenticated descriptor on connection, retaining it offline.
+`nodes` returns nullable `platform` and `arch` alongside its existing fields;
+devices without a recorded descriptor return null. These self-reports are not
+hardware attestation and must never drive authorization, admission, routing
+security, command filtering or sandboxing. Authentication and host authorization
+remain separate; commands still execute as the target daemon's OS account.
+Session v2 requires matching agents and gateway adapters; no v1 fallback exists.
+
 ## Chain isolation and persistence
 
 SQLite uses foreign keys, FULL synchronous commits, a rollback journal and an
@@ -169,6 +184,8 @@ There is one current schema, no migration or obsolete-format reader.
 
 - `chains(id, root)` stores only public root identity.
 - `devices(chain, id, certificate, revoked, last_seen)` has composite primary key.
+- `device_metadata(chain, id, platform, arch)` stores the latest connection descriptor,
+  referencing the device composite key; preexisting devices need no metadata row.
 - `clients(id, info, secret_hash)` holds registered OAuth metadata.
 - `grants(chain, id, record)` stores chain/client/scopes, expiration and revocation.
 - `tokens(hash, chain, grant_id)` resolves opaque tokens to that composite grant key.
