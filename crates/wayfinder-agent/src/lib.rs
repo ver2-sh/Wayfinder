@@ -46,18 +46,29 @@ pub async fn connect(i: &Installation) -> Result<Socket> {
         anyhow::bail!("Gateway did not challenge")
     };
     ensure!(
-        version == 1 && gateway == i.gateway,
+        version == SESSION_VERSION && gateway == i.gateway,
         "Gateway identity or protocol mismatch"
     );
     key_bytes(&nonce)?;
+    let metadata = PlatformDescriptor {
+        platform: match std::env::consts::OS {
+            "windows" => "windows",
+            "linux" => "linux",
+            "macos" => "macos",
+            _ => "other",
+        }
+        .into(),
+        arch: std::env::consts::ARCH.into(),
+    };
     let signature = sign(
         &i.key()?,
-        &session_proof(&i.gateway, &nonce, &i.certificate)?,
+        &session_proof(&i.gateway, &nonce, &i.certificate, &metadata)?,
     );
     send(
         &mut s,
         &Frame::Authenticate {
             certificate: i.certificate.clone(),
+            metadata,
             signature,
         },
     )
