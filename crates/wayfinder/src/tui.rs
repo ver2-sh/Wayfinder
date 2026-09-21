@@ -128,6 +128,7 @@ struct Ui {
     message: String,
     mode: Mode,
     input: Zeroizing<String>,
+    show_phrase: bool,
     update: Option<update::State>,
     owned: bool,
     scroll: u16,
@@ -147,6 +148,7 @@ impl Ui {
             message: "Remote execution uses this OS account's permissions.".into(),
             mode: Mode::Browse,
             input: Zeroizing::new(String::new()),
+            show_phrase: false,
             update: None,
             owned: false,
             scroll: 0,
@@ -473,7 +475,24 @@ impl Ui {
                         self.input.as_str()
                     )
                 } else {
-                    "24 recovery words (hidden)\nInput is hidden, including its length. Enter continues • Esc cancels".into()
+                    let phrase: String = if self.show_phrase {
+                        safe(self.input.as_str())
+                    } else {
+                        self.input
+                            .chars()
+                            .map(|c| if c.is_whitespace() { c } else { '*' })
+                            .collect()
+                    };
+                    format!(
+                        "24 recovery words ({})\n{}\nF2 {} • Enter continues • Esc cancels",
+                        if self.show_phrase {
+                            "visible"
+                        } else {
+                            "hidden"
+                        },
+                        phrase,
+                        if self.show_phrase { "hide" } else { "reveal" }
+                    )
                 }
             }
         });
@@ -914,6 +933,7 @@ async fn session(
         if key == KeyCode::Esc {
             ui.mode = Mode::Browse;
             ui.input = Zeroizing::new(String::new());
+            ui.show_phrase = false;
             saved_phrase = Zeroizing::new(String::new());
             continue;
         }
@@ -1044,6 +1064,7 @@ async fn session(
                     "Role: member (default) or admin" => {
                         if text.is_empty() || text == "member" || text == "admin" {
                             ui.input = Zeroizing::new(String::with_capacity(4096));
+                            ui.show_phrase = false;
                             ui.mode = Mode::Phrase(
                                 Task::Enroll {
                                     name: name.clone(),
@@ -1063,9 +1084,13 @@ async fn session(
                     _ => {}
                 }
             }
+            Mode::Phrase(_, false) if key == KeyCode::F(2) => {
+                ui.show_phrase = !ui.show_phrase;
+            }
             Mode::Phrase(t, create) if key == KeyCode::Enter => {
                 let t = t.clone();
                 saved_phrase = std::mem::replace(&mut ui.input, Zeroizing::new(String::new()));
+                ui.show_phrase = false;
                 if *create {
                     ui.confirm(t,"Have you stored the recovery phrase securely offline? It will not be shown again.".into());
                 } else {
@@ -1077,6 +1102,7 @@ async fn session(
                     if matches!(t, Task::Migrate(_)) {
                         ui.mode = Mode::Phrase(t.clone(), false);
                         ui.input = Zeroizing::new(String::with_capacity(4096));
+                        ui.show_phrase = false;
                     } else {
                         task = Some(t.clone());
                     }
@@ -1098,6 +1124,7 @@ async fn session(
         if let Some(task) = task {
             ui.mode = Mode::Browse;
             ui.input = Zeroizing::new(String::new());
+            ui.show_phrase = false;
             ui.message = "Working…".into();
             let result = if let Task::Pending(code) = task {
                 match busy(
@@ -1256,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_phrase_never_enters_terminal_frames() {
+    fn phrase_is_masked_by_default_and_can_be_revealed() {
         let mut ui = Ui::new();
         ui.mode = Mode::Phrase(
             Task::Enroll {
@@ -1266,21 +1293,32 @@ mod tests {
             },
             false,
         );
-        ui.input = Zeroizing::new("sensitive recovery input".into());
+        ui.input = Zeroizing::new("alpha beta".into());
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        for _ in 0..3 {
-            terminal.draw(|f| ui.render(f)).unwrap();
-            let text: String = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|c| c.symbol())
-                .collect();
-            assert!(text.contains("24 recovery words (hidden)"));
-            assert!(!text.contains("sensitive"));
-            assert!(!text.contains("recovery input"));
-        }
+        terminal.draw(|f| ui.render(f)).unwrap();
+        let masked: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(masked.contains("24 recovery words (hidden)"));
+        assert!(masked.contains("***** ****"));
+        assert!(masked.contains("F2 reveal"));
+
+        ui.show_phrase = true;
+        terminal.draw(|f| ui.render(f)).unwrap();
+        let visible: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(visible.contains("24 recovery words (visible)"));
+        assert!(visible.contains("alpha beta"));
+        assert!(visible.contains("F2 hide"));
     }
 
     #[test]
