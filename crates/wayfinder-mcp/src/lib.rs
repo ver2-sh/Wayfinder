@@ -77,7 +77,7 @@ impl Mcp {
         .with_meta(Some(meta)))
     }
     #[tool(
-        description = "Discover Wayfinder nodes: stable device ID, display name, role and reachability within your Sync Chain."
+        description = "Discover Wayfinder nodes: stable device ID, display name, role, reachability and last known platform/arch within your Sync Chain. Platform/arch are self-reported authenticated connection metadata, not hardware attestation."
     )]
     async fn nodes(
         &self,
