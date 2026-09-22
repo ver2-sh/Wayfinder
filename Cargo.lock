@@ -3237,7 +3237,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axoupdater",
@@ -3263,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3305,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder-exec"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "nix",
@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder-gateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "wayfinder-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
