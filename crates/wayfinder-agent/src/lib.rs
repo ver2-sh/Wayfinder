@@ -89,6 +89,10 @@ pub async fn register(i: &Installation) -> Result<()> {
 }
 pub async fn operation(i: &Installation, op: Operation) -> Result<serde_json::Value> {
     i.validate()?;
+    ensure!(
+        matches!(&op, Operation::Devices) || i.certificate.role == Role::Admin,
+        "Administrative device required"
+    );
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))

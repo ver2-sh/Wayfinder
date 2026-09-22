@@ -157,6 +157,9 @@ impl Ui {
             busy: None,
         }
     }
+    fn is_admin(&self) -> bool {
+        self.status["role"].as_str() == Some("admin")
+    }
     fn section(&mut self, section: usize) -> bool {
         self.focus = false;
         if self.section == section {
@@ -283,6 +286,7 @@ impl Ui {
         ])
         .split(f.area());
         let online = self.status["online"] == true;
+        let admin = self.is_admin();
         let running = self.status["agent_running"] == true;
         f.render_widget(
             Paragraph::new(format!(
@@ -344,9 +348,9 @@ impl Ui {
                 1 | 2 => vec![(
                     "Revoke selected (D)",
                     KeyCode::Char('d'),
-                    !self.rows.is_empty(),
+                    admin && !self.rows.is_empty(),
                 )],
-                3 => vec![("Look up pairing code (Enter)", KeyCode::Enter, true)],
+                3 => vec![("Look up pairing code (Enter)", KeyCode::Enter, admin)],
                 4 => vec![("Migrate this device (M)", KeyCode::Char('m'), true)],
                 5 => vec![
                     ("Start (S)", KeyCode::Char('s'), true),
@@ -375,12 +379,14 @@ impl Ui {
         } else {
             match self.section {
                 0 => format!("Device       {}\nRole         {}\nDevice ID    {}\nSync Chain   {}\nGateway      {}\nObserved     {}\n\n{}\n\n{}", value(&self.status["name"]), value(&self.status["role"]), value(&self.status["device_id"]), value(&self.status["chain_id"]), value(&self.status["gateway"]), self.status["observed"].as_u64().map(|t|format!("{} seconds ago",wayfinder_core::now().saturating_sub(t))).unwrap_or("Not yet observed".into()), if self.owned {"Temporary agent • stops when this TUI exits"} else {"Attached agent • this TUI does not own it"}, self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
-                3 => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
+                2 if !admin => "MCP grant management requires an administrative device.\n\nMembers can receive remote commands and list devices, but cannot inspect or revoke MCP grants.".into(),
+                3 if admin => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
+                3 => "Browser pairing approval requires an administrative device.\n\nMembers can receive remote commands but cannot inspect or approve pairing requests.".into(),
                 4 => format!("Current gateway\n{}\n\nMigrate this device with local recovery-root authorization. Device identity stays the same. Other devices move deliberately; MCP requires destination authorization. Stop an independently owned agent first.", value(&self.status["gateway"])),
                 5 => format!("{}\nAutomatic startup installed: {}\n\nService changes apply only to the current OS user.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, value(&self.status["service_installed"])),
                 6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())), _ => String::new() }
         };
-        if self.enrolled && matches!(self.section, 1 | 2) {
+        if self.enrolled && (self.section == 1 || (self.section == 2 && admin)) {
             let panes = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .split(right[0]);
             let rows: Vec<String> = self
@@ -411,8 +417,13 @@ impl Ui {
             f.render_stateful_widget(
                 List::new(rows)
                     .block(Block::bordered().title(format!(
-                        " {} • Tab focus • D revoke ",
-                        SECTIONS[self.section]
+                        " {} • {} ",
+                        SECTIONS[self.section],
+                        if admin {
+                            "Tab focus • D revoke"
+                        } else {
+                            "read-only"
+                        }
                     )))
                     .highlight_symbol("› ")
                     .highlight_style(Style::default().fg(if self.focus {
@@ -849,10 +860,14 @@ async fn session(
                                 .min(ui.rows.len().saturating_sub(1)),
                         );
                     ui.selected.select(Some(pos));
-                    ui.message = format!(
-                        "{} entries • Tab focuses list • D revokes selected entry",
-                        ui.rows.len()
-                    );
+                    ui.message = if ui.is_admin() {
+                        format!(
+                            "{} entries • Tab focuses list • D revokes selected entry",
+                            ui.rows.len()
+                        )
+                    } else {
+                        format!("{} entries • Read-only on member devices", ui.rows.len())
+                    };
                 }
                 Ok((section, Err(e))) if section == ui.section => {
                     ui.message = format!("Gateway: {e:#}")
@@ -862,23 +877,28 @@ async fn session(
         }
         if fetch && ui.enrolled && matches!(ui.section, 1 | 2) {
             lists.abort_all();
-            let path = data.to_owned();
-            let section = ui.section;
-            lists.spawn(async move {
-                (
-                    section,
-                    remote(
-                        &path,
-                        if section == 1 {
-                            Operation::Devices
-                        } else {
-                            Operation::Grants
-                        },
+            if ui.section == 2 && !ui.is_admin() {
+                ui.rows.clear();
+                ui.message = "Administrative device required to manage MCP grants.".into();
+            } else {
+                let path = data.to_owned();
+                let section = ui.section;
+                lists.spawn(async move {
+                    (
+                        section,
+                        remote(
+                            &path,
+                            if section == 1 {
+                                Operation::Devices
+                            } else {
+                                Operation::Grants
+                            },
+                        )
+                        .await,
                     )
-                    .await,
-                )
-            });
-            ui.message = "Loading from gateway… (navigation remains available)".into();
+                });
+                ui.message = "Loading from gateway… (navigation remains available)".into();
+            }
         }
         fetch = false;
         ui.draw(screen)?;
@@ -943,7 +963,10 @@ async fn session(
                 KeyCode::Tab | KeyCode::Left | KeyCode::Right => ui.focus = !ui.focus,
                 KeyCode::Up | KeyCode::Down => {
                     let down = key == KeyCode::Down;
-                    if ui.focus && matches!(ui.section, 1 | 2) && ui.enrolled {
+                    if ui.focus
+                        && (ui.section == 1 || (ui.section == 2 && ui.is_admin()))
+                        && ui.enrolled
+                    {
                         let old = ui.selected.selected().unwrap_or(0);
                         ui.select(if down {
                             old.saturating_add(1)
@@ -963,11 +986,23 @@ async fn session(
                     ui.refresh(data, owned.is_some());
                     fetch = true;
                 }
-                KeyCode::Enter if ui.enrolled && matches!(ui.section, 1 | 2) => ui.focus = true,
+                KeyCode::Enter
+                    if ui.enrolled && (ui.section == 1 || (ui.section == 2 && ui.is_admin())) =>
+                {
+                    ui.focus = true
+                }
+                KeyCode::Enter if ui.enrolled && ui.section == 2 => {
+                    ui.message = "Administrative device required to manage MCP grants.".into()
+                }
                 KeyCode::Enter if !ui.enrolled => ui.prompt("Device name"),
-                KeyCode::Enter if ui.section == 3 => ui.prompt("Pairing code from your browser"),
+                KeyCode::Enter if ui.section == 3 && ui.is_admin() => {
+                    ui.prompt("Pairing code from your browser")
+                }
+                KeyCode::Enter if ui.section == 3 => {
+                    ui.message = "Administrative device required for browser pairing.".into()
+                }
                 KeyCode::Char('m') if ui.section == 4 => ui.prompt("Destination gateway URL"),
-                KeyCode::Char('d') if matches!(ui.section, 1 | 2) => {
+                KeyCode::Char('d') if matches!(ui.section, 1 | 2) && ui.is_admin() => {
                     if let Some(row) = ui.rows.get(ui.selected.selected().unwrap_or(0))
                         && let Some(id) = row["id"].as_str()
                     {
@@ -983,6 +1018,9 @@ async fn session(
                             ),
                         );
                     }
+                }
+                KeyCode::Char('d') if matches!(ui.section, 1 | 2) => {
+                    ui.message = "Administrative device required to revoke entries.".into()
                 }
                 KeyCode::Char(c) if ui.section == 5 => {
                     let action = match c {
