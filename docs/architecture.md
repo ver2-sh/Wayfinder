@@ -174,6 +174,43 @@ security, command filtering or sandboxing. Authentication and host authorization
 remain separate; commands still execute as the target daemon's OS account.
 Session v2 requires matching agents and gateway adapters; no v1 fallback exists.
 
+## Local application services
+
+A running agent also owns a deterministic local application endpoint that other
+OS-native products use without configuration, credential files or private-state
+access. On Linux the daemon binds `wayfinder/app.sock` under the first viable
+runtime directory — `$XDG_RUNTIME_DIR`, then `/run/user/<euid>`, then the
+provisioned `/run` machine location — creating a daemon-owned directory
+(`0700`, or setgid `2750` with socket `0660` when an installer shares the
+`wayfinder-apps` group) and taking an exclusive lock before replacing a stale
+socket. On Windows it creates the protected `\\.\pipe\wayfinder-app-v1` named
+pipe with a DACL for the service account and LocalSystem; remote clients are
+rejected. Applications verify endpoint ownership and permissions before use.
+
+Local sessions speak a sequential four-byte big-endian length plus UTF-8 JSON
+contract bounded at 16 KiB requests and 128 KiB replies: `status`, `register_
+service`, `unregister_service` and `open_service`. A `status` answer is
+sanitized — bare node IDs, names, locality and reachability only — and
+registrations are ephemeral memory owned by their live IPC session: disconnect,
+crash or daemon shutdown removes them; nothing is persisted or replicated.
+Service names are 1–96 bytes of lowercase ASCII letters, digits, `.`, `-`,
+`_`; backends must be loopback with a nonzero port and a 256-bit application
+credential, which the daemon delivers in the admission preface so the backend
+can authenticate the caller before any payload crosses.
+
+`open_service` targets one exact device. The opener's agent and the target's
+agent each connect a dedicated `/service` relay WebSocket (same certificate
+authentication as `/agent`); the gateway pairs the two sockets for that chain
+and forwards only opaque binary records bounded near 64 KiB. Unknown services,
+offline targets, other chains and capacity limits fail before dispatch with a
+`service_error` — never replayed. Inside the relay the agents run an ephemeral
+`Noise_NN_25519_ChaChaPoly_BLAKE2s` handshake whose prologue binds chain,
+stream ID, source, target and service, then each peer proves its enrolled
+device identity with an Ed25519 signature over the handshake hash. Application
+payloads are therefore end-to-end encrypted: the relay learns routing metadata
+but never plaintext. Records carry a data/EOF/keepalive flag; EOF, failure and
+cancellation propagate in both directions and there is no resume or replay.
+
 ## Chain isolation and persistence
 
 SQLite uses foreign keys, FULL synchronous commits, a rollback journal and an

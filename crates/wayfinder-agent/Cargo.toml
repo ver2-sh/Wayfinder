@@ -19,3 +19,12 @@ futures-util.workspace = true
 tokio-tungstenite.workspace = true
 reqwest.workspace = true
 zeroize.workspace = true
+snow.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+wayfinder-gateway.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }

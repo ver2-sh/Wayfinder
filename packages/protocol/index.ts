@@ -173,6 +173,15 @@ export async function verifyCertificate(c: Certificate) {
   await verify(c.root_public, certificateBytes(c), c.signature);
 }
 export const SESSION_VERSION = 2;
+/** Generic application service transport over `/service` relay sockets. */
+export const SERVICE_VERSION = 1;
+export const DEVICE_ID = /^wfd1_[0-9a-fA-F]{64}$/;
+export const STREAM_ID = /^[0-9a-fA-F]{64}$/;
+export function validServiceName(v: string) {
+  requireThat(
+    typeof v === "string" && v.length >= 1 && v.length <= 96 && /^[a-z0-9._-]+$/.test(v),
+  );
+}
 export interface PlatformDescriptor {
   platform: "windows" | "linux" | "macos" | "other";
   arch: string;

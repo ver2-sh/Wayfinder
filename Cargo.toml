@@ -40,6 +40,7 @@ hkdf = "0.12"
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+snow = "0.9"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 rpassword = "7"

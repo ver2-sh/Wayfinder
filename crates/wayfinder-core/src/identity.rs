@@ -116,7 +116,7 @@ pub fn verify(public: &str, bytes: &[u8], signature: &str) -> Result<()> {
         .verify_strict(bytes, &Signature::from_slice(&hex::decode(signature)?)?)
         .map_err(|_| anyhow::anyhow!("Invalid signature"))
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Installation {
     pub version: u32,

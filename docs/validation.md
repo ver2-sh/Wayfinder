@@ -30,9 +30,18 @@ scopes, device/grant revocation, refresh rotation and replay detection. It also
 enrolls a fresh device with the same phrase at an independent Rust gateway and
 checks that old device certificates cannot self-admit there.
 
-Self-hosted runs additionally restart the Rust gateway and inspect only the
-private disposable SQLite file for accidental persistence of recovery material,
-private keys or raw bearer tokens. Hosted restart/deployment and hibernation
+Self-hosted runs additionally exercise the local application transport against
+the real daemon binaries: each daemon receives an isolated
+`XDG_RUNTIME_DIR`, the `wayfinder/app.sock` endpoint appears automatically, and
+unconfigured same-user clients verify sanitized status (no credentials or
+private state), session-owned loopback service registration, registration
+stealing and invalid name/address rejection, exact-device `open_service`, an
+end-to-end echo round trip through the gateway relay, half-close EOF
+propagation, the credential/source/target/service preface, unknown-service,
+same-device and cross-chain refusal, and registration teardown when the
+application session dies. The suite then restarts the Rust gateway and
+inspects only the private disposable SQLite file for accidental persistence of
+recovery material, private keys or raw bearer tokens. Hosted restart/deployment and hibernation
 checks belong to the infrastructure validation record in Wayfinder-Cloudflare.
 The process suite migrates the same installation between independent gateways,
 checking unchanged certificate/key/Chain ID/Device ID, destination connectivity,

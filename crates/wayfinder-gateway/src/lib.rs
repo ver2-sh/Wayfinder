@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
@@ -32,10 +32,29 @@ struct Dispatch {
     response: oneshot::Sender<ExecResult>,
     cancel: CancellationToken,
 }
+/// Work delivered to a live agent session: shell dispatch or a generic
+/// service-stream request.
+enum AgentEvent {
+    Exec(Dispatch),
+    Service {
+        id: String,
+        source: String,
+        service: String,
+    },
+}
+/// One in-flight `service_open`: the opener's relay socket waits for the
+/// target's relay socket to accept.
+struct Pending {
+    target: String,
+    /// The opener's stream inbox; given to the accepter on pairing.
+    opener: mpsc::Sender<Message>,
+    /// Resolves to the accepter's inbox sender, or the rejection reason.
+    notify: oneshot::Sender<Result<mpsc::Sender<Message>, String>>,
+}
 #[derive(Clone)]
 struct Session {
     generation: String,
-    send: mpsc::Sender<Dispatch>,
+    send: mpsc::Sender<AgentEvent>,
     stop: CancellationToken,
 }
 pub struct Gateway {
@@ -49,6 +68,10 @@ pub struct Gateway {
     approvals: Mutex<HashMap<Key, (u64, u32)>>,
     administration: Mutex<()>,
     connections: Arc<tokio::sync::Semaphore>,
+    /// Unpaired `service_open` requests, keyed by (chain, stream ID).
+    pendings: Mutex<HashMap<Key, Pending>>,
+    /// Live relay sockets per chain, bounded independently of agent sessions.
+    relays: Mutex<HashMap<String, usize>>,
 }
 impl Gateway {
     pub fn new(issuer: String, store: Arc<CredentialStore>) -> Result<Arc<Self>> {
@@ -65,6 +88,8 @@ impl Gateway {
             approvals: Mutex::new(HashMap::new()),
             administration: Mutex::new(()),
             connections: Arc::new(tokio::sync::Semaphore::new(1024)),
+            pendings: Mutex::new(HashMap::new()),
+            relays: Mutex::new(HashMap::new()),
         }))
     }
     pub fn expire(&self) -> Result<()> {
@@ -82,6 +107,7 @@ impl Gateway {
     pub fn router(self: &Arc<Self>) -> Router {
         let protocol = Router::new()
             .route("/agent", get(upgrade))
+            .route("/service", get(service_upgrade))
             .route("/device/challenge", post(challenge))
             .route("/device/operation", post(operation))
             .route("/device/admit", post(admit))
@@ -193,15 +219,16 @@ impl Gateway {
         ensure!(expiry > now() && expiry <= now() + 30, "Expired challenge");
         Ok(expiry)
     }
-    async fn connection(
-        self: Arc<Self>,
-        mut socket: WebSocket,
-        handshake: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<()> {
-        let (certificate, metadata) = tokio::time::timeout(Duration::from_secs(5), async {
+    /// The shared WebSocket challenge/certificate authentication used by both
+    /// `/agent` control sessions and `/service` relay sockets.
+    async fn authenticate(
+        &self,
+        socket: &mut WebSocket,
+    ) -> Result<(Certificate, PlatformDescriptor)> {
+        tokio::time::timeout(Duration::from_secs(5), async {
             let nonce = random_secret();
             send(
-                &mut socket,
+                socket,
                 &Frame::Challenge {
                     version: SESSION_VERSION,
                     gateway: self.issuer.clone(),
@@ -209,7 +236,7 @@ impl Gateway {
                 },
             )
             .await?;
-            let frame = receive(&mut socket).await?;
+            let frame = receive(socket).await?;
             let Frame::Authenticate {
                 certificate,
                 metadata,
@@ -226,13 +253,20 @@ impl Gateway {
             )?;
             Ok::<_, anyhow::Error>((certificate, metadata))
         })
-        .await??;
+        .await?
+    }
+    async fn connection(
+        self: Arc<Self>,
+        mut socket: WebSocket,
+        handshake: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let (certificate, metadata) = self.authenticate(&mut socket).await?;
         drop(handshake);
         let _permit = self.connections.clone().try_acquire_owned()?;
         let key = (certificate.chain_id.clone(), certificate.device_id.clone());
         let generation = random_secret();
         let stop = CancellationToken::new();
-        let (tx, mut rx) = mpsc::channel::<Dispatch>(16);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
         {
             let _administration = self.administration.lock().unwrap();
             let sessions = self.sessions.lock().unwrap();
@@ -269,13 +303,31 @@ impl Gateway {
         {
             sessions.remove(&key);
         }
+        drop(sessions);
+        // Unpaired opens aimed at this device can never complete once its
+        // control session is gone.
+        let dead: Vec<Key> = self
+            .pendings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((chain, _), p)| {
+                *chain == certificate.chain_id && p.target == certificate.device_id
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in dead {
+            if let Some(p) = self.pendings.lock().unwrap().remove(&key) {
+                let _ = p.notify.send(Err("Device disconnected".into()));
+            }
+        }
         outcome
     }
     async fn connected(
         &self,
         socket: &mut WebSocket,
         c: &Certificate,
-        rx: &mut mpsc::Receiver<Dispatch>,
+        rx: &mut mpsc::Receiver<AgentEvent>,
         stop: &CancellationToken,
     ) -> Result<()> {
         send(socket, &Frame::Ready).await?;
@@ -300,24 +352,290 @@ impl Gateway {
                         send(socket, &Frame::Cancel { id }).await?;
                     }
                 },
-                dispatch = rx.recv() => {
-                    let Some(d) = dispatch else { break };
+                event = rx.recv() => {
+                    let Some(e) = event else { break };
                     self.store.active(c)?;
-                    if d.cancel.is_cancelled() { continue; }
-                    ensure!(pending.len() < 64, "Execution capacity reached");
-                    send(socket, &Frame::Exec { id: d.id.clone(), input: d.input }).await?;
-                    pending.insert(d.id, (d.response, d.cancel));
+                    match e {
+                        AgentEvent::Exec(d) => {
+                            if d.cancel.is_cancelled() { continue; }
+                            ensure!(pending.len() < 64, "Execution capacity reached");
+                            send(socket, &Frame::Exec { id: d.id.clone(), input: d.input }).await?;
+                            pending.insert(d.id, (d.response, d.cancel));
+                        },
+                        AgentEvent::Service { id, source, service } => {
+                            send(socket, &Frame::ServiceRequest { version: SERVICE_VERSION, id, source, service }).await?;
+                        },
+                    }
                 },
                 frame = receive(socket) => match frame? {
                     Frame::Pong => { last = tokio::time::Instant::now(); self.store.register(c, None)?; },
                     Frame::Result { id, result } => {
                         if let Some((tx, _)) = pending.remove(&id) { let _ = tx.send(result); }
                     },
+                    Frame::ServiceReject { id, error } => {
+                        let key = (c.chain_id.clone(), id);
+                        let mut pendings = self.pendings.lock().unwrap();
+                        if pendings.get(&key).is_some_and(|p| p.target == c.device_id)
+                            && let Some(p) = pendings.remove(&key)
+                        {
+                            let _ = p.notify.send(Err(error));
+                        }
+                    },
                     _ => anyhow::bail!("Unexpected frame"),
                 }
             }
         }
         Ok(())
+    }
+    /// `/service` relay connection: authenticate, then pair one open with one
+    /// accept and forward opaque records between them.
+    async fn service_connection(
+        self: Arc<Self>,
+        mut socket: WebSocket,
+        handshake: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let (certificate, _) = self.authenticate(&mut socket).await?;
+        drop(handshake);
+        let _permit = self.connections.clone().try_acquire_owned()?;
+        self.store.active(&certificate)?;
+        {
+            let mut relays = self.relays.lock().unwrap();
+            let count = relays.entry(certificate.chain_id.clone()).or_default();
+            ensure!(*count < 128, "Chain service stream capacity reached");
+            *count += 1;
+        }
+        let _guard = RelayGuard {
+            gateway: self.clone(),
+            chain: certificate.chain_id.clone(),
+        };
+        send(&mut socket, &Frame::Ready).await?;
+        let frame = tokio::time::timeout(Duration::from_secs(10), receive(&mut socket)).await??;
+        match frame {
+            Frame::ServiceOpen {
+                version,
+                id,
+                target,
+                service,
+            } => {
+                self.open_relay(socket, &certificate, version, id, target, service)
+                    .await
+            }
+            Frame::ServiceAccept { version, id } => {
+                self.accept_relay(socket, &certificate, version, id).await
+            }
+            _ => anyhow::bail!("Relay socket requires an open or accept"),
+        }
+    }
+    async fn open_relay(
+        &self,
+        mut socket: WebSocket,
+        c: &Certificate,
+        version: u32,
+        id: String,
+        target: String,
+        service: String,
+    ) -> Result<()> {
+        if let Err(e) = (|| -> Result<()> {
+            ensure!(
+                version == SERVICE_VERSION,
+                "Unsupported service transport version"
+            );
+            valid_node_id(&id)?;
+            valid_device_id(&target)?;
+            ensure!(
+                target != c.device_id,
+                "Service target must be a remote device"
+            );
+            valid_service_name(&service)?;
+            Ok(())
+        })() {
+            service_fail(&mut socket, &id, format!("{e:#}")).await;
+            return Ok(());
+        }
+        let key = (c.chain_id.clone(), id.clone());
+        let (opener, inbox) = mpsc::channel::<Message>(64);
+        let (notify, verdict) = oneshot::channel();
+        {
+            let mut pendings = self.pendings.lock().unwrap();
+            ensure!(
+                pendings
+                    .keys()
+                    .filter(|(chain, _)| chain == &c.chain_id)
+                    .count()
+                    < 32,
+                "Chain pending service capacity reached"
+            );
+            ensure!(!pendings.contains_key(&key), "Duplicate service stream ID");
+            pendings.insert(
+                key.clone(),
+                Pending {
+                    target: target.clone(),
+                    opener,
+                    notify,
+                },
+            );
+        }
+        let admitted = (|| -> Result<()> {
+            let session = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&(c.chain_id.clone(), target.clone()))
+                .cloned()
+                .filter(|s| !s.stop.is_cancelled())
+                .ok_or_else(|| anyhow::anyhow!("Target device offline"))?;
+            session
+                .send
+                .try_send(AgentEvent::Service {
+                    id: id.clone(),
+                    source: c.device_id.clone(),
+                    service,
+                })
+                .map_err(|_| anyhow::anyhow!("Target device busy"))
+        })();
+        if let Err(e) = admitted {
+            self.pendings.lock().unwrap().remove(&key);
+            service_fail(&mut socket, &id, format!("{e:#}")).await;
+            return Ok(());
+        }
+        let pairing = tokio::select! {
+            verdict = tokio::time::timeout(Duration::from_secs(15), verdict) => {
+                match verdict {
+                    Ok(Ok(Ok(peer))) => Ok(peer),
+                    Ok(Ok(Err(e))) => Err(e),
+                    _ => Err("Service open timed out before admission".into()),
+                }
+            },
+            closed = socket.recv() => {
+                self.pendings.lock().unwrap().remove(&key);
+                let _ = closed;
+                anyhow::bail!("Opener disconnected before pairing");
+            }
+        };
+        let peer = match pairing {
+            Ok(peer) => peer,
+            Err(error) => {
+                // The pending may already be gone (a service_reject removed it
+                // to deliver this verdict); the opener still needs the error.
+                self.pendings.lock().unwrap().remove(&key);
+                service_fail(&mut socket, &id, error).await;
+                return Ok(());
+            }
+        };
+        send(&mut socket, &Frame::ServiceReady { id }).await?;
+        self.relay(socket, inbox, peer).await
+    }
+    async fn accept_relay(
+        &self,
+        mut socket: WebSocket,
+        c: &Certificate,
+        version: u32,
+        id: String,
+    ) -> Result<()> {
+        if let Err(e) = (|| -> Result<()> {
+            ensure!(
+                version == SERVICE_VERSION,
+                "Unsupported service transport version"
+            );
+            valid_node_id(&id)?;
+            Ok(())
+        })() {
+            service_fail(&mut socket, &id, format!("{e:#}")).await;
+            return Ok(());
+        }
+        let key = (c.chain_id.clone(), id.clone());
+        let pending = {
+            let mut pendings = self.pendings.lock().unwrap();
+            match pendings.get(&key) {
+                Some(p) if p.target == c.device_id => pendings.remove(&key),
+                _ => None,
+            }
+        };
+        let Some(pending) = pending else {
+            service_fail(&mut socket, &id, "Unknown or expired service stream".into()).await;
+            return Ok(());
+        };
+        let (sender, inbox) = mpsc::channel::<Message>(64);
+        if pending.notify.send(Ok(sender)).is_err() {
+            service_fail(&mut socket, &id, "Service opener disconnected".into()).await;
+            return Ok(());
+        }
+        send(&mut socket, &Frame::ServiceReady { id }).await?;
+        self.relay(socket, inbox, pending.opener).await
+    }
+    /// Forward opaque records between this relay socket and the paired peer's
+    /// inbox. Either side closing tears the stream down in both directions.
+    async fn relay(
+        &self,
+        socket: WebSocket,
+        mut inbox: mpsc::Receiver<Message>,
+        peer: mpsc::Sender<Message>,
+    ) -> Result<()> {
+        let (mut sink, mut stream) = socket.split();
+        let out = tokio::spawn(async move {
+            while let Some(message) = inbox.recv().await {
+                if sink.send(message).await.is_err() {
+                    break;
+                }
+            }
+            sink
+        });
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(m @ (Message::Binary(_) | Message::Text(_))) => {
+                    let size = match &m {
+                        Message::Binary(b) => b.len(),
+                        Message::Text(t) => t.len(),
+                        _ => 0,
+                    };
+                    if size > 66000 || peer.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                _ => break,
+            }
+        }
+        if let Ok(mut sink) = out.await {
+            let _ = sink.close().await;
+        }
+        Ok(())
+    }
+}
+async fn service_fail(socket: &mut WebSocket, id: &str, error: String) {
+    let _ = send(
+        socket,
+        &Frame::ServiceError {
+            id: id.into(),
+            error,
+        },
+    )
+    .await;
+}
+async fn service_upgrade(State(g): State<Arc<Gateway>>, ws: WebSocketUpgrade) -> Response {
+    let Ok(permit) = g.handshakes.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // Relay payloads are end-to-end encrypted records bounded near 64 KiB.
+    ws.max_message_size(131072)
+        .max_frame_size(131072)
+        .on_upgrade(move |s| async move {
+            let _ = g.service_connection(s, permit).await;
+        })
+}
+struct RelayGuard {
+    gateway: Arc<Gateway>,
+    chain: String,
+}
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        let mut relays = self.gateway.relays.lock().unwrap();
+        if let Some(count) = relays.get_mut(&self.chain) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                relays.remove(&self.chain);
+            }
+        }
     }
 }
 async fn send(s: &mut WebSocket, f: &Frame) -> Result<()> {
@@ -420,7 +738,7 @@ impl wayfinder_mcp::Routing for Gateway {
             let result:Result<ExecResult>=async{
  input.validate()?;ensure!(!target.is_empty(),"Explicit target required");let devices=self.store.devices(&client.chain_id)?;let matches:Vec<_>=devices.iter().filter(|d|!d.revoked&&(d.id==target||d.name==target)).collect();ensure!(matches.len()==1,"Target missing or ambiguous in this Sync Chain");let id=matches[0].id.clone();let session=self.sessions.lock().unwrap().get(&(client.chain_id.clone(),id.clone())).cloned().ok_or_else(||anyhow::anyhow!("Device offline"))?;
  let local=cancel.child_token();let _cleanup=CancelOnDrop(local.clone());let(tx,rx)=oneshot::channel();let timeout=input.timeout.unwrap_or(30000)+15000;
- session.send.try_send(Dispatch{id:random_secret(),input,response:tx,cancel:local}).map_err(|_|anyhow::anyhow!("Device unavailable or busy"))?;
+ session.send.try_send(AgentEvent::Exec(Dispatch{id:random_secret(),input,response:tx,cancel:local})).map_err(|_|anyhow::anyhow!("Device unavailable or busy"))?;
  tokio::select!{_=cancel.cancelled()=>anyhow::bail!("Execution cancelled; dispatch may have occurred"),r=tokio::time::timeout(Duration::from_millis(timeout),rx)=>{let mut result=r.map_err(|_|anyhow::anyhow!("Outcome unknown: response deadline exceeded; command will not be retried"))?.map_err(|_|anyhow::anyhow!("Outcome unknown: device disconnected; command will not be retried"))?;result.target=id;Ok(result)}}
  }.await;
             result.unwrap_or_else(|e| ExecResult::failed(target, e))
