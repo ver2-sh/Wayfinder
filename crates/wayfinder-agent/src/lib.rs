@@ -1,10 +1,12 @@
+pub mod applications;
+
 use anyhow::{Result, ensure};
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use wayfinder_core::{identity::*, protocol::*, *};
-type Socket =
+pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 async fn send(s: &mut Socket, f: &Frame) -> Result<()> {
     tokio::time::timeout(
@@ -26,10 +28,13 @@ async fn receive(s: &mut Socket) -> Result<Frame> {
         }
     }
 }
-pub async fn connect(i: &Installation) -> Result<Socket> {
+/// Connect and authenticate one gateway WebSocket on `path` (`agent` for the
+/// control session, `service` for a generic application relay stream). The
+/// handshake is identical on both; the path only selects the gateway role.
+pub(crate) async fn connect_path(i: &Installation, path: &str) -> Result<Socket> {
     i.validate()?;
     let url = format!(
-        "{}/agent?chain_id={}",
+        "{}/{path}?chain_id={}",
         i.gateway
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1),
@@ -81,6 +86,9 @@ pub async fn connect(i: &Installation) -> Result<Socket> {
         "Gateway rejected device"
     );
     Ok(s)
+}
+pub async fn connect(i: &Installation) -> Result<Socket> {
+    connect_path(i, "agent").await
 }
 pub async fn register(i: &Installation) -> Result<()> {
     let mut s = connect(i).await?;
@@ -158,9 +166,19 @@ async fn run_inner(
     i.validate()?;
     let mut backoff = 1u64;
     status(path, i, false)?;
+    // The local application endpoint runs independently of gateway
+    // connectivity: registration/status work offline and remote opens recover
+    // as sessions reconnect.
+    let apps = Arc::new(applications::Apps::new(Arc::new(i.clone())));
+    let endpoint_stop = stop.child_token();
+    let endpoint = {
+        let apps = apps.clone();
+        tokio::spawn(async move { apps.serve(endpoint_stop).await })
+    };
     loop {
         let started = tokio::time::Instant::now();
-        let result = tokio::select! {_=stop.cancelled()=>break,r=session(path,i,stop.clone())=>r};
+        let result =
+            tokio::select! {_=stop.cancelled()=>break,r=session(path,i,&apps,stop.clone())=>r};
         status(path, i, false)?;
         if stop.is_cancelled() {
             break;
@@ -176,6 +194,7 @@ async fn run_inner(
         tokio::select! {_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(backoff*1000+jitter))=>{}}
         backoff = (backoff * 2).min(30);
     }
+    let _ = endpoint.await;
     status(path, i, false)?;
     Ok(())
 }
@@ -185,13 +204,38 @@ impl Drop for StopTasks {
         self.0.cancel();
     }
 }
-async fn session(path: &Path, i: &Installation, stop: CancellationToken) -> Result<()> {
+
+/// One finished unit of session work. Service admission reports an error only
+/// while a `service_reject` is still meaningful at the gateway.
+enum Work {
+    Exec {
+        id: String,
+        result: ExecResult,
+    },
+    Service {
+        id: String,
+        result: Result<(), String>,
+    },
+}
+
+async fn session(
+    path: &Path,
+    i: &Installation,
+    apps: &Arc<applications::Apps>,
+    stop: CancellationToken,
+) -> Result<()> {
     let mut socket = connect(i).await?;
     status(path, i, true)?;
     let session = stop.child_token();
     let _cleanup = StopTasks(session.clone());
+    {
+        let apps = apps.clone();
+        let roster_stop = session.child_token();
+        tokio::spawn(async move { apps.refresh_roster(roster_stop).await });
+    }
     let mut tasks = tokio::task::JoinSet::new();
     let mut cancels = HashMap::new();
+    let mut services = 0usize;
     let mut last = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
@@ -202,9 +246,18 @@ async fn session(path: &Path, i: &Installation, stop: CancellationToken) -> Resu
                 status(path, i, true)?;
             },
             completed = tasks.join_next(), if !tasks.is_empty() => {
-                let (id, result) = completed.unwrap()?;
-                cancels.remove(&id);
-                send(&mut socket, &Frame::Result { id, result }).await?;
+                match completed.unwrap()? {
+                    Work::Exec { id, result } => {
+                        cancels.remove(&id);
+                        send(&mut socket, &Frame::Result { id, result }).await?;
+                    },
+                    Work::Service { id, result } => {
+                        services -= 1;
+                        if let Err(error) = result {
+                            send(&mut socket, &Frame::ServiceReject { id, error }).await?;
+                        }
+                    },
+                }
             },
             frame = receive(&mut socket) => {
                 last = tokio::time::Instant::now();
@@ -225,7 +278,26 @@ async fn session(path: &Path, i: &Installation, stop: CancellationToken) -> Resu
                         let target = i.certificate.device_id.clone();
                         tasks.spawn(async move {
                             let result = wayfinder_exec::execute(target, input, cancel).await;
-                            (id, result)
+                            Work::Exec { id, result }
+                        });
+                    },
+                    Frame::ServiceRequest { version, id, source, service } => {
+                        ensure!(version == SERVICE_VERSION, "Unsupported service transport version");
+                        ensure!(valid_device_id(&source).is_ok() && source != i.certificate.device_id, "Invalid service source");
+                        ensure!(valid_node_id(&id).is_ok(), "Invalid service stream ID");
+                        if services >= 16 {
+                            send(&mut socket, &Frame::ServiceReject { id, error: "Device service capacity reached".into() }).await?;
+                            continue;
+                        }
+                        services += 1;
+                        let apps = apps.clone();
+                        let cancel = session.child_token();
+                        tasks.spawn(async move {
+                            let result = tokio::select! {
+                                _ = cancel.cancelled() => Ok(()),
+                                r = apps.inbound(id.clone(), source, service) => r,
+                            };
+                            Work::Service { id, result }
                         });
                     },
                     _ => anyhow::bail!("Unexpected gateway frame"),

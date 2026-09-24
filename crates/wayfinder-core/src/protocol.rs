@@ -29,6 +29,14 @@ impl PlatformDescriptor {
 }
 pub const SESSION_VERSION: u32 = 2;
 
+/// Version of the generic local application/service transport.
+///
+/// Service frames ride on the same authenticated session socket plus dedicated
+/// authenticated `/service` relay sockets. Application payloads stay
+/// end-to-end encrypted between the two Wayfinder agents and are opaque to
+/// the gateway.
+pub const SERVICE_VERSION: u32 = 1;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
@@ -56,6 +64,88 @@ pub enum Frame {
     },
     Ping,
     Pong,
+    /// Relay → gateway: open a service stream to an exact target device.
+    ServiceOpen {
+        version: u32,
+        id: String,
+        target: String,
+        service: String,
+    },
+    /// Relay → gateway: accept a previously requested service stream.
+    ServiceAccept {
+        version: u32,
+        id: String,
+    },
+    /// Gateway → relay: the stream is paired; end-to-end setup may start.
+    ServiceReady {
+        id: String,
+    },
+    /// Gateway → relay: the open failed before any dispatch.
+    ServiceError {
+        id: String,
+        error: String,
+    },
+    /// Gateway → target agent control socket: a device wants a named service.
+    ServiceRequest {
+        version: u32,
+        id: String,
+        source: String,
+        service: String,
+    },
+    /// Target agent → gateway: admission refused before the stream existed.
+    ServiceReject {
+        id: String,
+        error: String,
+    },
+}
+
+/// Opaque application service names such as `scala.link.v1`. They are routing
+/// labels only; the gateway never learns a backend address, credential or
+/// payload.
+pub fn valid_service_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 96
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_".contains(&b)),
+        "Invalid service name"
+    );
+    Ok(())
+}
+
+/// Full device IDs are `wfd1_` plus 64 lowercase hex characters.
+pub fn valid_device_id(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id.len() == 69 && id.starts_with("wfd1_") && id[5..].bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid device ID"
+    );
+    Ok(())
+}
+
+/// Local applications use the bare 64-hex node identity, without the `wfd1_`
+/// prefix, matching the published Scala/Wayfinder IPC contract.
+pub fn valid_node_id(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid node ID"
+    );
+    Ok(())
+}
+
+/// Strip the `wfd1_` prefix from a full device ID.
+pub fn bare_device_id(id: &str) -> &str {
+    id.strip_prefix("wfd1_").unwrap_or(id)
+}
+
+/// Accept either the bare node ID or the full `wfd1_` device ID and normalize
+/// to the full form used internally and on the wire.
+pub fn full_device_id(id: &str) -> anyhow::Result<String> {
+    if valid_node_id(id).is_ok() {
+        return Ok(format!("wfd1_{id}"));
+    }
+    valid_device_id(id)?;
+    Ok(id.to_string())
 }
 pub fn session_proof(
     gateway: &str,

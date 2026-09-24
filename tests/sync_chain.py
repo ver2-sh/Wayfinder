@@ -180,6 +180,48 @@ async def rejected_session(origin,i,mode):
         except websockets.exceptions.ConnectionClosed:
             return True
 
+def recv_all(s, n):
+    out = b''
+    while len(out) < n:
+        chunk = s.recv(n - len(out))
+        if not chunk:
+            raise ConnectionError('unexpected EOF')
+        out += chunk
+    return out
+def app_session(sock):
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(45)
+    s.connect(str(sock))
+    return s
+def app_call(s, request):
+    payload = compact(request)
+    s.sendall(len(payload).to_bytes(4, 'big') + payload)
+    n = int.from_bytes(recv_all(s, 4), 'big')
+    return json.loads(recv_all(s, n))
+def echo_service(prefaces):
+    srv = socket.socket()
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(4)
+    def handle(c):
+        with c:
+            n = int.from_bytes(recv_all(c, 4), 'big')
+            prefaces.append(json.loads(recv_all(c, n)))
+            reply = compact(dict(version=1, ready=True))
+            c.sendall(len(reply).to_bytes(4, 'big') + reply)
+            while True:
+                data = c.recv(65536)
+                if not data:
+                    return
+                c.sendall(data)
+    def accept():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    threading.Thread(target=accept, daemon=True).start()
+    return srv
 def interactive(args):
     master,slave=pty.openpty()
     process=subprocess.Popen([str(v) for v in args],stdin=slave,stdout=slave,stderr=slave)
@@ -212,6 +254,13 @@ def interactive(args):
 def run():
  with tempfile.TemporaryDirectory(prefix='wayfinder-validation-') as tmp:
     root=Path(tmp)
+    # Each daemon owns a private runtime directory so the disposable endpoints
+    # never collide with each other or a real installation on this host.
+    def runtime(name):
+        d = root/('rt-'+name)
+        d.mkdir(mode=0o700, exist_ok=True)
+        os.environ['XDG_RUNTIME_DIR'] = str(d)
+        return d/'wayfinder/app.sock'
     external=os.environ.get('WAYFINDER_TEST_GATEWAY')
     origin=external or f'http://127.0.0.1:{port()}'
     gateway=None
@@ -229,6 +278,7 @@ def run():
     recovery=next(line.strip() for line in output.splitlines() if len(line.strip().split())==24 and Mnemonic('english').check(line.strip()))
     check('interactive creation saves device but not recovery',recovery not in (created/'installation.json').read_text())
     created_identity=json.loads((created/'installation.json').read_text())
+    runtime('created')
     created_process=spawn([BIN/'wayfinder','--data-dir',created,'daemon'])
     wait(lambda:json.loads((created/'status.json').read_text())['online'])
     operation(created_identity,origin,dict(operation='revoke_device',device_id=created_identity['certificate']['device_id']))
@@ -236,8 +286,11 @@ def run():
     del recovery,output,created_identity
     phrase=Mnemonic('english').generate(256)
     phrase_b=Mnemonic('english').generate(256)
+    sock_a=runtime('a')
     a,ia,pa=enroll(root,'admin-a',phrase,origin,True)
+    sock_b=runtime('b')
     b,ib,pb=enroll(root,'member-a',phrase,origin)
+    runtime('c')
     c,ic,pc=enroll(root,'admin-b',phrase_b,origin,True)
     ca=ia['certificate'];cb=ib['certificate'];cc=ic['certificate']
     check('phrase deterministically reproduces Chain ID',ca['chain_id']==cb['chain_id']!=cc['chain_id'])
@@ -296,9 +349,59 @@ def run():
         check('uncertain dispatch reports error and is never retried',response['isError'] and marker.read_text()=='once')
     wait(lambda:not next(n for n in operation(ia,origin,dict(operation='devices'))[2] if n['id']==cb['device_id'])['online'])
     check('offline node unreachable',tool(origin,token,'exec',exec_input(cb['device_id'],'true'))[1]['isError'])
+    runtime('b')
     pb=spawn([BIN/'wayfinder','--data-dir',b,'daemon'])
     wait(lambda:next(n for n in operation(ia,origin,dict(operation='devices'))[2] if n['id']==cb['device_id'])['online'])
     check('restart preserves identity',json.loads((b/'installation.json').read_text())==ib)
+    if not external:
+        # Generic local application transport: endpoints appear automatically
+        # under each daemon's runtime directory; unconfigured applications
+        # register session-owned services and open exact-device streams.
+        bare=lambda d:d['device_id'].removeprefix('wfd1_')
+        wait(lambda:sock_a.exists() and sock_b.exists())
+        app_a=app_session(sock_a)
+        # The roster cache refreshes periodically over the gateway session.
+        wait(lambda:{n['id'] for n in app_call(app_a,dict(op='status')).get('value',{}).get('nodes',[])}=={bare(ca),bare(cb)})
+        status=app_call(app_a,dict(op='status'))
+        check('local status is a sanitized chain view','value' in status and {n['id'] for n in status['value']['nodes']}=={bare(ca),bare(cb)} and all(set(n)=={'id','name','local','reachable'} for n in status['value']['nodes']))
+        check('status has no credentials or private state',all(v not in json.dumps(status) for v in (phrase,ia['private_key'])))
+        prefaces=[]
+        backend=echo_service(prefaces)
+        credential=os.urandom(32).hex()
+        app_b=app_session(sock_b)
+        reply=app_call(app_b,dict(op='register_service',service='echo.v1',address=f'127.0.0.1:{backend.getsockname()[1]}',credential=credential))
+        check('loopback service registration admitted',reply.get('value',{}).get('registered'))
+        check('non-loopback backend refused','error' in app_call(app_b,dict(op='register_service',service='net.v1',address='8.8.8.8:53',credential=credential)))
+        check('invalid service name refused','error' in app_call(app_b,dict(op='register_service',service='Invalid Name',address='127.0.0.1:9',credential=credential)))
+        thief=app_session(sock_b)
+        check('registration cannot be taken by another session','error' in app_call(thief,dict(op='register_service',service='echo.v1',address=f'127.0.0.1:{backend.getsockname()[1]}',credential=credential)))
+        opening=app_session(sock_a)
+        reply=app_call(opening,dict(op='open_service',target=bare(cb),service='echo.v1'))
+        check('exact remote device service opens',reply==dict(version=1,ready=True))
+        opening.sendall(b'secret application bytes')
+        check('end-to-end stream echoes through relay',recv_all(opening,24)==b'secret application bytes')
+        opening.shutdown(socket.SHUT_WR)
+        check('half-close propagates EOF through relay',opening.recv(1)==b'')
+        opening.close()
+        check('preface binds credential source target and service',prefaces and prefaces[0]['credential']==credential and prefaces[0]['source']==bare(ca) and prefaces[0]['target']==bare(cb) and prefaces[0]['service']=='echo.v1')
+        denied=app_session(sock_a)
+        check('unregistered service rejected','not registered' in app_call(denied,dict(op='open_service',target=bare(cb),service='absent.v1')).get('error',''))
+        denied.close()
+        loop=app_session(sock_a)
+        check('local device is not a service target','error' in app_call(loop,dict(op='open_service',target=bare(ca),service='echo.v1')))
+        loop.close()
+        foreign=app_session(sock_a)
+        check('cross-chain service target refused','error' in app_call(foreign,dict(op='open_service',target=bare(cc),service='echo.v1')))
+        foreign.close()
+        app_b.close();thief.close()
+        def unregistered():
+            s=app_session(sock_a)
+            r=app_call(s,dict(op='open_service',target=bare(cb),service='echo.v1'))
+            s.close()
+            return 'not registered' in r.get('error','')
+        wait(unregistered)
+        check('registration dies with the application session',True)
+        backend.close()
     readonly=finish_auth(origin,ia,client,'read')
     check('read token cannot exec',tool(origin,readonly['access_token'],'exec',exec_input(ca['device_id'],'true'))[1]['isError'])
     grants=operation(ia,origin,dict(operation='grants'))[2]
@@ -362,6 +465,7 @@ def run():
     check('explicit root-authorized migration succeeds', migrate(a, other)==0)
     moved=json.loads((a/'installation.json').read_text())
     check('migration preserves Chain ID Device ID certificate role and private key', moved == {**ia, 'gateway':other})
+    runtime('a')
     pa=spawn([BIN/'wayfinder','--data-dir',a,'daemon'])
     wait(lambda:operation(moved,other,dict(operation='devices'))[0]==200)
     check('same device connects at target', any(n['id']==ca['device_id'] and n['online'] for n in operation(moved,other,dict(operation='devices'))[2]))
@@ -372,6 +476,7 @@ def run():
     check('target tombstone rejects even recovery-root migration', migrate(b,origin)!=0 and (b/'installation.json').read_bytes()==before_b)
     pa.terminate();pa.wait(timeout=10)
     check('same installation migrates back to original gateway', migrate(a,origin)==0 and json.loads((a/'installation.json').read_text())==ia)
+    runtime('a')
     pa=spawn([BIN/'wayfinder','--data-dir',a,'daemon'])
     wait(lambda:operation(ia,origin,dict(operation='devices'))[0]==200)
     # Hosted validation leaves only explicitly revoked public disposable records.
