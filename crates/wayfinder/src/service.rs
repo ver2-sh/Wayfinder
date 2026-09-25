@@ -434,9 +434,21 @@ struct WindowsTriggerView {
     enabled: Option<bool>,
 }
 
+/// One Task Scheduler action as reported by the query script.
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsActionView {
+    #[serde(default)]
+    execute: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
 /// The Task Scheduler task as reported by the query script. Built from
 /// structured PowerShell objects (`Get-ScheduledTask` properties), never from
-/// localized human-readable `schtasks` text.
+/// localized human-readable `schtasks` text. `action_count`/`trigger_count`
+/// are explicit integers so cardinality is verifiable without depending on
+/// PowerShell scalar/array JSON shape quirks.
 #[cfg(any(windows, test))]
 #[derive(Debug, serde::Deserialize)]
 struct WindowsTaskView {
@@ -447,17 +459,21 @@ struct WindowsTaskView {
     #[serde(default)]
     current_user: Option<String>,
     #[serde(default)]
+    current_sid: Option<String>,
+    #[serde(default)]
     user: Option<String>,
     #[serde(default)]
     logon_type: Option<String>,
     #[serde(default)]
     run_level: Option<String>,
     #[serde(default)]
+    action_count: usize,
+    #[serde(default)]
+    actions: Vec<WindowsActionView>,
+    #[serde(default)]
+    trigger_count: usize,
+    #[serde(default)]
     triggers: Vec<WindowsTriggerView>,
-    #[serde(default)]
-    execute: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
 }
 
 #[cfg(any(windows, test))]
@@ -485,21 +501,34 @@ fn windows_unregister_script(name: &str) -> String {
 }
 
 // Emits the registered task as structured JSON, or `{"present":false}`. Reports
-// the task enabled flag, current user, principal semantics, triggers, and the
-// first action's executable and arguments so health is judged against the full
-// login-start contract rather than mere task existence.
+// the task enabled flag, the current user (name and SID), principal semantics,
+// the complete action and trigger lists, and explicit element counts so health
+// is judged against the full owned login-start definition rather than mere
+// task existence.
 #[cfg(any(windows, test))]
 fn windows_query_script(name: &str) -> String {
     format!(
-        "$n={name}; $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false; current_user=$me }} | ConvertTo-Json -Compress }} else {{ $a=@($t.Actions); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); $exe=$null; $argstr=$null; if ($a.Count -gt 0) {{ $exe=[string]$a[0].Execute; $argstr=[string]$a[0].Arguments }}; [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; current_user=$me; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; triggers=$tr; execute=$exe; arguments=$argstr }} | ConvertTo-Json -Compress -Depth 6 }}"
+        "$n={name}; $i=[System.Security.Principal.WindowsIdentity]::GetCurrent(); $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false; current_user=$i.Name; current_sid=$i.User.Value }} | ConvertTo-Json -Compress }} else {{ $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; current_user=$i.Name; current_sid=$i.User.Value; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
 }
 
+/// Task Scheduler may expose the same account either as `DOMAIN\name` or as
+/// its SID string; both representations identify the current user, so
+/// principal and trigger users match on either form.
+#[cfg(any(windows, test))]
+fn windows_same_account(reported: Option<&str>, name: &str, sid: &str) -> bool {
+    reported.is_some_and(|user| {
+        !user.is_empty() && (user.eq_ignore_ascii_case(name) || user.eq_ignore_ascii_case(sid))
+    })
+}
+
 /// Judges a queried task against the exact login-start contract Wayfinder owns:
-/// present, enabled, current-user interactive/limited principal, an AtLogOn
-/// trigger for that user, the exact executable, and the exact
-/// `--data-dir <canonical> daemon` arguments. `Enabled` is only reported when
-/// Windows will actually run the expected Wayfinder login task.
+/// present, enabled, current-user interactive/limited principal, exactly one
+/// action binding the exact executable with the exact
+/// `--data-dir <canonical> daemon` arguments, and exactly one enabled AtLogOn
+/// trigger for that user. Additional actions or triggers are mutations the
+/// contract does not allow: `true` is only reported when Windows will run the
+/// expected Wayfinder login task and nothing else.
 #[cfg(any(windows, test))]
 fn windows_task_healthy(
     view: &WindowsTaskView,
@@ -510,13 +539,18 @@ fn windows_task_healthy(
         return false;
     }
     let current_user = view.current_user.as_deref().unwrap_or_default();
+    let current_sid = view.current_sid.as_deref().unwrap_or_default();
+    // The owned contract is exact: one action and one trigger. The explicit
+    // counts and the complete arrays must agree, so extra entries cannot hide
+    // behind a correct first element.
+    let single_action = view.action_count == 1 && view.actions.len() == 1;
+    let single_trigger = view.trigger_count == 1 && view.triggers.len() == 1;
+    let action = view.actions.first();
     view.enabled
-        && view.execute.as_deref() == Some(expected_executable)
-        && view.arguments.as_deref() == Some(expected_arguments)
-        && view
-            .user
-            .as_deref()
-            .is_some_and(|user| user.eq_ignore_ascii_case(current_user))
+        && single_action
+        && action.and_then(|action| action.execute.as_deref()) == Some(expected_executable)
+        && action.and_then(|action| action.arguments.as_deref()) == Some(expected_arguments)
+        && windows_same_account(view.user.as_deref(), current_user, current_sid)
         && view
             .logon_type
             .as_deref()
@@ -525,15 +559,13 @@ fn windows_task_healthy(
             .run_level
             .as_deref()
             .is_some_and(|level| level.eq_ignore_ascii_case("Limited"))
-        && view.triggers.iter().any(|trigger| {
+        && single_trigger
+        && view.triggers.iter().all(|trigger| {
             trigger
                 .trigger_type
                 .to_ascii_lowercase()
                 .contains("logontrigger")
-                && trigger
-                    .user
-                    .as_deref()
-                    .is_some_and(|user| user.eq_ignore_ascii_case(current_user))
+                && windows_same_account(trigger.user.as_deref(), current_user, current_sid)
                 && trigger.enabled.unwrap_or(true)
         })
 }
@@ -734,19 +766,25 @@ mod tests {
         assert!(script.contains(r#"--data-dir "C:\My Data\wayfinder\\" daemon"#));
     }
 
+    const TEST_SID: &str = "S-1-5-21-111-222-333-1001";
+
     fn healthy_windows_task(exe: &str, args: &str) -> WindowsTaskView {
         let json = serde_json::json!({
             "present": true,
             "enabled": true,
             "current_user": r"DESKTOP\alice",
+            "current_sid": TEST_SID,
             "user": r"DESKTOP\alice",
             "logon_type": "Interactive",
             "run_level": "Limited",
+            "action_count": 1,
+            "actions": [
+                {"execute": exe, "arguments": args}
+            ],
+            "trigger_count": 1,
             "triggers": [
                 {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "enabled": true}
             ],
-            "execute": exe,
-            "arguments": args,
         });
         windows_parse(&json.to_string()).unwrap()
     }
@@ -787,14 +825,53 @@ mod tests {
             &args
         ));
 
+        // An extra action alongside the correct one is a mutation: not
+        // healthy, even though the first action still matches.
+        let mut extra_action = healthy_windows_task(exe, &args);
+        extra_action.action_count = 2;
+        extra_action.actions.push(WindowsActionView {
+            execute: Some(exe.to_owned()),
+            arguments: Some(args.clone()),
+        });
+        assert!(!windows_task_healthy(&extra_action, exe, &args));
+
+        // Zero actions: not healthy.
+        let mut no_action = healthy_windows_task(exe, &args);
+        no_action.action_count = 0;
+        no_action.actions.clear();
+        assert!(!windows_task_healthy(&no_action, exe, &args));
+
         // Missing or foreign AtLogOn trigger: not healthy.
         let mut no_trigger = healthy_windows_task(exe, &args);
+        no_trigger.trigger_count = 0;
         no_trigger.triggers.clear();
         assert!(!windows_task_healthy(&no_trigger, exe, &args));
 
         let mut boot_trigger = healthy_windows_task(exe, &args);
         boot_trigger.triggers[0].trigger_type = "MSFT_TaskBootTrigger".to_owned();
         assert!(!windows_task_healthy(&boot_trigger, exe, &args));
+
+        // An extra Boot trigger alongside the correct AtLogOn trigger: not
+        // healthy.
+        let mut extra_boot = healthy_windows_task(exe, &args);
+        extra_boot.trigger_count = 2;
+        extra_boot.triggers.push(WindowsTriggerView {
+            trigger_type: "MSFT_TaskBootTrigger".to_owned(),
+            user: None,
+            enabled: Some(true),
+        });
+        assert!(!windows_task_healthy(&extra_boot, exe, &args));
+
+        // A second AtLogOn trigger for the same user is still an extra
+        // trigger: not healthy.
+        let mut extra_logon = healthy_windows_task(exe, &args);
+        extra_logon.trigger_count = 2;
+        extra_logon.triggers.push(WindowsTriggerView {
+            trigger_type: "MSFT_TaskLogonTrigger".to_owned(),
+            user: Some(r"DESKTOP\alice".to_owned()),
+            enabled: Some(true),
+        });
+        assert!(!windows_task_healthy(&extra_logon, exe, &args));
 
         // Trigger/principal for another user: not healthy.
         let mut wrong_trigger_user = healthy_windows_task(exe, &args);
@@ -809,6 +886,13 @@ mod tests {
         let mut elevated = healthy_windows_task(exe, &args);
         elevated.run_level = Some("Highest".to_owned());
         assert!(!windows_task_healthy(&elevated, exe, &args));
+
+        // The same account reported by SID instead of name still matches the
+        // principal and trigger user checks.
+        let mut sid_task = healthy_windows_task(exe, &args);
+        sid_task.user = Some(TEST_SID.to_owned());
+        sid_task.triggers[0].user = Some(TEST_SID.to_owned());
+        assert!(windows_task_healthy(&sid_task, exe, &args));
     }
 
     #[test]
@@ -822,6 +906,14 @@ mod tests {
         assert!(query.contains("CimClassName"));
         assert!(query.contains("LogonType"));
         assert!(query.contains("ConvertTo-Json"));
+        // Complete arrays plus explicit counts: cardinality is deterministic.
+        assert!(query.contains("action_count=$a.Count"));
+        assert!(query.contains("actions=$a"));
+        assert!(query.contains("trigger_count=$tr.Count"));
+        assert!(query.contains("triggers=$tr"));
+        // Name and SID forms of the current user for robust account matching.
+        assert!(query.contains("current_user=$i.Name"));
+        assert!(query.contains("current_sid=$i.User.Value"));
 
         let unregister = windows_unregister_script(&name);
         assert!(unregister.contains("Unregister-ScheduledTask"));
