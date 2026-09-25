@@ -67,7 +67,7 @@ Do not disable OS protections to install an unsigned build.
 
 Run `wayfinder` in a terminal to open the management TUI (`wayfinder tui` is
 also supported). The full-screen sections cover Overview, Devices, MCP Grants,
-Browser pairing, Gateway, Agent and Updates. Before enrollment, choose Create Sync
+Browser pairing, Gateway, Agent, Updates and Settings. Before enrollment, choose Create Sync
 Chain or Join Sync Chain. Click sections, list rows and action buttons; use the
 mouse wheel to navigate lists or scroll details and dialogs. Keyboard shortcuts
 remain available: arrows navigate, Tab or Enter focuses a list, PgUp/PgDn scrolls,
@@ -76,8 +76,10 @@ pairing approvals require typing `yes` after reviewing their details.
 
 For an enrolled installation, opening the TUI automatically starts a temporary
 agent if none is running. Closing it stops only that temporary agent; attached
-agents and installed services continue running. **Agent → Install automatic
-startup** (or `I`) enables automatic startup for the current OS user. Gateway changes restart an owned temporary agent,
+agents and installed services continue running. **Settings → Start automatically
+on login** enables or disables automatic startup for the current OS user; the
+setting reflects the real OS registration and changing it never starts or stops
+the running agent. Gateway changes restart an owned temporary agent,
 including after a failed change; an independently running agent must be stopped
 explicitly first.
 
@@ -179,7 +181,15 @@ revocation. See [OAuth and self-hosting](docs/remote-mcp.md).
 
 ## Background agent and automatic startup
 
-Run as the OS account whose privileges remote commands should receive:
+The normal way to manage login startup is the **Settings** section of the TUI:
+*Start automatically on login* shows `Enabled` or `Disabled` read straight from
+the OS registration, so deleting the registration outside Wayfinder is reported
+accurately. Toggling it only changes what happens at the next login; it never
+starts, stops, or restarts the agent that is running right now.
+
+For scripts and automation the same registration is reachable through explicit
+service commands, which retain their documented lifecycle behavior. Run as the
+OS account whose privileges remote commands should receive:
 
 ```sh
 wayfinder service install    # configure startup and start; enroll first
@@ -189,6 +199,11 @@ wayfinder service start
 wayfinder service restart
 wayfinder service uninstall  # stop and remove startup; preserve identity/config
 ```
+
+Unlike the Settings toggle, `service install` starts the agent immediately and
+`service uninstall` stops it. Both write the same per-user registration the
+toggle controls, so a task registered by `service install` shows up as
+`Enabled` in Settings and can be disabled there (without stopping the agent).
 
 Linux uses **user-scoped systemd**, macOS a per-user **LaunchAgent**, and Windows
 a **Task Scheduler logon task** with interactive logon and limited run level.

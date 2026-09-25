@@ -1,4 +1,11 @@
 //! Per-user native startup. No elevation, shell interpolation, or privileged accounts.
+//!
+//! Two distinct primitives exist on purpose:
+//! - `configure` changes only whether the agent starts at the NEXT login. It
+//!   never starts, stops, or restarts a currently running agent.
+//! - `manage`/`manage_quiet` are the lifecycle commands (`service install`,
+//!   `start`, `stop`, `restart`, `uninstall`) and keep their documented
+//!   process-affecting behavior for scripts and automation.
 use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
 use std::{
@@ -15,6 +22,14 @@ pub enum Action {
     Stop,
     Restart,
     Status,
+}
+
+/// Registration-only change: controls whether the agent launches at the next
+/// login. Never affects a currently running agent.
+#[derive(Clone, Copy)]
+pub enum Configure {
+    Enable,
+    Disable,
 }
 
 pub fn agent_running(data: &Path) -> Result<bool> {
@@ -47,6 +62,10 @@ fn home() -> Result<PathBuf> {
         .to_owned())
 }
 fn invoke(program: &str, args: &[&str]) -> Result<String> {
+    #[cfg(all(test, unix))]
+    if program == "systemctl" {
+        return test_systemctl(args);
+    }
     let output = Command::new(program)
         .args(args)
         .output()
@@ -58,12 +77,80 @@ fn invoke(program: &str, args: &[&str]) -> Result<String> {
     );
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+// Synthetic user-unit manager used by tests so enable/disable round-trips can be
+// validated without a real systemd --user session.
+#[cfg(all(test, unix))]
+fn test_systemctl(args: &[&str]) -> Result<String> {
+    let dir = test_units_dir().context("test units dir unset")?;
+    let unit = args.last().unwrap_or(&"");
+    let link = dir.join("default.target.wants").join(unit);
+    match args.get(1).copied().unwrap_or("") {
+        "daemon-reload" => Ok(String::new()),
+        "enable" => {
+            ensure!(dir.join(unit).is_file(), "Unit file {unit} does not exist");
+            std::fs::create_dir_all(link.parent().unwrap())?;
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(dir.join(unit), &link)?;
+            Ok(String::new())
+        }
+        "disable" => {
+            ensure!(dir.join(unit).is_file(), "Unit file {unit} does not exist");
+            let _ = std::fs::remove_file(&link);
+            Ok(String::new())
+        }
+        "start" | "stop" | "restart" => Ok(String::new()),
+        "is-enabled" => Ok(if link.symlink_metadata().is_ok() {
+            "enabled".into()
+        } else {
+            "disabled".into()
+        }),
+        "is-active" => Ok("inactive".into()),
+        verb => anyhow::bail!("unexpected systemctl verb {verb}"),
+    }
+}
+#[cfg(all(test, unix))]
+fn test_units_dir() -> Option<PathBuf> {
+    TEST_UNITS_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+#[cfg(all(test, unix))]
+pub(crate) fn test_set_units_dir(dir: &Path) {
+    *TEST_UNITS_DIR.lock().unwrap() = Some(dir.to_owned());
+}
+#[cfg(all(test, unix))]
+static TEST_UNITS_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// Serializes tests that mutate the shared test units dir/systemctl shim.
+#[cfg(all(test, unix))]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+#[cfg(all(test, unix))]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(target_os = "linux")]
-fn definition(data: &Path) -> Result<PathBuf> {
+fn units_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = test_units_dir() {
+        return Ok(dir);
+    }
     Ok(directories::BaseDirs::new()
         .context("No user config directory")?
         .config_dir()
-        .join("systemd/user")
+        .join("systemd/user"))
+}
+#[cfg(target_os = "linux")]
+fn definition(data: &Path) -> Result<PathBuf> {
+    Ok(units_dir()?.join(format!("{}.service", id(data)?)))
+}
+// The enablement symlink `systemctl --user enable` creates. Checking it keeps
+// `installed` truthful when the unit is disabled externally.
+#[cfg(target_os = "linux")]
+fn wants_link(data: &Path) -> Result<PathBuf> {
+    Ok(units_dir()?
+        .join("default.target.wants")
         .join(format!("{}.service", id(data)?)))
 }
 #[cfg(target_os = "macos")]
@@ -76,8 +163,45 @@ fn definition(data: &Path) -> Result<PathBuf> {
 fn definition(data: &Path) -> Result<PathBuf> {
     Ok(data.join("startup-task.json"))
 }
+/// Whether the OS registration that launches the agent at next login exists.
+/// The native definition is authoritative; no separate desired-state flag is
+/// stored, so external removal or disabling is reported truthfully.
 pub fn installed(data: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(definition(data)?.exists() && wants_link(data)?.symlink_metadata().is_ok());
+    }
+    #[cfg(windows)]
+    {
+        return windows_installed(data);
+    }
+    #[allow(unreachable_code)]
     Ok(definition(data)?.exists())
+}
+
+// The marker file is only a fast path: it is written solely by our
+// registration, so its absence proves nothing was ever installed here. When
+// the marker exists the real Task Scheduler task is queried so an external
+// `Unregister-ScheduledTask` is reported instead of a stale Enabled claim.
+#[cfg(windows)]
+fn windows_installed(data: &Path) -> Result<bool> {
+    if !definition(data)?.exists() {
+        return Ok(false);
+    }
+    let task = id(data)?;
+    let output = Command::new("schtasks.exe")
+        .args(["/Query", "/TN", &task, "/FO", "CSV"])
+        .output()
+        .context("Could not query Task Scheduler")?;
+    Ok(output.status.success())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn manage(data: &Path, action: Action) -> Result<()> {
@@ -107,43 +231,90 @@ pub fn manage_quiet(data: &Path, action: Action) -> Result<()> {
     native(data, action)
 }
 
+/// Configure whether the agent launches at the next login for this OS user.
+/// Configuration-only: unlike `manage_quiet`, this never starts, stops, or
+/// restarts a running agent, so the TUI can toggle it while its temporary
+/// agent keeps running.
+pub fn configure(data: &Path, change: Configure) -> Result<()> {
+    if matches!(change, Configure::Enable) {
+        ensure!(
+            data.join("installation.json").exists(),
+            "Enroll this device before enabling login startup"
+        );
+    }
+    native_configure(data, change)
+}
+
+// systemd specifier/environment expansion applies even inside quotes.
+#[cfg(target_os = "linux")]
+fn systemd_quote(p: &Path) -> Result<String> {
+    let s = p.to_str().context("Service paths must be UTF-8")?;
+    ensure!(
+        !s.chars().any(char::is_control),
+        "Control characters in service path"
+    );
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+            .replace('$', "$$")
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn unit_text(data: &Path) -> Result<String> {
+    Ok(format!(
+        "[Unit]\nDescription=Wayfinder agent (current user)\n[Service]\nExecStart={} --data-dir {} daemon\nRestart=on-failure\nRestartSec=5\nUMask=0077\n[Install]\nWantedBy=default.target\n",
+        systemd_quote(&std::env::current_exe()?)?,
+        systemd_quote(&std::fs::canonicalize(data)?)?
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn native_configure(data: &Path, change: Configure) -> Result<()> {
+    let file = definition(data)?;
+    let wants = wants_link(data)?;
+    let unit = format!("{}.service", id(data)?);
+    match change {
+        Configure::Enable => {
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, unit_text(data)?)?;
+            invoke("systemctl", &["--user", "daemon-reload"])?;
+            // `enable` without `--now` registers next-login startup only and
+            // does not launch a second agent now.
+            invoke("systemctl", &["--user", "enable", &unit])?;
+        }
+        Configure::Disable => {
+            // `disable` never stops a running unit; removing the definition
+            // files is what prevents the next login from starting the agent.
+            if file.exists() {
+                let _ = invoke("systemctl", &["--user", "disable", &unit]);
+            }
+            remove_if_exists(&wants)?;
+            remove_if_exists(&file)?;
+            if file.exists() || wants.symlink_metadata().is_ok() {
+                anyhow::bail!("Startup definition could not be fully removed");
+            }
+            let _ = invoke("systemctl", &["--user", "daemon-reload"]);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn native(data: &Path, action: Action) -> Result<()> {
     let file = definition(data)?;
     let unit = format!("{}.service", id(data)?);
     match action {
         Action::Install => {
-            // systemd specifier/environment expansion applies even inside quotes.
-            fn quote(p: &Path) -> Result<String> {
-                let s = p.to_str().context("Service paths must be UTF-8")?;
-                ensure!(
-                    !s.chars().any(char::is_control),
-                    "Control characters in service path"
-                );
-                Ok(format!(
-                    "\"{}\"",
-                    s.replace('\\', "\\\\")
-                        .replace('"', "\\\"")
-                        .replace('%', "%%")
-                        .replace('$', "$$")
-                ))
-            }
-            std::fs::create_dir_all(file.parent().unwrap())?;
-            std::fs::write(
-                &file,
-                format!(
-                    "[Unit]\nDescription=Wayfinder agent (current user)\n[Service]\nExecStart={} --data-dir {} daemon\nRestart=on-failure\nRestartSec=5\nUMask=0077\n[Install]\nWantedBy=default.target\n",
-                    quote(&std::env::current_exe()?)?,
-                    quote(&std::fs::canonicalize(data)?)?
-                ),
-            )?;
-            invoke("systemctl", &["--user", "daemon-reload"])?;
-            invoke("systemctl", &["--user", "enable", "--now", &unit])?;
+            native_configure(data, Configure::Enable)?;
+            // Documented behavior: `service install` also starts the agent now.
+            invoke("systemctl", &["--user", "start", &unit])?;
         }
         Action::Uninstall => {
-            invoke("systemctl", &["--user", "disable", "--now", &unit])?;
-            std::fs::remove_file(file)?;
-            invoke("systemctl", &["--user", "daemon-reload"])?;
+            invoke("systemctl", &["--user", "stop", &unit])?;
+            native_configure(data, Configure::Disable)?;
         }
         Action::Start | Action::Stop | Action::Restart => {
             ensure!(file.exists(), "Install automatic startup first");
@@ -158,15 +329,45 @@ fn native(data: &Path, action: Action) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(any(target_os = "macos", test))]
+fn xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn plist_text(data: &Path) -> Result<String> {
+    let label = id(data)?;
+    let exe = std::env::current_exe()?;
+    let data = std::fs::canonicalize(data)?;
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{}</string><string>--data-dir</string><string>{}</string><string>daemon</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>Umask</key><integer>63</integer></dict></plist>",
+        xml(exe.to_str().context("Executable path must be UTF-8")?),
+        xml(data.to_str().context("Data path must be UTF-8")?)
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn native_configure(data: &Path, change: Configure) -> Result<()> {
+    let file = definition(data)?;
+    match change {
+        // A LaunchAgent plist in ~/Library/LaunchAgents is loaded by launchd at
+        // the next login; writing it does not start anything now.
+        Configure::Enable => {
+            std::fs::create_dir_all(file.parent().unwrap())?;
+            std::fs::write(&file, plist_text(data)?)?;
+        }
+        Configure::Disable => remove_if_exists(&file)?,
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn native(data: &Path, action: Action) -> Result<()> {
-    fn xml(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
-    }
     let file = definition(data)?;
     let uid = invoke("id", &["-u"])?;
     let domain = format!("gui/{}", uid.trim());
@@ -175,17 +376,8 @@ fn native(data: &Path, action: Action) -> Result<()> {
     let path = file.to_str().context("LaunchAgent path must be UTF-8")?;
     match action {
         Action::Install => {
-            std::fs::create_dir_all(file.parent().unwrap())?;
-            let exe = std::env::current_exe()?;
-            let data = std::fs::canonicalize(data)?;
-            std::fs::write(
-                &file,
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{}</string><string>--data-dir</string><string>{}</string><string>daemon</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>Umask</key><integer>63</integer></dict></plist>",
-                    xml(exe.to_str().context("Executable path must be UTF-8")?),
-                    xml(data.to_str().context("Data path must be UTF-8")?)
-                ),
-            )?;
+            // Documented behavior: `service install` also starts the agent now.
+            native_configure(data, Configure::Enable)?;
             invoke("launchctl", &["bootstrap", &domain, path])?;
         }
         Action::Start => {
@@ -201,12 +393,13 @@ fn native(data: &Path, action: Action) -> Result<()> {
             if invoke("launchctl", &["print", &target]).is_ok() {
                 invoke("launchctl", &["bootout", &target])?;
             }
-            std::fs::remove_file(file)?;
+            native_configure(data, Configure::Disable)?;
         }
         Action::Status => unreachable!(),
     }
     Ok(())
 }
+
 // Encode one argv element using Windows CRT quote/backslash rules. PowerShell
 // quoting is a separate outer layer; its single-quoted strings preserve this.
 #[cfg(any(windows, test))]
@@ -239,34 +432,24 @@ fn windows_task_arguments(data: &str) -> String {
     format!("--data-dir {} daemon", windows_argument(data))
 }
 
+#[cfg(any(windows, test))]
+fn windows_ps(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+// Registers (or replaces) the per-user AtLogOn task without starting it.
+// Current user, interactive logon, limited run level, no elevation.
+#[cfg(any(windows, test))]
+fn windows_register_script(name: &str, exe: &str, data: &str) -> String {
+    format!(
+        "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName {name} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null",
+        windows_ps(exe),
+        windows_ps(&windows_task_arguments(data))
+    )
+}
+
 #[cfg(windows)]
-fn native(data: &Path, action: Action) -> Result<()> {
-    fn ps(s: &str) -> String {
-        format!("'{}'", s.replace('\'', "''"))
-    }
-    let name = ps(&id(data)?);
-    let script = match action {
-        Action::Install => {
-            let exe = std::env::current_exe()?;
-            let data = std::fs::canonicalize(data)?;
-            let data = data.to_str().context("Data path must be UTF-8")?;
-            ensure!(!data.contains('"'), "Invalid data path");
-            format!(
-                "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName {name} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null; Start-ScheduledTask -TaskName {name}",
-                ps(exe.to_str().context("Executable path must be UTF-8")?),
-                ps(&windows_task_arguments(data))
-            )
-        }
-        Action::Start => format!("Start-ScheduledTask -TaskName {name}"),
-        Action::Stop => format!("Stop-ScheduledTask -TaskName {name}"),
-        Action::Restart => {
-            format!("Stop-ScheduledTask -TaskName {name}; Start-ScheduledTask -TaskName {name}")
-        }
-        Action::Uninstall => format!(
-            "Stop-ScheduledTask -TaskName {name}; Unregister-ScheduledTask -TaskName {name} -Confirm:$false"
-        ),
-        Action::Status => unreachable!(),
-    };
+fn windows_run(script: &str) -> Result<()> {
     invoke(
         "powershell.exe",
         &[
@@ -276,11 +459,57 @@ fn native(data: &Path, action: Action) -> Result<()> {
             &format!("$ErrorActionPreference='Stop'; {script}"),
         ],
     )?;
-    if matches!(action, Action::Install) {
-        wayfinder_core::atomic_write(&definition(data)?, &true)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn native_configure(data: &Path, change: Configure) -> Result<()> {
+    let marker = definition(data)?;
+    let name = windows_ps(&id(data)?);
+    match change {
+        Configure::Enable => {
+            let exe = std::env::current_exe()?;
+            let data = std::fs::canonicalize(data)?;
+            let data = data.to_str().context("Data path must be UTF-8")?;
+            ensure!(!data.contains('"'), "Invalid data path");
+            windows_run(&windows_register_script(
+                &name,
+                exe.to_str().context("Executable path must be UTF-8")?,
+                data,
+            ))?;
+            wayfinder_core::atomic_write(&marker, &true)?;
+        }
+        Configure::Disable => {
+            windows_run(&format!(
+                "if (Get-ScheduledTask -TaskName {name} -ErrorAction SilentlyContinue) {{ Unregister-ScheduledTask -TaskName {name} -Confirm:$false }}"
+            ))?;
+            remove_if_exists(&marker)?;
+        }
     }
-    if matches!(action, Action::Uninstall) {
-        std::fs::remove_file(definition(data)?)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn native(data: &Path, action: Action) -> Result<()> {
+    let name = windows_ps(&id(data)?);
+    match action {
+        Action::Install => {
+            native_configure(data, Configure::Enable)?;
+            // Documented behavior: `service install` also starts the agent now.
+            windows_run(&format!("Start-ScheduledTask -TaskName {name}"))?;
+        }
+        Action::Start => windows_run(&format!("Start-ScheduledTask -TaskName {name}"))?,
+        Action::Stop => windows_run(&format!("Stop-ScheduledTask -TaskName {name}"))?,
+        Action::Restart => windows_run(&format!(
+            "Stop-ScheduledTask -TaskName {name}; Start-ScheduledTask -TaskName {name}"
+        ))?,
+        Action::Uninstall => {
+            windows_run(&format!(
+                "Stop-ScheduledTask -TaskName {name}; Unregister-ScheduledTask -TaskName {name} -Confirm:$false"
+            ))?;
+            remove_if_exists(&definition(data)?)?;
+        }
+        Action::Status => unreachable!(),
     }
     Ok(())
 }
@@ -324,6 +553,17 @@ impl TemporaryAgent {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        Self {
+            stop: tokio_util::sync::CancellationToken::new(),
+            task: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop.is_cancelled()
+    }
 }
 
 impl Drop for TemporaryAgent {
@@ -355,5 +595,93 @@ mod tests {
         }
         assert_eq!(windows_argument(""), r#""""#);
         assert_eq!(windows_argument(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn windows_powershell_single_quote_escapes() {
+        assert_eq!(windows_ps("plain"), "'plain'");
+        assert_eq!(
+            windows_ps(r"C:\My Apps\wayfinder.exe"),
+            r"'C:\My Apps\wayfinder.exe'"
+        );
+        // Trailing backslashes are literal inside PowerShell single quotes.
+        assert_eq!(windows_ps(r"C:\Tools\"), r"'C:\Tools\'");
+        assert_eq!(windows_ps("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn windows_register_script_is_registration_only_and_safely_quoted() {
+        let script = windows_register_script(
+            &windows_ps("app.usewayfinder.agent.0123456789abcdef"),
+            r"C:\My Apps\wayfinder.exe",
+            r"C:\My Data\wayfinder\",
+        );
+        // Never starts the task: configuration-only registration.
+        assert!(!script.contains("Start-ScheduledTask"));
+        assert!(script.contains("Register-ScheduledTask"));
+        assert!(script.contains("-AtLogOn"));
+        assert!(script.contains("-LogonType Interactive -RunLevel Limited"));
+        assert!(script.contains("ExecutionTimeLimit ([TimeSpan]::Zero)"));
+        assert!(script.contains(r"-Execute 'C:\My Apps\wayfinder.exe'"));
+        assert!(script.contains(r#"--data-dir "C:\My Data\wayfinder\\" daemon"#));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_configure_round_trips_without_lifecycle() {
+        let _guard = test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "wayfinder-test-{}",
+            wayfinder_core::random_secret()
+        ));
+        let data = root.join("data");
+        let units = root.join("units");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&units).unwrap();
+        *TEST_UNITS_DIR.lock().unwrap() = Some(units.clone());
+
+        assert!(!installed(&data).unwrap());
+        // Deterministic, data-directory-scoped unit name owned by Wayfinder.
+        let file = definition(&data).unwrap();
+        let name = file.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("app.usewayfinder.agent."));
+        assert!(name.ends_with(".service"));
+        // Enable registers next-login startup without any start verb.
+        native_configure(&data, Configure::Enable).unwrap();
+        assert!(installed(&data).unwrap());
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(" daemon\n"), "{text}");
+        assert!(text.contains("ExecStart="));
+        // External `systemctl --user disable` removes the link; status must reflect it.
+        let _ = std::fs::remove_file(wants_link(&data).unwrap());
+        assert!(!installed(&data).unwrap());
+        // Re-enabling repairs the registration.
+        native_configure(&data, Configure::Enable).unwrap();
+        assert!(installed(&data).unwrap());
+        native_configure(&data, Configure::Disable).unwrap();
+        assert!(!installed(&data).unwrap());
+        assert!(!definition(&data).unwrap().exists());
+
+        *TEST_UNITS_DIR.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn macos_launch_agent_plist_binds_exact_binary_and_data_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "wayfinder-test-{}",
+            wayfinder_core::random_secret()
+        ));
+        let data = root.join("My Data");
+        std::fs::create_dir_all(&data).unwrap();
+        let text = plist_text(&data).unwrap();
+        let canonical = std::fs::canonicalize(&data).unwrap();
+        assert!(text.contains("<key>RunAtLoad</key><true/>"), "{text}");
+        assert!(text.contains("<key>KeepAlive</key><true/>"), "{text}");
+        assert!(text.contains("<string>--data-dir</string>"), "{text}");
+        assert!(text.contains("<string>daemon</string>"), "{text}");
+        assert!(text.contains(&xml(canonical.to_str().unwrap())), "{text}");
+        assert!(text.contains("app.usewayfinder.agent."), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

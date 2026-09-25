@@ -1,7 +1,7 @@
 //! Full-screen management of the current Sync Chain identity. Secrets never enter argv/history.
 use crate::{
     app,
-    service::{self, Action, TemporaryAgent},
+    service::{self, Action, Configure, TemporaryAgent},
     update,
 };
 use anyhow::{Context, Result, ensure};
@@ -30,7 +30,7 @@ use wayfinder_core::{
 };
 use zeroize::Zeroizing;
 
-const SECTIONS: [&str; 7] = [
+const SECTIONS: [&str; 8] = [
     "Overview",
     "Devices",
     "MCP Grants",
@@ -38,6 +38,7 @@ const SECTIONS: [&str; 7] = [
     "Gateway",
     "Agent",
     "Updates",
+    "Settings",
 ];
 type Screen = Terminal<CrosstermBackend<io::Stdout>>;
 struct Restore;
@@ -81,6 +82,7 @@ enum Task {
     Pending(String),
     Approve(String, String),
     Service(Action),
+    ConfigureStartup(bool),
     Install,
     Migrate(String),
     Enroll {
@@ -356,8 +358,6 @@ impl Ui {
                     ("Start (S)", KeyCode::Char('s'), true),
                     ("Stop (X)", KeyCode::Char('x'), true),
                     ("Restart (T)", KeyCode::Char('t'), true),
-                    ("Install automatic startup (I)", KeyCode::Char('i'), true),
-                    ("Uninstall automatic startup (U)", KeyCode::Char('u'), true),
                 ],
                 6 => vec![
                     ("Check for updates (C)", KeyCode::Char('c'), true),
@@ -365,6 +365,18 @@ impl Ui {
                         "Install update (I)",
                         KeyCode::Char('i'),
                         self.update.as_ref().is_some_and(|s| s.available()),
+                    ),
+                ],
+                7 => vec![
+                    (
+                        "Enable login startup (E)",
+                        KeyCode::Char('e'),
+                        self.status["service_installed"] != true,
+                    ),
+                    (
+                        "Disable login startup (D)",
+                        KeyCode::Char('d'),
+                        self.status["service_installed"] == true,
                     ),
                 ],
                 _ => vec![],
@@ -383,8 +395,9 @@ impl Ui {
                 3 if admin => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
                 3 => "Browser pairing approval requires an administrative device.\n\nMembers can receive remote commands but cannot inspect or approve pairing requests.".into(),
                 4 => format!("Current gateway\n{}\n\nMigrate this device with local recovery-root authorization. Device identity stays the same. Other devices move deliberately; MCP requires destination authorization. Stop an independently owned agent first.", value(&self.status["gateway"])),
-                5 => format!("{}\nAutomatic startup installed: {}\n\nService changes apply only to the current OS user.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, value(&self.status["service_installed"])),
-                6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())), _ => String::new() }
+                5 => format!("{}\nStart automatically on login: {} (managed in Settings)\n\nStart, stop and restart apply to the current OS user's running agent.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, if self.status["service_installed"] == true {"Enabled"} else {"Disabled"}),
+                6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
+                7 => format!("Start automatically on login:  {}\n\nControls whether the Wayfinder daemon launches at your next OS login for this user.\nChanging it never starts or stops the currently running agent.\n\nWindows uses a per-user Task Scheduler logon task (interactive logon, limited run level; no administrator rights). Linux uses a systemd --user service; macOS uses a per-user LaunchAgent.\n\nThe registration binds this exact binary and data directory; re-enable it after moving either.\nAutomation: `wayfinder service install`/`uninstall` manage the same registration and explicitly start/stop the agent.", if self.status["service_installed"] == true {"Enabled"} else {"Disabled"}), _ => String::new() }
         };
         if self.enrolled && (self.section == 1 || (self.section == 2 && admin)) {
             let panes = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -749,6 +762,27 @@ async fn perform(
                 }
             }
         },
+        Task::ConfigureStartup(enable) => {
+            // Registration-only: the owned temporary agent keeps running.
+            let path = data.to_owned();
+            tokio::task::spawn_blocking(move || {
+                service::configure(
+                    &path,
+                    if enable {
+                        Configure::Enable
+                    } else {
+                        Configure::Disable
+                    },
+                )
+            })
+            .await
+            .context("Startup configuration task failed")??;
+            return Ok(if enable {
+                "Start automatically on login: Enabled. Applies to the next login; the running agent is unaffected.".into()
+            } else {
+                "Start automatically on login: Disabled. The running agent is unaffected.".into()
+            });
+        }
         Task::Migrate(gateway) => {
             let restart = stop_owned(owned).await?;
             let result = async {
@@ -975,7 +1009,7 @@ async fn session(
                         });
                     } else {
                         let section = if down {
-                            (ui.section + 1).min(if ui.enrolled { 6 } else { 1 })
+                            (ui.section + 1).min(if ui.enrolled { SECTIONS.len() - 1 } else { 1 })
                         } else {
                             ui.section.saturating_sub(1)
                         };
@@ -1027,21 +1061,31 @@ async fn session(
                         's' => Some(Action::Start),
                         'x' => Some(Action::Stop),
                         't' => Some(Action::Restart),
-                        'i' => Some(Action::Install),
-                        'u' => Some(Action::Uninstall),
                         _ => None,
                     };
                     if let Some(action) = action {
-                        ui.confirm(Task::Service(action), match action {
-                            Action::Start => "Start the agent for this OS user?",
-                            Action::Stop => "Stop the agent? Active commands may be interrupted.",
-                            Action::Restart => "Restart the agent? Active commands may be interrupted.",
-                            Action::Install => "Enable automatic startup for this OS user? The temporary agent will stop; active commands may be interrupted.",
-                            Action::Uninstall => "Disable automatic startup and stop the managed agent? Active commands may be interrupted.",
-                            Action::Status => unreachable!(),
-                        }.into());
+                        ui.confirm(
+                            Task::Service(action),
+                            match action {
+                                Action::Start => "Start the agent for this OS user?",
+                                Action::Stop => {
+                                    "Stop the agent? Active commands may be interrupted."
+                                }
+                                Action::Restart => {
+                                    "Restart the agent? Active commands may be interrupted."
+                                }
+                                Action::Install | Action::Uninstall | Action::Status => {
+                                    unreachable!()
+                                }
+                            }
+                            .into(),
+                        );
                     }
                 }
+                // The login-startup toggle is registration-only and reversible,
+                // so it applies immediately without a typed confirmation.
+                KeyCode::Char('e') if ui.section == 7 => task = Some(Task::ConfigureStartup(true)),
+                KeyCode::Char('d') if ui.section == 7 => task = Some(Task::ConfigureStartup(false)),
                 KeyCode::Char('c') if ui.section == 6 && check.is_empty() => {
                     let path = data.to_owned();
                     check.spawn(async move { update::check(&path, true).await });
@@ -1205,7 +1249,7 @@ async fn session(
                 break;
             }
             ui.refresh(data, owned.is_some());
-            if ui.enrolled && ui.section > 6 {
+            if ui.enrolled && ui.section >= SECTIONS.len() {
                 ui.section = 0;
             }
         }
@@ -1382,5 +1426,79 @@ mod tests {
         terminal.draw(|f| ui.render(f)).unwrap();
         assert_eq!(ui.input.as_str(), "ye");
         assert_eq!(ui.selected.selected(), Some(1));
+    }
+
+    fn rendered(ui: &mut Ui, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui.render(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn settings_section_shows_native_login_startup_state() {
+        let mut ui = Ui::new();
+        ui.enrolled = true;
+        ui.section = 7;
+        ui.status = serde_json::json!({"service_installed": false});
+        let text = rendered(&mut ui, 120, 30);
+        assert!(text.contains("Settings"));
+        assert!(text.contains("Start automatically on login"));
+        assert!(text.contains("Disabled"));
+        ui.status = serde_json::json!({"service_installed": true});
+        let text = rendered(&mut ui, 120, 30);
+        assert!(text.contains("Enabled"));
+
+        // The Agent section keeps lifecycle controls but no longer owns autostart.
+        ui.section = 5;
+        let text = rendered(&mut ui, 120, 30);
+        assert!(!text.contains("Install automatic startup"));
+        assert!(!text.contains("Uninstall automatic startup"));
+        assert!(text.contains("Start automatically on login"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn configure_startup_never_touches_the_running_agent() {
+        let _guard = service::test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "wayfinder-tui-test-{}",
+            wayfinder_core::random_secret()
+        ));
+        let data = root.join("data");
+        let units = root.join("units");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(data.join("installation.json"), b"{}").unwrap();
+        service::test_set_units_dir(&units);
+
+        let mut owned = Some(TemporaryAgent::stub());
+        let phrase = || Zeroizing::new(String::new());
+        perform(&data, Task::ConfigureStartup(true), phrase(), &mut owned)
+            .await
+            .unwrap();
+        assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
+        assert!(service::installed(&data).unwrap());
+        perform(&data, Task::ConfigureStartup(false), phrase(), &mut owned)
+            .await
+            .unwrap();
+        assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
+        assert!(!service::installed(&data).unwrap());
+
+        // Unenrolled data directories cannot register login startup.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(
+            perform(&bare, Task::ConfigureStartup(true), phrase(), &mut owned)
+                .await
+                .is_err()
+        );
+        assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

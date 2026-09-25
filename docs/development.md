@@ -19,5 +19,9 @@ See [release maintenance](releases.md) for distribution preflight and
 Development scripts build local binaries only. The obsolete system-level
 `wayfinder-service.sh` installer has been removed. For local lifecycle testing,
 use a stable binary path with `wayfinder service install` as your ordinary OS
-user. Reinstall the startup definition if you move the binary. Do not overwrite
-an executable while a service owns it; use its lifecycle commands.
+user. Interactive startup control lives in the TUI under
+Settings → Start automatically on login; it is registration-only and never
+stops a running agent, while `service install` retains its process-affecting
+behavior for scripts and automation. Reinstall the startup definition if you
+move the binary. Do not overwrite an executable while a service owns it; use
+its lifecycle commands.
