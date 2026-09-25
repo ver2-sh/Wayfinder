@@ -184,8 +184,12 @@ revocation. See [OAuth and self-hosting](docs/remote-mcp.md).
 The normal way to manage login startup is the **Settings** section of the TUI:
 *Start automatically on login* shows `Enabled` or `Disabled` read straight from
 the OS registration, so deleting the registration outside Wayfinder is reported
-accurately. Toggling it only changes what happens at the next login; it never
-starts, stops, or restarts the agent that is running right now.
+accurately. `Enabled` is shown only while the registration is enabled and still
+matches the expected Wayfinder login task (current user, interactive/limited
+principal, an `AtLogOn` trigger, the exact executable, and the exact
+`--data-dir <canonical path> daemon` arguments); a disabled or altered task is
+reported as `Disabled`. Toggling it only changes what happens at the next login;
+it never starts, stops, or restarts the agent that is running right now.
 
 For scripts and automation the same registration is reachable through explicit
 service commands, which retain their documented lifecycle behavior. Run as the
