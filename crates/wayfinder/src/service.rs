@@ -8,10 +8,10 @@
 //!   process-affecting behavior for scripts and automation.
 use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::PathBuf;
+use std::process::Command;
 use wayfinder_core::{lock_dir, private_dir};
 
 #[derive(Clone, Copy, Subcommand)]
@@ -159,43 +159,28 @@ fn definition(data: &Path) -> Result<PathBuf> {
         .join("Library/LaunchAgents")
         .join(format!("{}.plist", id(data)?)))
 }
-#[cfg(windows)]
-fn definition(data: &Path) -> Result<PathBuf> {
-    Ok(data.join("startup-task.json"))
-}
-/// Whether the OS registration that launches the agent at next login exists.
-/// The native definition is authoritative; no separate desired-state flag is
-/// stored, so external removal or disabling is reported truthfully.
+/// Whether the OS registration that launches the agent at next login exists and
+/// is healthy. The native definition is authoritative; no marker or
+/// desired-state flag is consulted, so external removal or disabling is
+/// reported truthfully.
+#[cfg(target_os = "linux")]
 pub fn installed(data: &Path) -> Result<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        return Ok(definition(data)?.exists() && wants_link(data)?.symlink_metadata().is_ok());
-    }
-    #[cfg(windows)]
-    {
-        return windows_installed(data);
-    }
-    #[allow(unreachable_code)]
+    Ok(definition(data)?.exists() && wants_link(data)?.symlink_metadata().is_ok())
+}
+#[cfg(target_os = "macos")]
+pub fn installed(data: &Path) -> Result<bool> {
     Ok(definition(data)?.exists())
 }
-
-// The marker file is only a fast path: it is written solely by our
-// registration, so its absence proves nothing was ever installed here. When
-// the marker exists the real Task Scheduler task is queried so an external
-// `Unregister-ScheduledTask` is reported instead of a stale Enabled claim.
 #[cfg(windows)]
-fn windows_installed(data: &Path) -> Result<bool> {
-    if !definition(data)?.exists() {
-        return Ok(false);
-    }
-    let task = id(data)?;
-    let output = Command::new("schtasks.exe")
-        .args(["/Query", "/TN", &task, "/FO", "CSV"])
-        .output()
-        .context("Could not query Task Scheduler")?;
-    Ok(output.status.success())
+pub fn installed(data: &Path) -> Result<bool> {
+    windows_installed(data)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn installed(_data: &Path) -> Result<bool> {
+    Ok(false)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn remove_if_exists(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -437,6 +422,49 @@ fn windows_ps(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// One Task Scheduler trigger as reported by the query script.
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsTriggerView {
+    #[serde(default, rename = "type")]
+    trigger_type: String,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+/// The Task Scheduler task as reported by the query script. Built from
+/// structured PowerShell objects (`Get-ScheduledTask` properties), never from
+/// localized human-readable `schtasks` text.
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsTaskView {
+    #[serde(default)]
+    present: bool,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    current_user: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    logon_type: Option<String>,
+    #[serde(default)]
+    run_level: Option<String>,
+    #[serde(default)]
+    triggers: Vec<WindowsTriggerView>,
+    #[serde(default)]
+    execute: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+fn windows_parse<T: serde::de::DeserializeOwned>(output: &str) -> Result<T> {
+    serde_json::from_str(output.trim()).context("Unexpected Task Scheduler query output")
+}
+
 // Registers (or replaces) the per-user AtLogOn task without starting it.
 // Current user, interactive logon, limited run level, no elevation.
 #[cfg(any(windows, test))]
@@ -446,6 +474,68 @@ fn windows_register_script(name: &str, exe: &str, data: &str) -> String {
         windows_ps(exe),
         windows_ps(&windows_task_arguments(data))
     )
+}
+
+// Unregisters the task only if present; never stops task instances.
+#[cfg(any(windows, test))]
+fn windows_unregister_script(name: &str) -> String {
+    format!(
+        "if (Get-ScheduledTask -TaskName {name} -ErrorAction SilentlyContinue) {{ Unregister-ScheduledTask -TaskName {name} -Confirm:$false }}"
+    )
+}
+
+// Emits the registered task as structured JSON, or `{"present":false}`. Reports
+// the task enabled flag, current user, principal semantics, triggers, and the
+// first action's executable and arguments so health is judged against the full
+// login-start contract rather than mere task existence.
+#[cfg(any(windows, test))]
+fn windows_query_script(name: &str) -> String {
+    format!(
+        "$n={name}; $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false; current_user=$me }} | ConvertTo-Json -Compress }} else {{ $a=@($t.Actions); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); $exe=$null; $argstr=$null; if ($a.Count -gt 0) {{ $exe=[string]$a[0].Execute; $argstr=[string]$a[0].Arguments }}; [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; current_user=$me; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; triggers=$tr; execute=$exe; arguments=$argstr }} | ConvertTo-Json -Compress -Depth 6 }}"
+    )
+}
+
+/// Judges a queried task against the exact login-start contract Wayfinder owns:
+/// present, enabled, current-user interactive/limited principal, an AtLogOn
+/// trigger for that user, the exact executable, and the exact
+/// `--data-dir <canonical> daemon` arguments. `Enabled` is only reported when
+/// Windows will actually run the expected Wayfinder login task.
+#[cfg(any(windows, test))]
+fn windows_task_healthy(
+    view: &WindowsTaskView,
+    expected_executable: &str,
+    expected_arguments: &str,
+) -> bool {
+    if !view.present {
+        return false;
+    }
+    let current_user = view.current_user.as_deref().unwrap_or_default();
+    view.enabled
+        && view.execute.as_deref() == Some(expected_executable)
+        && view.arguments.as_deref() == Some(expected_arguments)
+        && view
+            .user
+            .as_deref()
+            .is_some_and(|user| user.eq_ignore_ascii_case(current_user))
+        && view
+            .logon_type
+            .as_deref()
+            .is_some_and(|logon| logon.eq_ignore_ascii_case("Interactive"))
+        && view
+            .run_level
+            .as_deref()
+            .is_some_and(|level| level.eq_ignore_ascii_case("Limited"))
+        && view.triggers.iter().any(|trigger| {
+            trigger
+                .trigger_type
+                .to_ascii_lowercase()
+                .contains("logontrigger")
+                && trigger
+                    .user
+                    .as_deref()
+                    .is_some_and(|user| user.eq_ignore_ascii_case(current_user))
+                && trigger.enabled.unwrap_or(true)
+        })
 }
 
 #[cfg(windows)]
@@ -463,8 +553,31 @@ fn windows_run(script: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn windows_installed(data: &Path) -> Result<bool> {
+    let name = id(data)?;
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_str().context("Executable path must be UTF-8")?;
+    let canonical = std::fs::canonicalize(data)?;
+    let canonical = canonical.to_str().context("Data path must be UTF-8")?;
+    let expected_arguments = windows_task_arguments(canonical);
+    let output = invoke(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$ErrorActionPreference='Stop'; {}",
+                windows_query_script(&windows_ps(&name))
+            ),
+        ],
+    )?;
+    let view: WindowsTaskView = windows_parse(&output)?;
+    Ok(windows_task_healthy(&view, exe, &expected_arguments))
+}
+
+#[cfg(windows)]
 fn native_configure(data: &Path, change: Configure) -> Result<()> {
-    let marker = definition(data)?;
     let name = windows_ps(&id(data)?);
     match change {
         Configure::Enable => {
@@ -477,13 +590,9 @@ fn native_configure(data: &Path, change: Configure) -> Result<()> {
                 exe.to_str().context("Executable path must be UTF-8")?,
                 data,
             ))?;
-            wayfinder_core::atomic_write(&marker, &true)?;
         }
         Configure::Disable => {
-            windows_run(&format!(
-                "if (Get-ScheduledTask -TaskName {name} -ErrorAction SilentlyContinue) {{ Unregister-ScheduledTask -TaskName {name} -Confirm:$false }}"
-            ))?;
-            remove_if_exists(&marker)?;
+            windows_run(&windows_unregister_script(&name))?;
         }
     }
     Ok(())
@@ -507,7 +616,6 @@ fn native(data: &Path, action: Action) -> Result<()> {
             windows_run(&format!(
                 "Stop-ScheduledTask -TaskName {name}; Unregister-ScheduledTask -TaskName {name} -Confirm:$false"
             ))?;
-            remove_if_exists(&definition(data)?)?;
         }
         Action::Status => unreachable!(),
     }
@@ -624,6 +732,100 @@ mod tests {
         assert!(script.contains("ExecutionTimeLimit ([TimeSpan]::Zero)"));
         assert!(script.contains(r"-Execute 'C:\My Apps\wayfinder.exe'"));
         assert!(script.contains(r#"--data-dir "C:\My Data\wayfinder\\" daemon"#));
+    }
+
+    fn healthy_windows_task(exe: &str, args: &str) -> WindowsTaskView {
+        let json = serde_json::json!({
+            "present": true,
+            "enabled": true,
+            "current_user": r"DESKTOP\alice",
+            "user": r"DESKTOP\alice",
+            "logon_type": "Interactive",
+            "run_level": "Limited",
+            "triggers": [
+                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "enabled": true}
+            ],
+            "execute": exe,
+            "arguments": args,
+        });
+        windows_parse(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn windows_task_health_requires_full_login_contract() {
+        let exe = r"C:\Apps\wayfinder.exe";
+        let args = windows_task_arguments(r"C:\My Data\wayfinder");
+
+        // Absent task: not healthy.
+        let absent: WindowsTaskView =
+            windows_parse(r#"{"present":false,"current_user":"DESKTOP\\alice"}"#).unwrap();
+        assert!(!windows_task_healthy(&absent, exe, &args));
+
+        // Registered, enabled, exact definition: the only healthy outcome.
+        assert!(windows_task_healthy(
+            &healthy_windows_task(exe, &args),
+            exe,
+            &args
+        ));
+
+        // Registered but Disabled: never healthy.
+        let mut disabled = healthy_windows_task(exe, &args);
+        disabled.enabled = false;
+        assert!(!windows_task_healthy(&disabled, exe, &args));
+
+        // Wrong executable: not healthy.
+        assert!(!windows_task_healthy(
+            &healthy_windows_task(r"C:\Other\wayfinder.exe", &args),
+            exe,
+            &args
+        ));
+
+        // Wrong arguments: not healthy.
+        assert!(!windows_task_healthy(
+            &healthy_windows_task(exe, r#"--data-dir "C:\Other" daemon"#),
+            exe,
+            &args
+        ));
+
+        // Missing or foreign AtLogOn trigger: not healthy.
+        let mut no_trigger = healthy_windows_task(exe, &args);
+        no_trigger.triggers.clear();
+        assert!(!windows_task_healthy(&no_trigger, exe, &args));
+
+        let mut boot_trigger = healthy_windows_task(exe, &args);
+        boot_trigger.triggers[0].trigger_type = "MSFT_TaskBootTrigger".to_owned();
+        assert!(!windows_task_healthy(&boot_trigger, exe, &args));
+
+        // Trigger/principal for another user: not healthy.
+        let mut wrong_trigger_user = healthy_windows_task(exe, &args);
+        wrong_trigger_user.triggers[0].user = Some(r"DESKTOP\bob".to_owned());
+        assert!(!windows_task_healthy(&wrong_trigger_user, exe, &args));
+
+        let mut wrong_user = healthy_windows_task(exe, &args);
+        wrong_user.user = Some(r"DESKTOP\bob".to_owned());
+        assert!(!windows_task_healthy(&wrong_user, exe, &args));
+
+        // Wrong principal semantics: not healthy.
+        let mut elevated = healthy_windows_task(exe, &args);
+        elevated.run_level = Some("Highest".to_owned());
+        assert!(!windows_task_healthy(&elevated, exe, &args));
+    }
+
+    #[test]
+    fn windows_query_is_structured_and_marker_free() {
+        let name = windows_ps("app.usewayfinder.agent.0123456789abcdef");
+        let query = windows_query_script(&name);
+        assert!(query.contains(&name));
+        // Structured object properties, not localized human-readable text.
+        assert!(query.contains("present=$true"));
+        assert!(query.contains("Settings.Enabled"));
+        assert!(query.contains("CimClassName"));
+        assert!(query.contains("LogonType"));
+        assert!(query.contains("ConvertTo-Json"));
+
+        let unregister = windows_unregister_script(&name);
+        assert!(unregister.contains("Unregister-ScheduledTask"));
+        assert!(unregister.contains("SilentlyContinue"));
     }
 
     #[cfg(target_os = "linux")]
