@@ -612,7 +612,7 @@ fn windows_task_healthy(
                 .to_ascii_lowercase()
                 .contains("logontrigger")
                 && windows_same_user(trigger.user_sid.as_deref(), current_sid)
-                && trigger.enabled.unwrap_or(true)
+                && trigger.enabled == Some(true)
                 && trigger.delay.as_deref() == Some("PT30S")
         })
         // The owned startup settings as `New-ScheduledTaskSettingsSet` emits
@@ -1007,6 +1007,20 @@ mod tests {
             delay: Some("PT30S".to_owned()),
         });
         assert!(!windows_task_healthy(&extra_logon, exe, &args));
+
+        // The owned AtLogOn trigger is healthy only when its `Enabled`
+        // property is explicitly true: a disabled trigger and a missing or
+        // unreadable property both fail closed like a missing SID or delay.
+        for (enabled, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let mut task = healthy_windows_task(exe, &args);
+            task.triggers[0].enabled = enabled;
+            assert_eq!(
+                windows_task_healthy(&task, exe, &args),
+                expected,
+                "trigger enabled {enabled:?} must {}pass",
+                if expected { "" } else { "not " }
+            );
+        }
 
         // Trigger/principal for another user: not healthy.
         let mut wrong_trigger_user = healthy_windows_task(exe, &args);
