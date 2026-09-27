@@ -88,7 +88,7 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
                 &serde_json::json!({"chain_id":i.certificate.chain_id,"this_device":i.certificate,"gateway":i.gateway}),
             )?;
         }
-        Command::Daemon => {
+        Command::Daemon { .. } => {
             let _lock = lock_dir(data)?;
             let i = load(data)?;
             let stop = tokio_util::sync::CancellationToken::new();

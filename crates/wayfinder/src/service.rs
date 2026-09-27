@@ -385,6 +385,13 @@ fn native(data: &Path, action: Action) -> Result<()> {
     Ok(())
 }
 
+/// Internal argument appended to the owned Scheduled Task launch. It marks the
+/// process as an OS login-startup launch so it detaches from the console Task
+/// Scheduler allocates: the login agent is a background process and must not
+/// pin a visible terminal window to the user's session. The flag is hidden and
+/// changes nothing for ordinary `daemon` invocations.
+pub(crate) const LOGIN_STARTUP_FLAG: &str = "--login-startup";
+
 // Encode one argv element using Windows CRT quote/backslash rules. PowerShell
 // quoting is a separate outer layer; its single-quoted strings preserve this.
 #[cfg(any(windows, test))]
@@ -414,7 +421,10 @@ fn windows_argument(value: &str) -> String {
 
 #[cfg(any(windows, test))]
 fn windows_task_arguments(data: &str) -> String {
-    format!("--data-dir {} daemon", windows_argument(data))
+    format!(
+        "--data-dir {} daemon {LOGIN_STARTUP_FLAG}",
+        windows_argument(data)
+    )
 }
 
 #[cfg(any(windows, test))]
@@ -428,8 +438,11 @@ fn windows_ps(s: &str) -> String {
 struct WindowsTriggerView {
     #[serde(default, rename = "type")]
     trigger_type: String,
+    /// The trigger user's account resolved to its SID by the query script;
+    /// `null` when the identifier cannot be translated to a SID at all. The raw
+    /// reported text is ignored: identity is the resolved SID only.
     #[serde(default)]
-    user: Option<String>,
+    user_sid: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
 }
@@ -457,11 +470,12 @@ struct WindowsTaskView {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
-    current_user: Option<String>,
-    #[serde(default)]
     current_sid: Option<String>,
+    /// The principal's account resolved to its SID by the query script;
+    /// `null` when the identifier cannot be translated to a SID at all. The raw
+    /// reported text is ignored: identity is the resolved SID only.
     #[serde(default)]
-    user: Option<String>,
+    user_sid: Option<String>,
     #[serde(default)]
     logon_type: Option<String>,
     #[serde(default)]
@@ -486,7 +500,7 @@ fn windows_parse<T: serde::de::DeserializeOwned>(output: &str) -> Result<T> {
 #[cfg(any(windows, test))]
 fn windows_register_script(name: &str, exe: &str, data: &str) -> String {
     format!(
-        "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName {name} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null",
+        "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $t.Delay='PT30S'; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Register-ScheduledTask -TaskName {name} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null",
         windows_ps(exe),
         windows_ps(&windows_task_arguments(data))
     )
@@ -505,21 +519,26 @@ fn windows_unregister_script(name: &str) -> String {
 // the complete action and trigger lists, and explicit element counts so health
 // is judged against the full owned login-start definition rather than mere
 // task existence.
+//
+// Account identifiers are resolved to SIDs inside the query: Windows exposes
+// the same local account as `name`, `MACHINE\name`, or `S-1-5-…`, and only the
+// resolved SID is authoritative for identity. `$rs` accepts a SID string or any
+// account name form; anything unresolvable yields `null`, which fails closed.
 #[cfg(any(windows, test))]
 fn windows_query_script(name: &str) -> String {
     format!(
-        "$n={name}; $i=[System.Security.Principal.WindowsIdentity]::GetCurrent(); $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false; current_user=$i.Name; current_sid=$i.User.Value }} | ConvertTo-Json -Compress }} else {{ $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; current_user=$i.Name; current_sid=$i.User.Value; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
+        "$n={name}; $i=[System.Security.Principal.WindowsIdentity]::GetCurrent(); $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false; current_user=$i.Name; current_sid=$i.User.Value }} | ConvertTo-Json -Compress }} else {{ $rs={{ param($u) if ([string]::IsNullOrWhiteSpace([string]$u)) {{ return $null }} try {{ return (New-Object System.Security.Principal.SecurityIdentifier([string]$u)).Value }} catch {{}} try {{ return (New-Object System.Security.Principal.NTAccount([string]$u)).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ return $null }} }}; $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; user_sid=(& $rs $_.UserId); enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; current_user=$i.Name; current_sid=$i.User.Value; user=[string]$t.Principal.UserId; user_sid=(& $rs $t.Principal.UserId); logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
 }
 
-/// Task Scheduler may expose the same account either as `DOMAIN\name` or as
-/// its SID string; both representations identify the current user, so
-/// principal and trigger users match on either form.
+/// The query script resolves every reported account identifier to its SID
+/// before it reaches this check, so `name`, `MACHINE\name` and the literal SID
+/// form all reduce to one comparison: identity is established only when the
+/// resolved SID equals the current user's SID. An unresolvable or foreign
+/// account never matches.
 #[cfg(any(windows, test))]
-fn windows_same_account(reported: Option<&str>, name: &str, sid: &str) -> bool {
-    reported.is_some_and(|user| {
-        !user.is_empty() && (user.eq_ignore_ascii_case(name) || user.eq_ignore_ascii_case(sid))
-    })
+fn windows_same_user(reported_sid: Option<&str>, current_sid: &str) -> bool {
+    reported_sid.is_some_and(|sid| !sid.is_empty() && sid.eq_ignore_ascii_case(current_sid))
 }
 
 /// Judges a queried task against the exact login-start contract Wayfinder owns:
@@ -538,7 +557,6 @@ fn windows_task_healthy(
     if !view.present {
         return false;
     }
-    let current_user = view.current_user.as_deref().unwrap_or_default();
     let current_sid = view.current_sid.as_deref().unwrap_or_default();
     // The owned contract is exact: one action and one trigger. The explicit
     // counts and the complete arrays must agree, so extra entries cannot hide
@@ -550,7 +568,7 @@ fn windows_task_healthy(
         && single_action
         && action.and_then(|action| action.execute.as_deref()) == Some(expected_executable)
         && action.and_then(|action| action.arguments.as_deref()) == Some(expected_arguments)
-        && windows_same_account(view.user.as_deref(), current_user, current_sid)
+        && windows_same_user(view.user_sid.as_deref(), current_sid)
         && view
             .logon_type
             .as_deref()
@@ -565,10 +583,58 @@ fn windows_task_healthy(
                 .trigger_type
                 .to_ascii_lowercase()
                 .contains("logontrigger")
-                && windows_same_account(trigger.user.as_deref(), current_user, current_sid)
+                && windows_same_user(trigger.user_sid.as_deref(), current_sid)
                 && trigger.enabled.unwrap_or(true)
         })
 }
+
+/// Detach this process from the console its launcher allocated. Task Scheduler
+/// runs console-subsystem executables attached to the interactive console,
+/// which leaves a persistent conhost window on the user's session. For the
+/// owned `--login-startup` launch only, the console is hidden if it already
+/// materialized and then freed outright; standard handles are rebound to NUL
+/// so detached output cannot hit a dead console handle. Ordinary invocations
+/// never call this: CLI and TUI keep their normal console.
+#[cfg(windows)]
+pub(crate) fn detach_console() {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
+        System::Console::{
+            FreeConsole, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetStdHandle,
+        },
+        UI::WindowsAndMessaging::{SW_HIDE, ShowWindow},
+    };
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    unsafe {
+        let window = GetConsoleWindow();
+        if !window.is_null() {
+            ShowWindow(window, SW_HIDE);
+        }
+        FreeConsole();
+        let name: Vec<u16> = "NUL\0".encode_utf16().collect();
+        let null = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        );
+        if !null.is_null() {
+            SetStdHandle(STD_INPUT_HANDLE, null);
+            SetStdHandle(STD_OUTPUT_HANDLE, null);
+            SetStdHandle(STD_ERROR_HANDLE, null);
+        }
+    }
+}
+
+/// Non-Windows launches never own a console to detach from.
+#[cfg(not(windows))]
+pub(crate) fn detach_console() {}
 
 #[cfg(windows)]
 fn windows_run(script: &str) -> Result<()> {
@@ -719,16 +785,22 @@ mod tests {
     #[test]
     fn windows_task_command_lines() {
         for (path, command) in [
-            (r"C:\wayfinder", r#"--data-dir "C:\wayfinder" daemon"#),
+            (
+                r"C:\wayfinder",
+                r#"--data-dir "C:\wayfinder" daemon --login-startup"#,
+            ),
             (
                 r"C:\My Data\wayfinder",
-                r#"--data-dir "C:\My Data\wayfinder" daemon"#,
+                r#"--data-dir "C:\My Data\wayfinder" daemon --login-startup"#,
             ),
-            (r"C:\My Data\", r#"--data-dir "C:\My Data\\" daemon"#),
-            (r"C:\", r#"--data-dir "C:\\" daemon"#),
+            (
+                r"C:\My Data\",
+                r#"--data-dir "C:\My Data\\" daemon --login-startup"#,
+            ),
+            (r"C:\", r#"--data-dir "C:\\" daemon --login-startup"#),
             (
                 r"\\?\C:\My Data\",
-                r#"--data-dir "\\?\C:\My Data\\" daemon"#,
+                r#"--data-dir "\\?\C:\My Data\\" daemon --login-startup"#,
             ),
         ] {
             assert_eq!(windows_task_arguments(path), command);
@@ -762,8 +834,17 @@ mod tests {
         assert!(script.contains("-AtLogOn"));
         assert!(script.contains("-LogonType Interactive -RunLevel Limited"));
         assert!(script.contains("ExecutionTimeLimit ([TimeSpan]::Zero)"));
+        // A short trigger delay and missed-fire catch-up make logon launches
+        // survive ordinary login-session resource timing.
+        assert!(script.contains("$t.Delay='PT30S'"));
+        assert!(script.contains("-StartWhenAvailable"));
         assert!(script.contains(r"-Execute 'C:\My Apps\wayfinder.exe'"));
-        assert!(script.contains(r#"--data-dir "C:\My Data\wayfinder\\" daemon"#));
+        assert!(script.contains(r#"--data-dir "C:\My Data\wayfinder\\" daemon --login-startup"#));
+        // The launch goes through the real binary with the owned background
+        // flag — no shell, wrapper script, or helper executable.
+        assert!(!script.contains("conhost"));
+        assert!(!script.contains("cmd.exe"));
+        assert!(!script.contains("powershell.exe'"));
     }
 
     const TEST_SID: &str = "S-1-5-21-111-222-333-1001";
@@ -775,6 +856,7 @@ mod tests {
             "current_user": r"DESKTOP\alice",
             "current_sid": TEST_SID,
             "user": r"DESKTOP\alice",
+            "user_sid": TEST_SID,
             "logon_type": "Interactive",
             "run_level": "Limited",
             "action_count": 1,
@@ -783,7 +865,7 @@ mod tests {
             ],
             "trigger_count": 1,
             "triggers": [
-                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "enabled": true}
+                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "user_sid": TEST_SID, "enabled": true}
             ],
         });
         windows_parse(&json.to_string()).unwrap()
@@ -857,7 +939,7 @@ mod tests {
         extra_boot.trigger_count = 2;
         extra_boot.triggers.push(WindowsTriggerView {
             trigger_type: "MSFT_TaskBootTrigger".to_owned(),
-            user: None,
+            user_sid: None,
             enabled: Some(true),
         });
         assert!(!windows_task_healthy(&extra_boot, exe, &args));
@@ -868,31 +950,97 @@ mod tests {
         extra_logon.trigger_count = 2;
         extra_logon.triggers.push(WindowsTriggerView {
             trigger_type: "MSFT_TaskLogonTrigger".to_owned(),
-            user: Some(r"DESKTOP\alice".to_owned()),
+            user_sid: Some(TEST_SID.to_owned()),
             enabled: Some(true),
         });
         assert!(!windows_task_healthy(&extra_logon, exe, &args));
 
         // Trigger/principal for another user: not healthy.
         let mut wrong_trigger_user = healthy_windows_task(exe, &args);
-        wrong_trigger_user.triggers[0].user = Some(r"DESKTOP\bob".to_owned());
+        wrong_trigger_user.triggers[0].user_sid = Some("S-1-5-21-111-222-333-1002".to_owned());
         assert!(!windows_task_healthy(&wrong_trigger_user, exe, &args));
 
         let mut wrong_user = healthy_windows_task(exe, &args);
-        wrong_user.user = Some(r"DESKTOP\bob".to_owned());
+        wrong_user.user_sid = Some("S-1-5-21-111-222-333-1002".to_owned());
         assert!(!windows_task_healthy(&wrong_user, exe, &args));
 
         // Wrong principal semantics: not healthy.
         let mut elevated = healthy_windows_task(exe, &args);
         elevated.run_level = Some("Highest".to_owned());
         assert!(!windows_task_healthy(&elevated, exe, &args));
+    }
 
-        // The same account reported by SID instead of name still matches the
-        // principal and trigger user checks.
-        let mut sid_task = healthy_windows_task(exe, &args);
-        sid_task.user = Some(TEST_SID.to_owned());
-        sid_task.triggers[0].user = Some(TEST_SID.to_owned());
-        assert!(windows_task_healthy(&sid_task, exe, &args));
+    /// One task query result as emitted by the script: the raw account text is
+    /// carried for diagnostics, but only the resolved `user_sid` identifies the
+    /// account.
+    fn account_view(user: &str, user_sid: Option<&str>) -> WindowsTaskView {
+        let exe = r"C:\Apps\wayfinder.exe";
+        let args = windows_task_arguments(r"C:\My Data\wayfinder");
+        let json = serde_json::json!({
+            "present": true,
+            "enabled": true,
+            "current_user": r"DESKTOP\alice",
+            "current_sid": TEST_SID,
+            "user": user,
+            "user_sid": user_sid,
+            "logon_type": "Interactive",
+            "run_level": "Limited",
+            "action_count": 1,
+            "actions": [{"execute": exe, "arguments": args}],
+            "trigger_count": 1,
+            "triggers": [{
+                "type": "MSFT_TaskLogonTrigger",
+                "user": user,
+                "user_sid": user_sid,
+                "enabled": true
+            }],
+        });
+        windows_parse(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn windows_identity_uses_resolved_sid_not_account_text() {
+        let exe = r"C:\Apps\wayfinder.exe";
+        let args = windows_task_arguments(r"C:\My Data\wayfinder");
+
+        // Every textual form of the same account resolves to the current SID:
+        // the short local name, MACHINE\name, and the literal SID string.
+        for reported in ["alice", r"DESKTOP\alice", TEST_SID] {
+            let task = account_view(reported, Some(TEST_SID));
+            assert!(
+                windows_task_healthy(&task, exe, &args),
+                "reported form {reported} resolving to the current SID must be healthy"
+            );
+        }
+
+        // A foreign account is never accepted, in any textual form.
+        let foreign_sid = "S-1-5-21-111-222-333-1002";
+        for reported in ["bob", r"DESKTOP\bob", foreign_sid] {
+            let task = account_view(reported, Some(foreign_sid));
+            assert!(
+                !windows_task_healthy(&task, exe, &args),
+                "foreign account {reported} must fail closed"
+            );
+        }
+
+        // Account text that matches the current user's name but resolves to a
+        // different SID (e.g. a domain account shadowing the local name) is a
+        // different identity.
+        let task = account_view("alice", Some("S-1-5-21-999-888-777-500"));
+        assert!(!windows_task_healthy(&task, exe, &args));
+
+        // An identifier that cannot be translated to a SID at all is not the
+        // same identity.
+        let task = account_view("not-an-account", None);
+        assert!(!windows_task_healthy(&task, exe, &args));
+        let task = account_view("not-an-account", Some(""));
+        assert!(!windows_task_healthy(&task, exe, &args));
+
+        // A trigger whose user is foreign while the principal matches: not
+        // healthy, even though the principal check passes.
+        let mut task = account_view("alice", Some(TEST_SID));
+        task.triggers[0].user_sid = Some(foreign_sid.to_owned());
+        assert!(!windows_task_healthy(&task, exe, &args));
     }
 
     #[test]
@@ -911,9 +1059,13 @@ mod tests {
         assert!(query.contains("actions=$a"));
         assert!(query.contains("trigger_count=$tr.Count"));
         assert!(query.contains("triggers=$tr"));
-        // Name and SID forms of the current user for robust account matching.
+        // Name and SID forms of the current user for robust account matching,
+        // with principal/trigger accounts resolved to SIDs inside the query.
         assert!(query.contains("current_user=$i.Name"));
         assert!(query.contains("current_sid=$i.User.Value"));
+        assert!(query.contains("user_sid="));
+        assert!(query.contains("SecurityIdentifier"));
+        assert!(query.contains("NTAccount"));
 
         let unregister = windows_unregister_script(&name);
         assert!(unregister.contains("Unregister-ScheduledTask"));
