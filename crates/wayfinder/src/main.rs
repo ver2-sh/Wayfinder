@@ -28,7 +28,12 @@ enum Command {
         command: ChainCommand,
     },
     /// Run the outbound agent as this OS user. Remote commands have the same privileges.
-    Daemon,
+    Daemon {
+        /// Internal: marks the OS login-startup launch (background process, no
+        /// console window on Windows). Not for interactive use.
+        #[arg(long, hide = true)]
+        login_startup: bool,
+    },
     Status,
     /// Interactive management of this device and chain.
     Tui,
@@ -106,6 +111,11 @@ enum AuthCommand {
 }
 #[tokio::main]
 async fn main() {
+    // The login-startup launch runs before anything can write to the inherited
+    // console; detach before runtime work so no console window stays visible.
+    if std::env::args_os().any(|arg| arg == service::LOGIN_STARTUP_FLAG) {
+        service::detach_console();
+    }
     if let Err(e) = run().await {
         eprintln!("Wayfinder: {e:#}");
         std::process::exit(1);
@@ -148,5 +158,26 @@ mod tests {
                 .kind(),
             clap::error::ErrorKind::DisplayVersion
         );
+    }
+
+    #[test]
+    fn daemon_login_startup_flag_is_internal() {
+        // Ordinary `daemon` keeps its exact current shape.
+        let cli = Cli::try_parse_from(["wayfinder", "daemon"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon {
+                login_startup: false
+            })
+        ));
+        // The owned login-startup marker parses only on the daemon command.
+        let cli = Cli::try_parse_from(["wayfinder", "daemon", "--login-startup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon {
+                login_startup: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["wayfinder", "status", "--login-startup"]).is_err());
     }
 }
