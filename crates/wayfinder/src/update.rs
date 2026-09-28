@@ -45,14 +45,14 @@ impl State {
 }
 fn updater(receipt: bool) -> Result<AxoUpdater> {
     let mut u = AxoUpdater::new_for("wayfinder");
+    // Capture diagnostics for errors without corrupting a live TUI or CLI output.
+    u.disable_installer_output();
     u.set_client(
         update_http::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()?,
     );
     if receipt {
-        // axoupdater uses process-scoped PowerShell Bypass on Windows. It does
-        // not persist policy changes; MachinePolicy/UserPolicy take precedence.
         u.load_receipt().context("No direct-install receipt. Upgrade using the package manager or source/manual installation method that owns this binary")?;
         ensure!(
             u.check_receipt_is_for_this_executable()?,
@@ -72,6 +72,7 @@ pub fn ensure_owned() -> Result<()> {
     updater(true)?;
     Ok(())
 }
+
 pub async fn check(data: &Path, force: bool) -> Result<State> {
     private_dir(data)?;
     let path = data.join("update-check.json");
@@ -118,24 +119,81 @@ pub async fn check(data: &Path, force: bool) -> Result<State> {
     })
     .await;
     match result {
-        Ok(Ok(latest))=>{state.latest=latest;state.error=None;}
-        _=>state.error=Some("release channel inaccessible (private repository, no release, network failure or rate limit). Agent operation is unaffected".into()),
+        Ok(Ok(latest)) => {
+            state.latest = latest;
+            state.error = None;
+        }
+        _ => {
+            state.error = Some(
+                "release channel inaccessible (private repository, no release, network failure or rate limit). Agent operation is unaffected".into(),
+            );
+        }
     }
     atomic_write(&path, &state)?;
     Ok(state)
 }
 pub async fn install(data: &Path) -> Result<()> {
-    install_quiet(data).await?;
+    use std::io::IsTerminal;
+    let executable = std::env::current_exe()?;
+    let prepared = prepare().await?;
+    install_quiet(data, prepared).await?;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return relaunch(&executable, data);
+    }
     println!("Updated. Exit and reopen Wayfinder to use the new version.");
     Ok(())
 }
-pub async fn install_quiet(data: &Path) -> Result<()> {
+
+pub fn relaunch(executable: &Path, data: &Path) -> Result<()> {
+    let mut command = std::process::Command::new(executable);
+    // Preserve the selected identity, but never replay the update command.
+    command.arg("--data-dir").arg(data);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec()).context("Wayfinder updated, but restarting the app failed")
+    }
+    #[cfg(not(unix))]
+    {
+        // Let the new app inherit the console and the old process exit immediately.
+        command
+            .spawn()
+            .context("Wayfinder updated, but restarting the app failed")?;
+        Ok(())
+    }
+}
+pub struct PreparedUpdate {
+    updater: AxoUpdater,
+    #[cfg(windows)]
+    target: semver::Version,
+    #[cfg(windows)]
+    executable: std::path::PathBuf,
+}
+
+pub async fn prepare() -> Result<PreparedUpdate> {
     let mut u = updater(true)?;
     // Complete discovery before interrupting any agent. axoupdater retains this exact release.
+    let target = tokio::time::timeout(Duration::from_secs(30), u.query_new_version())
+        .await
+        .context("Release discovery timed out")?
+        .context("Release discovery failed")?
+        .context("No stable release")?
+        .to_string()
+        .parse::<semver::Version>()?;
     ensure!(
-        tokio::time::timeout(Duration::from_secs(30), u.is_update_needed()).await??,
+        target.pre.is_empty() && target > semver::Version::parse(CURRENT)?,
         "No newer stable release"
     );
+    Ok(PreparedUpdate {
+        updater: u,
+        #[cfg(windows)]
+        target,
+        #[cfg(windows)]
+        executable: std::env::current_exe()?.canonicalize()?,
+    })
+}
+
+pub async fn install_quiet(data: &Path, mut prepared: PreparedUpdate) -> Result<()> {
     let restart = crate::service::agent_running(data)?;
     if restart {
         ensure!(
@@ -149,17 +207,23 @@ pub async fn install_quiet(data: &Path) -> Result<()> {
             crate::service::wait_stopped(data).await?;
         }
         let _lock = wayfinder_core::lock_dir(data)?;
-        ensure!(
-            u.run()
-                .await
-                .context(if cfg!(windows) {
-                    "Update failed; identity and configuration were not changed. If PowerShell reports an organizational MachinePolicy/UserPolicy restriction, contact your administrator; Wayfinder does not override Group Policy or change persistent execution policy"
-                } else {
-                    "Update failed; user identity and configuration were not changed"
-                })?
-                .is_some(),
-            "No binary replacement was performed"
-        );
+        match prepared.updater.run().await {
+            Ok(result) => ensure!(result.is_some(), "No binary replacement was performed"),
+            #[cfg(windows)]
+            Err(error @ axoupdater::AxoupdateError::CleanupFailed {}) => {
+                if let Err(verification) =
+                    verify_installed(&prepared.target, &prepared.executable).await
+                {
+                    let context = format!(
+                        "Update cleanup failed: {error}; post-install verification failed: {verification:#}"
+                    );
+                    return Err(anyhow::Error::new(error).context(context));
+                }
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("Application update failed"));
+            }
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -170,6 +234,126 @@ pub async fn install_quiet(data: &Path) -> Result<()> {
         );
     }
     result?;
+    Ok(())
+}
+
+// Keep this lookup aligned with axoupdater 0.10.2's private receipt resolver:
+// overrides are directories, and the first existing receipt wins even if invalid.
+#[cfg(windows)]
+fn receipt_path() -> Result<std::path::PathBuf> {
+    use std::{env, path::PathBuf};
+    let paths = if env::var("AXOUPDATER_CONFIG_WORKING_DIR").is_ok() {
+        let path = env::current_dir()?;
+        ensure!(path.to_str().is_some(), "Receipt directory is not UTF-8");
+        vec![path]
+    } else if let Ok(path) = env::var("AXOUPDATER_CONFIG_PATH") {
+        vec![PathBuf::from(path)]
+    } else {
+        let mut paths = Vec::new();
+        if let Ok(path) = env::var("XDG_CONFIG_HOME") {
+            let path = PathBuf::from(path).join("wayfinder");
+            if path.exists() {
+                paths.push(path);
+            }
+        }
+        if let Ok(path) = env::var("LOCALAPPDATA") {
+            paths.push(PathBuf::from(path).join("wayfinder"));
+        }
+        paths
+    };
+    paths
+        .into_iter()
+        .map(|path| path.join("wayfinder-receipt.json"))
+        .find(|path| path.exists())
+        .context("No Wayfinder install receipt found after installation")
+}
+
+#[cfg(windows)]
+async fn verify_installed(target: &semver::Version, executable: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Provider {
+        source: String,
+        version: String,
+    }
+    #[derive(Deserialize)]
+    struct Receipt {
+        source: ReleaseSource,
+        provider: Provider,
+        version: String,
+        binaries: Vec<String>,
+        #[serde(default)]
+        cdylibs: Vec<String>,
+        #[serde(default)]
+        cstaticlibs: Vec<String>,
+        install_layout: String,
+        install_prefix: std::path::PathBuf,
+    }
+    let path = receipt_path()?;
+    let receipt: Receipt = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("Reading receipt {}", path.display()))?,
+    )
+    .with_context(|| format!("Parsing receipt {}", path.display()))?;
+    ensure!(
+        receipt.source.release_type == ReleaseSourceType::GitHub
+            && receipt.source.owner == OWNER
+            && receipt.source.name == REPOSITORY
+            && receipt.source.app_name == "wayfinder",
+        "Receipt is not from the official Wayfinder GitHub source"
+    );
+    ensure!(
+        receipt.provider.source == "cargo-dist",
+        "Receipt provider is not cargo-dist"
+    );
+    semver::Version::parse(&receipt.provider.version)
+        .context("Invalid cargo-dist provider version")?;
+    ensure!(
+        semver::Version::parse(&receipt.version).context("Invalid receipt version")? == *target,
+        "Receipt version does not match target {target}"
+    );
+    ensure!(
+        receipt.binaries == ["wayfinder.exe"]
+            && receipt.cdylibs.is_empty()
+            && receipt.cstaticlibs.is_empty()
+            && receipt.install_layout == "cargo-home",
+        "Receipt must contain only wayfinder.exe in cargo-home layout, without libraries"
+    );
+    let installed = receipt
+        .install_prefix
+        .join("bin")
+        .join("wayfinder.exe")
+        .canonicalize()
+        .context("Resolving receipt executable")?;
+    ensure!(
+        installed == executable,
+        "Receipt executable does not match the captured executable"
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(executable)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("Installed executable --version timed out")?
+    .context("Running installed executable --version")?;
+    ensure!(
+        output.status.success(),
+        "Installed executable --version failed: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = std::str::from_utf8(&output.stdout).context("Version output is not UTF-8")?;
+    // clap terminates its one-line version output with a newline.
+    let version = stdout
+        .strip_suffix("\r\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .unwrap_or(stdout);
+    ensure!(
+        version == format!("wayfinder {target}"),
+        "Unexpected installed version output: {stdout:?}"
+    );
     Ok(())
 }
 

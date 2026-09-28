@@ -617,6 +617,7 @@ fn start_if_needed(data: &Path, owned: &mut Option<TemporaryAgent>) -> Result<()
 }
 
 pub async fn run(data: &Path) -> Result<()> {
+    let executable = std::env::current_exe()?;
     let _restore = Restore;
     terminal::enable_raw_mode()?;
     crossterm::execute!(
@@ -629,7 +630,14 @@ pub async fn run(data: &Path) -> Result<()> {
     let mut owned = None;
     let result = session(data, &mut screen, &mut owned).await;
     let stopped = stop_owned(&mut owned).await;
-    result.and(stopped.map(|_| ()))
+    drop(screen);
+    drop(_restore);
+    let restart = result?;
+    stopped?;
+    if restart {
+        update::relaunch(&executable, data)?;
+    }
+    Ok(())
 }
 
 // Keep servicing the terminal during actions. Mutations finish before quitting so ownership
@@ -799,14 +807,19 @@ async fn perform(
             return Ok("This device migrated. Authorize MCP separately at the destination.".into());
         }
         Task::Install => {
-            update::ensure_owned()?;
+            let prepared = update::prepare().await?;
             let restart = stop_owned(owned).await?;
-            let result = update::install_quiet(data).await;
-            if restart {
-                start_if_needed(data, owned)?;
+            let result = update::install_quiet(data, prepared).await;
+            if restart
+                && result.is_err()
+                && let Err(error) = start_if_needed(data, owned)
+            {
+                return Err(result
+                    .unwrap_err()
+                    .context(format!("Temporary agent restart also failed: {error:#}")));
             }
             result?;
-            return Ok("Updated. Quit and reopen Wayfinder to use the new version.".into());
+            return Ok("Updated. Restarting Wayfinder…".into());
         }
         Task::Enroll {
             name,
@@ -848,7 +861,7 @@ async fn session(
     data: &Path,
     screen: &mut Screen,
     owned: &mut Option<TemporaryAgent>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut ui = Ui::new();
     if let Err(e) = start_if_needed(data, owned) {
         ui.message = format!("Agent startup: {e:#}");
@@ -1093,7 +1106,7 @@ async fn session(
                 }
                 KeyCode::Char('i') if ui.section == 6 => {
                     if ui.update.as_ref().is_some_and(|s| s.available()) {
-                        ui.confirm(Task::Install,"Install update? Active commands may be interrupted. Reopen Wayfinder afterward.".into());
+                        ui.confirm(Task::Install,"Install update and restart Wayfinder? Active commands may be interrupted.".into());
                     } else {
                         ui.message = "No available update. C checks the release channel.".into();
                     }
@@ -1231,8 +1244,12 @@ async fn session(
                 }
             } else {
                 let phrase = std::mem::replace(&mut saved_phrase, Zeroizing::new(String::new()));
+                let installing = matches!(&task, Task::Install);
                 match busy(&mut ui, screen, false, perform(data, task, phrase, owned)).await {
                     Ok((message, quit)) => {
+                        if installing {
+                            return Ok(true);
+                        }
                         ui.message = message;
                         if quit {
                             break;
@@ -1254,7 +1271,7 @@ async fn session(
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
