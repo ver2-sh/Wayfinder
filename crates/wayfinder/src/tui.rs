@@ -1480,42 +1480,49 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn configure_startup_never_touches_the_running_agent() {
+    #[test]
+    fn configure_startup_never_touches_the_running_agent() {
+        // Serialize shared service-test state outside the async future.
         let _guard = service::test_lock();
-        let root = std::env::temp_dir().join(format!(
-            "wayfinder-tui-test-{}",
-            wayfinder_core::random_secret()
-        ));
-        let data = root.join("data");
-        let units = root.join("units");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&units).unwrap();
-        std::fs::write(data.join("installation.json"), b"{}").unwrap();
-        service::test_set_units_dir(&units);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "wayfinder-tui-test-{}",
+                    wayfinder_core::random_secret()
+                ));
+                let data = root.join("data");
+                let units = root.join("units");
+                std::fs::create_dir_all(&data).unwrap();
+                std::fs::create_dir_all(&units).unwrap();
+                std::fs::write(data.join("installation.json"), b"{}").unwrap();
+                service::test_set_units_dir(&units);
 
-        let mut owned = Some(TemporaryAgent::stub());
-        let phrase = || Zeroizing::new(String::new());
-        perform(&data, Task::ConfigureStartup(true), phrase(), &mut owned)
-            .await
-            .unwrap();
-        assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
-        assert!(service::installed(&data).unwrap());
-        perform(&data, Task::ConfigureStartup(false), phrase(), &mut owned)
-            .await
-            .unwrap();
-        assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
-        assert!(!service::installed(&data).unwrap());
+                let mut owned = Some(TemporaryAgent::stub());
+                let phrase = || Zeroizing::new(String::new());
+                perform(&data, Task::ConfigureStartup(true), phrase(), &mut owned)
+                    .await
+                    .unwrap();
+                assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
+                assert!(service::installed(&data).unwrap());
+                perform(&data, Task::ConfigureStartup(false), phrase(), &mut owned)
+                    .await
+                    .unwrap();
+                assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
+                assert!(!service::installed(&data).unwrap());
 
-        // Unenrolled data directories cannot register login startup.
-        let bare = root.join("bare");
-        std::fs::create_dir_all(&bare).unwrap();
-        assert!(
-            perform(&bare, Task::ConfigureStartup(true), phrase(), &mut owned)
-                .await
-                .is_err()
-        );
-        assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
-        let _ = std::fs::remove_dir_all(&root);
+                // Unenrolled data directories cannot register login startup.
+                let bare = root.join("bare");
+                std::fs::create_dir_all(&bare).unwrap();
+                assert!(
+                    perform(&bare, Task::ConfigureStartup(true), phrase(), &mut owned)
+                        .await
+                        .is_err()
+                );
+                assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
+                let _ = std::fs::remove_dir_all(&root);
+            });
     }
 }
