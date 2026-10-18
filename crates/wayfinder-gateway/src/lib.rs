@@ -19,6 +19,9 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use wayfinder_core::code::{
+    CODE_SESSION_VERSION, CodeInput, CodeResult, DEFAULT_TIMEOUT, OUTPUT_LIMIT,
+};
 use wayfinder_core::{
     credentials::{ClientIdentity, CredentialStore},
     identity::{Certificate, Role, verify},
@@ -26,6 +29,12 @@ use wayfinder_core::{
     *,
 };
 type Key = (String, String);
+struct CodeDispatch {
+    id: String,
+    input: CodeInput,
+    response: oneshot::Sender<CodeResult>,
+    cancel: CancellationToken,
+}
 struct Dispatch {
     id: String,
     input: ExecInput,
@@ -36,6 +45,7 @@ struct Dispatch {
 /// service-stream request.
 enum AgentEvent {
     Exec(Dispatch),
+    Code(CodeDispatch),
     Service {
         id: String,
         source: String,
@@ -54,6 +64,7 @@ struct Pending {
 #[derive(Clone)]
 struct Session {
     generation: String,
+    code: bool,
     send: mpsc::Sender<AgentEvent>,
     stop: CancellationToken,
 }
@@ -126,7 +137,17 @@ impl Gateway {
                     .get(&(chain.into(), d.id.clone()))
                     .is_some_and(|s| !s.stop.is_cancelled());
         }
-        Ok(serde_json::to_value(devices)?)
+        let mut value = serde_json::to_value(devices)?;
+        if let Some(devices) = value.as_array_mut() {
+            for device in devices {
+                let supported = device["id"]
+                    .as_str()
+                    .and_then(|id| sessions.get(&(chain.to_owned(), id.to_owned())))
+                    .is_some_and(|session| session.code && !session.stop.is_cancelled());
+                device["code_intelligence"] = serde_json::Value::Bool(supported);
+            }
+        }
+        Ok(value)
     }
     fn operate(&self, s: SignedOperation) -> Result<serde_json::Value> {
         let _administration = self.administration.lock().unwrap();
@@ -224,13 +245,14 @@ impl Gateway {
     async fn authenticate(
         &self,
         socket: &mut WebSocket,
+        version: u32,
     ) -> Result<(Certificate, PlatformDescriptor)> {
         tokio::time::timeout(Duration::from_secs(5), async {
             let nonce = random_secret();
             send(
                 socket,
                 &Frame::Challenge {
-                    version: SESSION_VERSION,
+                    version,
                     gateway: self.issuer.clone(),
                     nonce: nonce.clone(),
                 },
@@ -248,7 +270,7 @@ impl Gateway {
             certificate.verify()?;
             verify(
                 &certificate.device_public,
-                &session_proof(&self.issuer, &nonce, &certificate, &metadata)?,
+                &session_proof_for(version, &self.issuer, &nonce, &certificate, &metadata)?,
                 &signature,
             )?;
             Ok::<_, anyhow::Error>((certificate, metadata))
@@ -259,8 +281,9 @@ impl Gateway {
         self: Arc<Self>,
         mut socket: WebSocket,
         handshake: tokio::sync::OwnedSemaphorePermit,
+        version: u32,
     ) -> Result<()> {
-        let (certificate, metadata) = self.authenticate(&mut socket).await?;
+        let (certificate, metadata) = self.authenticate(&mut socket, version).await?;
         drop(handshake);
         let _permit = self.connections.clone().try_acquire_owned()?;
         let key = (certificate.chain_id.clone(), certificate.device_id.clone());
@@ -285,6 +308,7 @@ impl Gateway {
                 key.clone(),
                 Session {
                     generation: generation.clone(),
+                    code: version == CODE_SESSION_VERSION,
                     send: tx,
                     stop: stop.clone(),
                 },
@@ -333,6 +357,8 @@ impl Gateway {
         send(socket, &Frame::Ready).await?;
         let mut pending: HashMap<String, (oneshot::Sender<ExecResult>, CancellationToken)> =
             HashMap::new();
+        let mut code_pending: HashMap<String, (oneshot::Sender<CodeResult>, CancellationToken)> =
+            HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last = tokio::time::Instant::now();
         let mut heartbeat = 0;
@@ -351,6 +377,8 @@ impl Gateway {
                         pending.remove(&id);
                         send(socket, &Frame::Cancel { id }).await?;
                     }
+                    let cancelled: Vec<_> = code_pending.iter().filter(|(_, (_, cancel))| cancel.is_cancelled()).map(|(id, _)| id.clone()).collect();
+                    for id in cancelled { code_pending.remove(&id); send(socket, &Frame::Cancel { id }).await?; }
                 },
                 event = rx.recv() => {
                     let Some(e) = event else { break };
@@ -358,9 +386,15 @@ impl Gateway {
                     match e {
                         AgentEvent::Exec(d) => {
                             if d.cancel.is_cancelled() { continue; }
-                            ensure!(pending.len() < 64, "Execution capacity reached");
+                            if pending.len() + code_pending.len() >= 64 { let _ = d.response.send(ExecResult::failed(c.device_id.clone(), "Execution capacity reached")); continue; }
                             send(socket, &Frame::Exec { id: d.id.clone(), input: d.input }).await?;
                             pending.insert(d.id, (d.response, d.cancel));
+                        },
+                        AgentEvent::Code(d) => {
+                            if d.cancel.is_cancelled() { continue; }
+                            if pending.len() + code_pending.len() >= 64 { let _ = d.response.send(CodeResult::failed(&d.input, "Execution capacity reached")); continue; }
+                            send(socket, &Frame::Code { id: d.id.clone(), input: d.input }).await?;
+                            code_pending.insert(d.id, (d.response, d.cancel));
                         },
                         AgentEvent::Service { id, source, service } => {
                             send(socket, &Frame::ServiceRequest { version: SERVICE_VERSION, id, source, service }).await?;
@@ -371,6 +405,14 @@ impl Gateway {
                     Frame::Pong => { last = tokio::time::Instant::now(); self.store.register(c, None)?; },
                     Frame::Result { id, result } => {
                         if let Some((tx, _)) = pending.remove(&id) { let _ = tx.send(result); }
+                    },
+                    Frame::CodeResult { id, mut result } => {
+                        if let Some((tx, _)) = code_pending.remove(&id) {
+                            if serde_json::to_vec(&result)?.len() > OUTPUT_LIMIT {
+                                result.result = None; result.error = Some("Code result exceeds 1 MiB; inspect edits before repeating the operation".into()); result.outcome_unknown = true;
+                            }
+                            let _ = tx.send(result);
+                        }
                     },
                     Frame::ServiceReject { id, error } => {
                         let key = (c.chain_id.clone(), id);
@@ -394,7 +436,7 @@ impl Gateway {
         mut socket: WebSocket,
         handshake: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()> {
-        let (certificate, _) = self.authenticate(&mut socket).await?;
+        let (certificate, _) = self.authenticate(&mut socket, SESSION_VERSION).await?;
         drop(handshake);
         let _permit = self.connections.clone().try_acquire_owned()?;
         self.store.active(&certificate)?;
@@ -655,7 +697,22 @@ async fn receive(s: &mut WebSocket) -> Result<Frame> {
         }
     }
 }
-async fn upgrade(State(g): State<Arc<Gateway>>, ws: WebSocketUpgrade) -> Response {
+async fn upgrade(
+    State(g): State<Arc<Gateway>>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if headers.get_all("x-wayfinder-agent-protocol").iter().count() > 1 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let version = match headers
+        .get("x-wayfinder-agent-protocol")
+        .and_then(|v| v.to_str().ok())
+    {
+        None | Some("2") => SESSION_VERSION,
+        Some("3") => CODE_SESSION_VERSION,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let Ok(permit) = g.handshakes.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -663,7 +720,7 @@ async fn upgrade(State(g): State<Arc<Gateway>>, ws: WebSocketUpgrade) -> Respons
     ws.max_message_size(16 * 1024 * 1024)
         .max_frame_size(16 * 1024 * 1024)
         .on_upgrade(move |s| async move {
-            let _ = g.connection(s, permit).await;
+            let _ = g.connection(s, permit, version).await;
         })
 }
 async fn challenge(State(g): State<Arc<Gateway>>) -> Response {
@@ -720,6 +777,45 @@ impl Drop for CancelOnDrop {
     }
 }
 impl wayfinder_mcp::Routing for Gateway {
+    fn code<'a>(
+        &'a self,
+        client: ClientIdentity,
+        mut input: CodeInput,
+        cancel: CancellationToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CodeResult> + Send + 'a>> {
+        Box::pin(async move {
+            let mut dispatched = false;
+            let result: Result<CodeResult> = async {
+                ensure!(client.permissions.contains(&wayfinder_core::credentials::Capability::Exec), "Execution permission required for code intelligence");
+                input.validate()?;
+                let devices = self.store.devices(&client.chain_id)?;
+                let matches: Vec<_> = devices.iter().filter(|d| !d.revoked && (d.id == input.target || d.name == input.target)).collect();
+                ensure!(matches.len() == 1, "Target missing or ambiguous in this Sync Chain");
+                input.target = matches[0].id.clone();
+                let session = self.sessions.lock().unwrap().get(&(client.chain_id.clone(), input.target.clone())).cloned().ok_or_else(|| anyhow::anyhow!("Device offline"))?;
+                ensure!(session.code, "This device's agent does not support code intelligence; update Wayfinder on that device");
+                ensure!(!cancel.is_cancelled(), "Code operation cancelled before dispatch");
+                let local = cancel.child_token(); let _cleanup = CancelOnDrop(local.clone());
+                let (tx, rx) = oneshot::channel();
+                let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT) + 15000;
+                session.send.try_send(AgentEvent::Code(CodeDispatch { id: random_secret(), input: input.clone(), response: tx, cancel: local })).map_err(|_| anyhow::anyhow!("Device unavailable or busy"))?;
+                dispatched = true;
+                tokio::select! {
+                    _ = cancel.cancelled() => anyhow::bail!("Code operation cancelled; dispatch may have occurred. No automatic retry"),
+                    response = tokio::time::timeout(Duration::from_millis(timeout), rx) => {
+                        let mut result = response.map_err(|_| anyhow::anyhow!("Outcome unknown: response deadline exceeded. No automatic retry"))?.map_err(|_| anyhow::anyhow!("Outcome unknown: device disconnected. No automatic retry"))?;
+                        result.target = input.target.clone(); Ok(result)
+                    }
+                }
+            }.await;
+            result.unwrap_or_else(|error| {
+                let mut result = CodeResult::failed(&input, error);
+                result.outcome_unknown = dispatched;
+                result
+            })
+        })
+    }
+
     fn nodes<'a>(
         &'a self,
         chain: &'a str,
@@ -778,6 +874,7 @@ mod tests {
         let (send, _) = mpsc::channel(1);
         let session = Session {
             generation: random_secret(),
+            code: false,
             send,
             stop: CancellationToken::new(),
         };
@@ -818,6 +915,132 @@ mod tests {
         );
         drop(restarted);
         drop(g);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn code_routing_requires_exec_and_authenticated_capability_without_retry() -> Result<()> {
+        use wayfinder_core::credentials::Capability;
+        use wayfinder_mcp::Routing;
+        let dir = std::env::temp_dir().join(format!("wayfinder-code-routing-{}", random_secret()));
+        let store = Arc::new(CredentialStore::open(dir.join("registry.sqlite"))?);
+        let gateway = Gateway::new("http://127.0.0.1:12345".into(), store.clone())?;
+        let root = identity::new_key();
+        let device = identity::new_key();
+        let certificate = Certificate::issue(&root, &device, "code-target".into(), Role::Admin)?;
+        let nonce = gateway.challenge();
+        store.admit(
+            &security::Admission {
+                certificate: certificate.clone(),
+                signature: identity::sign(
+                    &root,
+                    &security::admission_proof(&certificate, &gateway.issuer, &nonce)?,
+                ),
+                nonce,
+            },
+            &gateway.issuer,
+            now() + 30,
+        )?;
+        store.register(&certificate, None)?;
+        let (send, mut receive) = mpsc::channel(4);
+        let mut session = Session {
+            generation: random_secret(),
+            code: false,
+            send,
+            stop: CancellationToken::new(),
+        };
+        let key = (certificate.chain_id.clone(), certificate.device_id.clone());
+        gateway
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session.clone());
+        let mut client = ClientIdentity {
+            id: random_secret(),
+            chain_id: certificate.chain_id.clone(),
+            name: "test".into(),
+            client_id: "test".into(),
+            permissions: std::collections::BTreeSet::from([Capability::Read]),
+            created: now(),
+            revoked: None,
+        };
+        let input = CodeInput {
+            target: "code-target".into(),
+            action: wayfinder_core::code::CodeAction::Status,
+            project: None,
+            tool: None,
+            arguments: None,
+            timeout: Some(1000),
+        };
+        assert!(
+            Routing::code(
+                &*gateway,
+                client.clone(),
+                input.clone(),
+                CancellationToken::new()
+            )
+            .await
+            .is_error()
+        );
+        client.permissions.insert(Capability::Exec);
+        assert!(
+            Routing::code(
+                &*gateway,
+                client.clone(),
+                input.clone(),
+                CancellationToken::new()
+            )
+            .await
+            .error
+            .unwrap()
+            .contains("update")
+        );
+        assert!(receive.try_recv().is_err());
+        session.code = true;
+        gateway.sessions.lock().unwrap().insert(key, session);
+        let mut foreign = client.clone();
+        foreign.chain_id = random_secret();
+        assert!(
+            Routing::code(&*gateway, foreign, input.clone(), CancellationToken::new())
+                .await
+                .is_error()
+        );
+        assert!(receive.try_recv().is_err());
+        let operation = Routing::code(
+            &*gateway,
+            client.clone(),
+            input.clone(),
+            CancellationToken::new(),
+        );
+        let backend = async {
+            let Some(AgentEvent::Code(dispatch)) = receive.recv().await else {
+                panic!("expected one code dispatch")
+            };
+            assert_eq!(dispatch.input.target, certificate.device_id);
+            let mut result = CodeResult::success(
+                &dispatch.input,
+                serde_json::json!({"isError":false,"content":[]}),
+            );
+            result.target = "spoofed".into();
+            assert!(dispatch.response.send(result).is_ok());
+        };
+        let (result, ()) = tokio::join!(operation, backend);
+        assert!(!result.is_error());
+        assert_eq!(result.target, certificate.device_id);
+        let operation = Routing::code(&*gateway, client, input, CancellationToken::new());
+        let disconnect = async {
+            let Some(AgentEvent::Code(dispatch)) = receive.recv().await else {
+                panic!("expected code dispatch")
+            };
+            drop(dispatch.response);
+        };
+        let (result, ()) = tokio::join!(operation, disconnect);
+        assert!(result.is_error());
+        assert!(result.outcome_unknown);
+        assert!(receive.try_recv().is_err());
+        drop(receive);
+        drop(gateway);
         drop(store);
         std::fs::remove_dir_all(dir)?;
         Ok(())

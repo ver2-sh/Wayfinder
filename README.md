@@ -24,9 +24,8 @@ protocol. Neither mode needs email, passwords or a Wayfinder account. Apache-2.0
 
 ## Install the agent
 
-**Public but unreleased today:** the source repository is public, but consumer
-downloads and update checks are not yet available. The following is the intended
-release installation path once the first public release exists; it requires no
+Wayfinder is distributed through public release archives and installers. The
+following installation path requires no
 Rust, Cargo, compiler or repository checkout. `usewayfinder.app` is the stable public install front door and redirects
 to the corresponding public GitHub Release assets. Do not supply private
 credentials to installer commands.
@@ -171,7 +170,7 @@ initiated and recognize; type `yes` locally. Refresh the browser page to return 
 the MCP client. Requests expire after ten minutes and can only be approved once.
 **Never enter your recovery phrase in the browser or ChatGPT.**
 
-`read` allows device discovery. `exec` allows arbitrary shell execution on chain
+`read` allows device discovery. `exec` allows arbitrary shell execution and code-intelligence operations on chain
 devices with the agent's OS privileges. A root agent executes commands as root.
 There is no command sandbox. Chain isolation does not alter this OS boundary.
 Access tokens expire after one hour; rotating refresh tokens last up to 30 days.
@@ -235,6 +234,14 @@ The previous source-building, `/usr/local/bin`, system-level installer is remove
 If you previously deployed it, deliberately stop/disable its old system unit as
 administrator before enabling user startup. Existing identities are retained;
 there is no automatic privilege or installation migration.
+
+## Code intelligence
+
+Wayfinder exposes a `code` MCP tool on supported devices: semantic navigation, references, diagnostics, structured edits, refactoring, file tools and persistent project memories. Give it a device and an absolute project directory; `action=tools` discovers the available `code_*` operations and `action=call` runs one. The agent prepares its private runtime automatically on first use. No separate account, MCP connection, dashboard or backend configuration is required.
+
+**Settings → Code intelligence** enables/disables the feature and can prepare the runtime ahead of first use. `wayfinder code status`, `prepare`, `update`, `auto-updates`, `rollback`, `enable`, `disable`, `clean` and `licenses` provide the same local management for scripts. All remote code operations require the existing `exec` grant and run with the agent's OS privileges; `read` remains device discovery only.
+
+See [code intelligence](docs/code-intelligence.md) for lifecycle, language prerequisites, private storage, wire compatibility and third-party notices.
 
 ## Updates
 

@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.7"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -22,7 +22,7 @@ fs2 = "0.4"
 hex = "0.4"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rmcp = { version = "3.3.0", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.3.0", features = ["server", "client", "macros", "transport-streamable-http-server", "transport-child-process"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,6 +45,7 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 rpassword = "7"
 wayfinder-agent = { path = "crates/wayfinder-agent" }
+wayfinder-code = { path = "crates/wayfinder-code" }
 wayfinder-gateway = { path = "crates/wayfinder-gateway" }
 
 [profile.dist]

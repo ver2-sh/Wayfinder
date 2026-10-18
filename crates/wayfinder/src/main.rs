@@ -6,6 +6,7 @@ use std::{
 };
 use wayfinder_core::{default_data_dir, identity::DEFAULT_GATEWAY};
 mod app;
+mod code;
 mod service;
 mod tui;
 mod update;
@@ -22,6 +23,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Manage this device's private, on-demand code-intelligence runtime.
+    Code {
+        #[command(subcommand)]
+        command: code::Action,
+    },
     /// Create or join a Sync Chain; recovery secrets never belong in arguments.
     Chain {
         #[command(subcommand)]

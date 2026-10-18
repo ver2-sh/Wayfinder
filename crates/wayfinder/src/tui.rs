@@ -83,6 +83,9 @@ enum Task {
     Approve(String, String),
     Service(Action),
     ConfigureStartup(bool),
+    ConfigureCode(bool),
+    ConfigureCodeUpdates(bool),
+    PrepareCode,
     Install,
     Migrate(String),
     Enroll {
@@ -368,6 +371,18 @@ impl Ui {
                     ),
                 ],
                 7 => vec![
+                    ("Toggle code intelligence (C)", KeyCode::Char('c'), true),
+                    (
+                        "Toggle automatic code updates (A)",
+                        KeyCode::Char('a'),
+                        true,
+                    ),
+                    (
+                        "Prepare code runtime (P)",
+                        KeyCode::Char('p'),
+                        self.status["code_intelligence"]["enabled"] == true
+                            && self.status["code_intelligence"]["runtime_ready"] != true,
+                    ),
                     (
                         "Enable login startup (E)",
                         KeyCode::Char('e'),
@@ -397,7 +412,7 @@ impl Ui {
                 4 => format!("Current gateway\n{}\n\nMigrate this device with local recovery-root authorization. Device identity stays the same. Other devices move deliberately; MCP requires destination authorization. Stop an independently owned agent first.", value(&self.status["gateway"])),
                 5 => format!("{}\nStart automatically on login: {} (managed in Settings)\n\nStart, stop and restart apply to the current OS user's running agent.\nStopping may interrupt active commands.", if self.owned {"Temporary agent owned by this TUI"} else {"External agents remain running on TUI exit"}, if self.status["service_installed"] == true {"Enabled"} else {"Disabled"}),
                 6 => format!("{}\n\nSource/package-manager installs retain their existing update owner.", self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
-                7 => format!("Start automatically on login:  {}\n\nControls whether the Wayfinder daemon launches at your next OS login for this user.\nChanging it never starts or stops the currently running agent.\n\nWindows uses a per-user Task Scheduler logon task (interactive logon, limited run level; no administrator rights). Linux uses a systemd --user service; macOS uses a per-user LaunchAgent.\n\nThe registration binds this exact binary and data directory; re-enable it after moving either.\nAutomation: `wayfinder service install`/`uninstall` manage the same registration and explicitly start/stop the agent.", if self.status["service_installed"] == true {"Enabled"} else {"Disabled"}), _ => String::new() }
+                7 => format!("{}\n\nStart automatically on login:  {}\n\nControls whether the Wayfinder daemon launches at your next OS login for this user.\nChanging it never starts or stops the currently running agent.\n\nWindows uses a per-user Task Scheduler logon task (interactive logon, limited run level; no administrator rights). Linux uses a systemd --user service; macOS uses a per-user LaunchAgent.\n\nThe registration binds this exact binary and data directory; re-enable it after moving either.\nAutomation: `wayfinder service install`/`uninstall` manage the same registration and explicitly start/stop the agent.", code_settings(&self.status), if self.status["service_installed"] == true {"Enabled"} else {"Disabled"}), _ => String::new() }
         };
         if self.enrolled && (self.section == 1 || (self.section == 2 && admin)) {
             let panes = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -770,6 +785,27 @@ async fn perform(
                 }
             }
         },
+        Task::ConfigureCode(enabled) => {
+            wayfinder_code::Settings::set_enabled(data, enabled)?;
+            return Ok(if enabled {
+                "Code intelligence enabled. Setup happens automatically on first use.".into()
+            } else {
+                "Code intelligence disabled. Active code sessions are being cancelled; project files and memories are retained.".into()
+            });
+        }
+        Task::ConfigureCodeUpdates(enabled) => {
+            wayfinder_code::Settings::set_automatic_updates(data, enabled)?;
+            return Ok(format!(
+                "Automatic code runtime updates {}. Wayfinder application updates are unchanged.",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+        Task::PrepareCode => {
+            crate::code::prepare(data, 300000).await?;
+            return Ok(
+                "Code runtime ready. Project tools start automatically when requested.".into(),
+            );
+        }
         Task::ConfigureStartup(enable) => {
             // Registration-only: the owned temporary agent keeps running.
             let path = data.to_owned();
@@ -1059,10 +1095,7 @@ async fn session(
                             } else {
                                 Task::RevokeGrant(id.into())
                             },
-                            format!(
-                                "Permanently revoke {}? Active access may be interrupted.",
-                                id
-                            ),
+                            format!("Permanently revoke {id}? Active access may be interrupted."),
                         );
                     }
                 }
@@ -1097,6 +1130,23 @@ async fn session(
                 }
                 // The login-startup toggle is registration-only and reversible,
                 // so it applies immediately without a typed confirmation.
+                KeyCode::Char('a') if ui.section == 7 => {
+                    task = Some(Task::ConfigureCodeUpdates(
+                        ui.status["code_intelligence"]["automatic_updates"] != true,
+                    ));
+                }
+                KeyCode::Char('c') if ui.section == 7 => {
+                    if ui.status["code_intelligence"]["enabled"] == true {
+                        ui.confirm(Task::ConfigureCode(false), "Disable code intelligence? Active code operations will be cancelled; in-flight edits may have completed. Shell execution and project files are retained.".into());
+                    } else {
+                        task = Some(Task::ConfigureCode(true));
+                    }
+                }
+                KeyCode::Char('p')
+                    if ui.section == 7 && ui.status["code_intelligence"]["enabled"] == true =>
+                {
+                    task = Some(Task::PrepareCode)
+                }
                 KeyCode::Char('e') if ui.section == 7 => task = Some(Task::ConfigureStartup(true)),
                 KeyCode::Char('d') if ui.section == 7 => task = Some(Task::ConfigureStartup(false)),
                 KeyCode::Char('c') if ui.section == 6 && check.is_empty() => {
@@ -1272,6 +1322,35 @@ async fn session(
         }
     }
     Ok(false)
+}
+
+fn code_settings(status: &Value) -> String {
+    let code = &status["code_intelligence"];
+    format!(
+        "Code intelligence: {}\nRuntime: {}\nAutomatic runtime updates: {}\nSelected version: {}\n\nCode tools run locally with this agent's OS permissions. The private runtime and language tools are prepared on demand; no separate connection or account is needed. C toggles this feature; P prepares the runtime now; A toggles independent runtime updates. Disabling cancels code sessions without stopping Wayfinder.\nProject memories are retained. `wayfinder code clean` removes runtime/cache data after disabling.\n{}",
+        if code["enabled"] == true {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if code["runtime_ready"] == true {
+            "Ready"
+        } else {
+            "Prepared automatically on first use"
+        },
+        if code["automatic_updates"] == true {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        code["updates"]["active_version"]
+            .as_str()
+            .unwrap_or("Not observed"),
+        code["error"]
+            .as_str()
+            .or_else(|| code["updates"]["last_error"].as_str())
+            .unwrap_or("")
+    )
 }
 
 #[cfg(test)]
@@ -1524,5 +1603,71 @@ mod tests {
                 assert!(owned.as_ref().is_some_and(|a| !a.stop_requested()));
                 let _ = std::fs::remove_dir_all(&root);
             });
+    }
+    #[tokio::test]
+    async fn code_settings_do_not_stop_the_wayfinder_agent_or_install_a_runtime() {
+        let data = std::env::temp_dir().join(format!(
+            "wayfinder-code-settings-{}",
+            wayfinder_core::random_secret()
+        ));
+        let mut owned = Some(TemporaryAgent::stub());
+        for enabled in [true, false] {
+            perform(
+                &data,
+                Task::ConfigureCode(enabled),
+                Zeroizing::new(String::new()),
+                &mut owned,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                wayfinder_code::Settings::load(&data).unwrap().enabled,
+                enabled
+            );
+            assert!(owned.as_ref().is_some_and(|agent| !agent.stop_requested()));
+            assert!(!data.join("code-intelligence/runtimes").exists());
+            let mut ui = Ui::new();
+            ui.enrolled = true;
+            ui.section = 7;
+            ui.status = serde_json::json!({"code_intelligence":{"enabled":enabled,"runtime_ready":false},"service_installed":false});
+            let text = rendered(&mut ui, 140, 40);
+            assert!(text.contains("Code intelligence"));
+            assert!(text.contains("Toggle code intelligence"));
+            assert!(!text.contains("Serena"));
+        }
+        std::fs::remove_dir_all(data).unwrap();
+    }
+    #[tokio::test]
+    async fn automatic_code_updates_toggle_is_local_and_preserves_agent_and_feature() {
+        let data = std::env::temp_dir().join(format!(
+            "wayfinder-code-settings-{}",
+            wayfinder_core::random_secret()
+        ));
+        let mut owned = Some(TemporaryAgent::stub());
+        for enabled in [false, true] {
+            perform(
+                &data,
+                Task::ConfigureCodeUpdates(enabled),
+                Zeroizing::new(String::new()),
+                &mut owned,
+            )
+            .await
+            .unwrap();
+            let settings = wayfinder_code::Settings::load(&data).unwrap();
+            assert!(settings.enabled);
+            assert_eq!(settings.automatic_updates, enabled);
+            assert!(owned.as_ref().is_some_and(|agent| !agent.stop_requested()));
+            assert!(!data.join("code-intelligence/runtimes").exists());
+            let mut ui = Ui::new();
+            ui.enrolled = true;
+            ui.section = 7;
+            ui.status = serde_json::json!({"code_intelligence":{"enabled":true,"automatic_updates":enabled,"runtime_ready":false,"updates":{"active_version":"test-version"}},"service_installed":false});
+            let text = rendered(&mut ui, 150, 45);
+            assert!(text.contains("Automatic runtime updates"));
+            assert!(text.contains("Toggle automatic code updates"));
+            assert!(text.contains("test-version"));
+            assert!(!text.contains("Serena"));
+        }
+        std::fs::remove_dir_all(data).unwrap();
     }
 }

@@ -140,3 +140,11 @@ OAuth/device endpoints at their TLS ingress. The generic gateway never trusts
 Cloudflare or forwarded IP headers for authorization. Capacity limits reject new
 work without evicting authenticated sessions or active grants. Wait before retrying
 admission failures; new-device admission is bounded separately from reconnects.
+
+## Code tool
+
+Updated gateways expose `code` alongside `nodes` and `exec`. `code` requires `exec` for every action, including status and discovery; the OAuth `read` scope does not authorize repository reads, dependency installation or language-server startup. Existing grants and pairing flows remain valid.
+
+Use `nodes` to select an exact device with `code_intelligence: true`. Call `code` with `action: "tools"`, that target and an absolute project directory to discover actual input schemas. Then call `action: "call"` with the returned `code_*` tool name and matching arguments. There is no second MCP connection, remote backend URL or additional credential. All operations remain at the selected agent OS-account boundary. A code session is not an OS sandbox.
+
+[Code lifecycle, setup and examples](code-intelligence.md).

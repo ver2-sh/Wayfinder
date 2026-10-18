@@ -19,9 +19,16 @@ use rmcp::{
 };
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
+use wayfinder_core::code::{CodeInput, CodeResult};
 use wayfinder_core::credentials::{Capability, ClientIdentity, CredentialStore};
 use wayfinder_core::{ExecInput, bearer_value};
 pub trait Routing: Send + Sync {
+    fn code<'a>(
+        &'a self,
+        client: ClientIdentity,
+        input: CodeInput,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = CodeResult> + Send + 'a>>;
     fn nodes<'a>(
         &'a self,
         chain: &'a str,
@@ -44,7 +51,7 @@ impl Mcp {
     fn new(routing: Arc<dyn Routing>, issuer: String) -> Self {
         let mut tools = Self::tool_router();
         {
-            for (name, scope) in [("nodes", "read"), ("exec", "exec")] {
+            for (name, scope) in [("nodes", "read"), ("exec", "exec"), ("code", "exec")] {
                 // rmcp has no top-level securitySchemes field. Use OpenAI's
                 // documented compatibility representation in native Tool.meta.
                 let mut meta = MetaObject::new();
@@ -90,6 +97,29 @@ impl Mcp {
         Ok(CallToolResult::structured(value))
     }
     #[tool(
+        description = "Wayfinder code intelligence on an explicit device and project. Use action=tools first to discover code_* operations and their schemas, then action=call with tool and arguments. Supports symbol/reference lookup, diagnostics, structured edits, refactoring and project memories. status is read-only; prepare installs the managed runtime on demand; close releases a project session. All actions require exec permission. No sandbox, automatic retry or fallback. Timeout covers setup and queueing."
+    )]
+    async fn code(
+        &self,
+        Parameters(input): Parameters<CodeInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if require(&context, Capability::Exec).is_err() {
+            return self.capability_error("exec");
+        }
+        let result = self
+            .routing
+            .code(identity(&context)?.clone(), input, context.ct.clone())
+            .await;
+        let failed = result.is_error();
+        let mut response = CallToolResult::structured(
+            serde_json::to_value(result)
+                .map_err(|_| ErrorData::internal_error("Result serialization failed", None))?,
+        );
+        response.is_error = Some(failed);
+        Ok(response)
+    }
+    #[tool(
         description = "Execute a fresh host shell as the selected node's OS account. No sandbox. Target is required: use a stable device ID or unique name within your Sync Chain. Timeout is 1–300000 milliseconds. No fallback or automatic retry."
     )]
     async fn exec(
@@ -116,7 +146,7 @@ impl Mcp {
 #[tool_handler(router = self.tools)]
 impl ServerHandler for Mcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new("wayfinder",env!("CARGO_PKG_VERSION"))).with_instructions("Use nodes to choose a target, then exec. Commands execute as the target daemon's OS account.")
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new("wayfinder",env!("CARGO_PKG_VERSION"))).with_instructions("Use nodes to choose a target. Use exec for shell commands or code with action=tools and an absolute project path to discover code intelligence operations. Operations execute as the target daemon's OS account.")
     }
 }
 fn identity(context: &RequestContext<RoleServer>) -> Result<&ClientIdentity, ErrorData> {
