@@ -13,6 +13,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+pub mod code;
 pub mod credentials;
 pub mod oauth;
 pub const VERSION: u32 = 1;

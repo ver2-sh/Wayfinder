@@ -28,6 +28,7 @@ pub fn confirm(prompt: &str) -> Result<()> {
 }
 pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
     match command {
+        Command::Code { command } => crate::code::execute(data, command).await?,
         Command::Chain {
             command: ChainCommand::Create { name, gateway },
         } => {
@@ -235,6 +236,8 @@ pub fn status(data: &std::path::Path) -> Result<serde_json::Value> {
     s["name"] = serde_json::json!(i.certificate.name);
     s["service_installed"] = serde_json::json!(service::installed(data)?);
     s["agent_running"] = serde_json::json!(service::agent_running(data)?);
+    s["code_intelligence"] = wayfinder_code::local_status(data)
+        .unwrap_or_else(|error| serde_json::json!({"enabled":false,"error":error.to_string()}));
     if s["agent_running"] == false {
         s["online"] = serde_json::json!(false);
     }

@@ -1,9 +1,9 @@
 # Release maintenance
 
-The repository is public and unreleased. This configuration is a foundation, not
-yet an accessible release download channel. Do not change visibility or publish a tag
-as a validation step. Ordinary future users need neither GitHub accounts/tokens
-nor Rust. No update server or telemetry is required.
+The repository publishes public, versioned release archives and installers.
+Never publish a tag merely to validate code: use the local preflight first.
+Ordinary users need neither GitHub accounts/tokens nor Rust. No mandatory update
+server or telemetry is required.
 
 ## Local preflight, before spending Actions minutes
 

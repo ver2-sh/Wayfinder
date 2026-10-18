@@ -3,8 +3,12 @@ pub mod applications;
 use anyhow::{Result, ensure};
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 use tokio_util::sync::CancellationToken;
+use wayfinder_core::code::{CODE_SESSION_VERSION, CodeResult};
 use wayfinder_core::{identity::*, protocol::*, *};
 pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -40,7 +44,13 @@ pub(crate) async fn connect_path(i: &Installation, path: &str) -> Result<Socket>
             .replacen("http://", "ws://", 1),
         i.certificate.chain_id
     );
-    let (s, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(url)).await??;
+    let mut request = url.into_client_request()?;
+    if path == "agent" {
+        request
+            .headers_mut()
+            .insert("x-wayfinder-agent-protocol", "3".parse()?);
+    }
+    let (s, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(request)).await??;
     let mut s = s;
     let Frame::Challenge {
         version,
@@ -51,7 +61,8 @@ pub(crate) async fn connect_path(i: &Installation, path: &str) -> Result<Socket>
         anyhow::bail!("Gateway did not challenge")
     };
     ensure!(
-        version == SESSION_VERSION && gateway == i.gateway,
+        (version == SESSION_VERSION || (path == "agent" && version == CODE_SESSION_VERSION))
+            && gateway == i.gateway,
         "Gateway identity or protocol mismatch"
     );
     key_bytes(&nonce)?;
@@ -67,7 +78,7 @@ pub(crate) async fn connect_path(i: &Installation, path: &str) -> Result<Socket>
     };
     let signature = sign(
         &i.key()?,
-        &session_proof(&i.gateway, &nonce, &i.certificate, &metadata)?,
+        &session_proof_for(version, &i.gateway, &nonce, &i.certificate, &metadata)?,
     );
     send(
         &mut s,
@@ -169,6 +180,13 @@ async fn run_inner(
     // The local application endpoint runs independently of gateway
     // connectivity: registration/status work offline and remote opens recover
     // as sessions reconnect.
+    let code = Arc::new(wayfinder_code::Manager::new(path));
+    let code_stop = stop.child_token();
+    let _code_cleanup = StopTasks(code_stop.clone());
+    let code_maintenance = {
+        let code = code.clone();
+        tokio::spawn(async move { code.maintenance(code_stop).await })
+    };
     let apps = Arc::new(applications::Apps::new(Arc::new(i.clone())));
     let endpoint_stop = stop.child_token();
     let endpoint = {
@@ -177,8 +195,7 @@ async fn run_inner(
     };
     loop {
         let started = tokio::time::Instant::now();
-        let result =
-            tokio::select! {_=stop.cancelled()=>break,r=session(path,i,&apps,stop.clone())=>r};
+        let result = tokio::select! {_=stop.cancelled()=>break,r=session(path,i,&apps,&code,stop.clone())=>r};
         status(path, i, false)?;
         if stop.is_cancelled() {
             break;
@@ -195,6 +212,7 @@ async fn run_inner(
         backoff = (backoff * 2).min(30);
     }
     let _ = endpoint.await;
+    let _ = code_maintenance.await;
     status(path, i, false)?;
     Ok(())
 }
@@ -208,6 +226,10 @@ impl Drop for StopTasks {
 /// One finished unit of session work. Service admission reports an error only
 /// while a `service_reject` is still meaningful at the gateway.
 enum Work {
+    Code {
+        id: String,
+        result: CodeResult,
+    },
     Exec {
         id: String,
         result: ExecResult,
@@ -222,6 +244,7 @@ async fn session(
     path: &Path,
     i: &Installation,
     apps: &Arc<applications::Apps>,
+    code: &Arc<wayfinder_code::Manager>,
     stop: CancellationToken,
 ) -> Result<()> {
     let mut socket = connect(i).await?;
@@ -247,6 +270,10 @@ async fn session(
             },
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 match completed.unwrap()? {
+                    Work::Code { id, result } => {
+                        cancels.remove(&id);
+                        send(&mut socket, &Frame::CodeResult { id, result }).await?;
+                    },
                     Work::Exec { id, result } => {
                         cancels.remove(&id);
                         send(&mut socket, &Frame::Result { id, result }).await?;
@@ -265,6 +292,19 @@ async fn session(
                     Frame::Ping => send(&mut socket, &Frame::Pong).await?,
                     Frame::Cancel { id } => {
                         if let Some(cancel) = cancels.get(&id) { CancellationToken::cancel(cancel); }
+                    },
+                    Frame::Code { id, mut input } => {
+                        ensure!(!cancels.contains_key(&id), "Duplicate operation ID");
+                        input.target = i.certificate.device_id.clone();
+                        if tasks.len() >= 16 {
+                            let result = CodeResult::failed(&input, "Device execution capacity reached");
+                            send(&mut socket, &Frame::CodeResult { id, result }).await?;
+                            continue;
+                        }
+                        let cancel = session.child_token();
+                        cancels.insert(id.clone(), cancel.clone());
+                        let code = code.clone();
+                        tasks.spawn(async move { Work::Code { id, result: code.execute(input, cancel).await } });
                     },
                     Frame::Exec { id, input } => {
                         ensure!(!cancels.contains_key(&id), "Duplicate execution ID");

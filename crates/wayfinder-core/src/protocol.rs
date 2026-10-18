@@ -55,6 +55,14 @@ pub enum Frame {
         id: String,
         input: ExecInput,
     },
+    Code {
+        id: String,
+        input: crate::code::CodeInput,
+    },
+    CodeResult {
+        id: String,
+        result: crate::code::CodeResult,
+    },
     Cancel {
         id: String,
     },
@@ -153,8 +161,22 @@ pub fn session_proof(
     cert: &Certificate,
     metadata: &PlatformDescriptor,
 ) -> anyhow::Result<Vec<u8>> {
+    session_proof_for(SESSION_VERSION, gateway, nonce, cert, metadata)
+}
+/// The negotiated protocol is authenticated, never inferred from an untrusted header.
+pub fn session_proof_for(
+    version: u32,
+    gateway: &str,
+    nonce: &str,
+    cert: &Certificate,
+    metadata: &PlatformDescriptor,
+) -> anyhow::Result<Vec<u8>> {
     metadata.validate()?;
-    let mut b = b"wayfinder/session/v2\0".to_vec();
+    let mut b = match version {
+        SESSION_VERSION => b"wayfinder/session/v2\0".to_vec(),
+        crate::code::CODE_SESSION_VERSION => b"wayfinder/session/v3\0".to_vec(),
+        _ => anyhow::bail!("Unsupported agent protocol"),
+    };
     field(&mut b, gateway);
     field(&mut b, nonce);
     field(&mut b, &crate::digest(&cert.bytes()?));
@@ -203,4 +225,45 @@ pub struct Device {
     pub last_seen: u64,
     pub revoked: bool,
     pub online: bool,
+}
+
+#[cfg(test)]
+mod code_protocol_tests {
+    use super::*;
+    #[test]
+    fn code_capability_is_bound_to_the_signed_session_version() -> anyhow::Result<()> {
+        let root = crate::identity::new_key();
+        let device = crate::identity::new_key();
+        let certificate =
+            Certificate::issue(&root, &device, "test".into(), crate::identity::Role::Member)?;
+        let metadata = PlatformDescriptor {
+            platform: "windows".into(),
+            arch: "x86_64".into(),
+        };
+        let old = session_proof("https://gateway.example", "nonce", &certificate, &metadata)?;
+        let code = session_proof_for(
+            crate::code::CODE_SESSION_VERSION,
+            "https://gateway.example",
+            "nonce",
+            &certificate,
+            &metadata,
+        )?;
+        assert!(old.starts_with(b"wayfinder/session/v2\0"));
+        assert!(code.starts_with(b"wayfinder/session/v3\0"));
+        assert_ne!(old, code);
+        let signature = crate::identity::sign(&device, &old);
+        assert!(crate::identity::verify(&certificate.device_public, &old, &signature).is_ok());
+        assert!(crate::identity::verify(&certificate.device_public, &code, &signature).is_err());
+        assert!(
+            session_proof_for(
+                999,
+                "https://gateway.example",
+                "nonce",
+                &certificate,
+                &metadata
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 }

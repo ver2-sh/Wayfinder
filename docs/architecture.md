@@ -346,3 +346,13 @@ has root enrollment authority. Revocations are gateway-local and restore from
 backup can restore earlier trust state: protect current backups and do not treat
 a fresh gateway as carrying historical revocations. Protect machine backups,
 terminal scrollback, swap/core dumps and service OS accounts accordingly.
+
+## Managed code intelligence
+
+`wayfinder-code` owns private runtime acquisition, project sessions and cancellation; unchanged upstream tools own language analysis and edits. All code operations require the same `exec` authority as arbitrary shell execution. Project and runtime data stay on the selected device. Command arguments and results still pass through the trusted gateway; the code route is not an end-to-end encrypted application relay.
+
+Agents advertise support with `X-Wayfinder-Agent-Protocol: 3` on `/agent`. Supporting gateways challenge with version 3 and verify the `wayfinder/session/v3\0` proof domain. Absent headers retain version 2. New agents accept a version-2 challenge from an old gateway; application `/service` streams remain version 2. A `code_intelligence` node field reports live authenticated support, not permission or attestation. Unsupported agents are rejected before code dispatch.
+
+Version-3 agent frames add `code { id, input }` and `code_result { id, result }`; `cancel { id }` is shared. Rust `wayfinder_core::code` and the Web protocol package bound input to 64 KiB, output to 1 MiB and deadlines to 300000 ms. The existing agent concurrency and gateway pending-request limits are shared with shell work. Code responses preserve upstream structured results, target identity and explicit unknown-outcome state; a lost result never causes replay.
+
+The hosted adapter adds a lazily created `kind` column to its existing transient jobs table when the first code operation is dispatched. Previous jobs default to `exec`; the tag lets cancellation, disconnect and hibernation recovery preserve the right response contract. No identity, grant, device or service schema changes are required. See [code intelligence](code-intelligence.md).

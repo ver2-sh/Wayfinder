@@ -191,7 +191,9 @@ export async function sessionProof(
   nonce: string,
   c: Certificate,
   metadata: PlatformDescriptor,
+  version: number = SESSION_VERSION,
 ) {
+  requireThat(version === SESSION_VERSION || version === CODE_SESSION_VERSION);
   exact(metadata, ["platform", "arch"]);
   requireThat(
     ["windows", "linux", "macos", "other"].includes(metadata.platform) &&
@@ -199,7 +201,7 @@ export async function sessionProof(
       /^[a-z0-9_]{1,32}$/.test(metadata.arch),
   );
   return cat(
-    encoder.encode("wayfinder/session/v2\0"),
+    encoder.encode(`wayfinder/session/v${version}\0`),
     field(gateway),
     field(nonce),
     field(await hash(certificateBytes(c))),
@@ -328,3 +330,90 @@ export function validateExec(v: ExecInput) {
       );
   }
 }
+
+export const CODE_TOOLS = [
+  "read_file",
+  "create_text_file",
+  "list_dir",
+  "find_file",
+  "replace_content",
+  "replace_in_files",
+  "delete_lines",
+  "replace_lines",
+  "insert_at_line",
+  "search_for_pattern",
+  "restart_language_server",
+  "get_symbols_overview",
+  "find_symbol",
+  "find_referencing_symbols",
+  "find_implementations",
+  "find_declaration",
+  "get_diagnostics_for_file",
+  "get_diagnostics_for_symbol",
+  "replace_symbol_body",
+  "insert_after_symbol",
+  "insert_before_symbol",
+  "rename_symbol",
+  "write_memory",
+  "read_memory",
+  "list_memories",
+  "delete_memory",
+  "rename_memory",
+  "edit_memory"
+] as const;
+export const CODE_SESSION_VERSION = 3;
+export const CODE_DEFAULT_TIMEOUT = 270000;
+export interface CodeInput {
+  target: string;
+  action: "status" | "prepare" | "tools" | "call" | "close";
+  project?: string | null;
+  tool?: string | null;
+  arguments?: Record<string, unknown> | null;
+  timeout?: number | null;
+}
+export interface CodeResult {
+  target: string;
+  project: string | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  timedOut: boolean;
+  outcomeUnknown: boolean;
+}
+export function validateCode(input: CodeInput) {
+  requireThat(input !== null && typeof input === "object" && !Array.isArray(input));
+  requireThat(Object.keys(input).every(k => ["target", "action", "project", "tool", "arguments", "timeout"].includes(k)));
+  requireThat(typeof input.target === "string" && input.target.trim().length > 0 && encoder.encode(input.target).length <= 256 && !input.target.includes("\0"), "Explicit device target required");
+  requireThat(["status", "prepare", "tools", "call", "close"].includes(input.action));
+  if (input.project != null) requireThat(typeof input.project === "string" && input.project.trim().length > 0 && encoder.encode(input.project).length <= 8192 && !input.project.includes("\0"), "Invalid project directory");
+  if (["tools", "call", "close"].includes(input.action)) requireThat(input.project != null, "Project directory required");
+  if (input.action === "call") {
+    requireThat(typeof input.tool === "string" && input.tool.startsWith("code_") && (CODE_TOOLS as readonly string[]).includes(input.tool.slice(5)), "Use a code_* operation from action=tools");
+    if (input.arguments != null) requireThat(typeof input.arguments === "object" && !Array.isArray(input.arguments));
+  } else requireThat(input.tool == null && input.arguments == null, "Tool arguments are only valid for action=call");
+  if (input.timeout != null) requireThat(Number.isInteger(input.timeout) && input.timeout >= 1 && input.timeout <= 300000);
+  const normalized = { target: input.target, action: input.action, project: input.project ?? null, tool: input.tool ?? null, arguments: input.arguments ?? null, timeout: input.timeout ?? null };
+  requireThat(encoder.encode(JSON.stringify(normalized)).length <= 65536, "Code request exceeds 64 KiB");
+}
+export function validateCodeResult(result: CodeResult) {
+  exact(result, ["target", "project", "result", "error", "timedOut", "outcomeUnknown"]);
+  requireThat(typeof result.target === "string" && (result.project === null || typeof result.project === "string") && (result.error === null || typeof result.error === "string") && typeof result.timedOut === "boolean" && typeof result.outcomeUnknown === "boolean");
+  requireThat(result.result === null || (typeof result.result === "object" && !Array.isArray(result.result)));
+  requireThat(encoder.encode(JSON.stringify(result)).length <= 1048576, "Code result exceeds 1 MiB");
+}
+export const codeTool = {
+  name: "code",
+  description: "Wayfinder code intelligence on an explicit device and absolute project path. Use action=tools to discover code_* operations and their inputSchema, then action=call with tool and arguments. Includes symbols, references, diagnostics, structured edits, refactoring and project memories. status does not install; prepare provisions on demand; close releases a project session. All actions require exec permission. No sandbox, fallback or automatic retry. Timeout includes setup and queueing.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      target: { type: "string" },
+      action: { type: "string", enum: ["status", "prepare", "tools", "call", "close"] },
+      project: { type: ["string", "null"] },
+      tool: { type: ["string", "null"] },
+      arguments: { type: ["object", "null"], additionalProperties: true },
+      timeout: { type: ["integer", "null"], minimum: 1, maximum: 300000 },
+    },
+    required: ["target", "action"], additionalProperties: false,
+  },
+  _meta: { securitySchemes: [{ type: "oauth2", scopes: ["exec"] }] },
+};
