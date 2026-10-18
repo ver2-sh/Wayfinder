@@ -95,13 +95,14 @@ Gateway selection happens during enrollment. A recovery phrase derives the same
 Chain ID independently of the URL; each enrollment creates a new device key and
 locally signs fresh gateway admission. An old device certificate alone cannot
 bootstrap a chain or register at an empty gateway. Device revocations and MCP
-grants are durable within that deployment. `wayfinder gateway migrate <origin>`
+grants and effective-role delegations are durable within that deployment. `wayfinder gateway migrate <origin>`
 (or TUI Gateway → Migrate this device) requires local recovery-root authorization
 and preserves this device’s certificate, private key and Device ID. It commits
 the URL only after target admission and registration; failures keep the old local
 configuration. Stop independently owned agents first. Target tombstones remain
-permanent. Other devices move deliberately, and no revocation/grant databases are
-transferred. MCP clients need explicit authorization at each gateway/resource.
+permanent. Other devices move deliberately, and no delegation/revocation/grant databases are
+transferred. A promoted Member retains only its immutable certificate role at a
+fresh destination; promote it separately there when desired. MCP clients need explicit authorization at each gateway/resource.
 The recovery phrase never leaves the local device.
 
 For local development, `http://127.0.0.1:PORT` and explicit IPv6 loopback HTTP
@@ -113,7 +114,7 @@ A default gateway is only an installation default, never a cryptographic domain.
 Use a single gateway process and persistent disk. Back up the SQLite database
 while stopped, or use SQLite's backup API. Protect backups like the live registry:
 although it contains no identity private keys or raw bearer tokens, it controls
-membership revocations and grants. Do not restore stale revocation data casually.
+membership revocations, delegated administrative authority and grants. Do not restore stale revocation data casually.
 There are no migration tools for old unreleased state.
 
 Connection availability is ephemeral. A gateway restart discards pending OAuth

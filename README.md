@@ -136,17 +136,49 @@ wayfinder status
 wayfinder tui
 wayfinder devices
 wayfinder device revoke DEVICE_ID
+wayfinder device promote DEVICE_ID
+wayfinder device demote DEVICE_ID
 wayfinder auth list
 wayfinder auth revoke GRANT_ID
 ```
 
 The TUI attaches to a running agent or starts a temporary one automatically. Status includes the gateway, connection state,
-Chain ID, Device ID, name and role. Stale status is reported offline. Device and
+Chain ID, Device ID, name and effective role. `status` confirms the current role
+with the gateway; offline/unreachable status reports `role: null` and
+`role_status: "unconfirmed"`, with the immutable `certificate_role` separately.
+The TUI polls the authenticated roster every two seconds; failed or stale role
+observations disable administrative controls. Device and
 grant administration requires a reachable gateway. Revocation is
 confirmed explicitly (use `--yes` for deliberate CLI automation) and permanent for that Device ID at this gateway; it closes the session, cancels
 in-flight work and prevents reconnect. To replace a revoked installation, join
 with a fresh device key in a fresh data directory. Grants already approved by a
 device are separate: revoke its grants too when responding to compromise.
+
+An existing effective Admin can run `wayfinder device promote PVE-Lab` (a Device
+ID or unambiguous name), then `wayfinder device demote PVE-Lab` to remove that
+access. Both require explicit confirmation; `--yes` enables deliberate
+noninteractive use. In TUI → Devices, select an active device and choose
+**Promote to Admin (P)** or **Demote to Member (M)**, review its current role, and
+type `yes`. The selected device keeps its certificate, keys, Device ID and Chain
+ID and its running agent stays connected. Its open TUI refreshes device and
+OAuth pairing controls automatically; the gateway enforces demotion immediately.
+
+A promoted Admin has full ordinary Admin access, including granting further Admin
+access, approving OAuth requests and revoking devices/grants. It gains no root
+signing/enrollment authority. Promotion cannot reconstruct the recovery phrase.
+Root-signed Admin authority cannot be demoted through these commands: use the
+separate permanent device revocation operation when necessary. Delegated Admins
+return to their underlying Member role on demotion; demoting the last effective
+Admin is rejected. Only active, admitted devices in the same chain can be targets.
+
+Delegations persist at this gateway across restarts, independently of the
+Admin that granted them. Disconnecting, demoting or revoking that Admin does
+**not** undo its earlier delegations. Remove each unwanted delegation explicitly
+(or revoke its target) and revoke unwanted OAuth grants separately. Treat Admin
+access as authority to expand the trusted administrator set. Delegations and
+revocations are gateway-local: migration copies neither, and a Member promoted
+at one gateway remains a Member at a fresh destination until promoted there.
+Older gateways reject these new operations without a fallback or re-enrollment.
 
 Names are display labels; `exec` accepts a stable Device ID or an unambiguous name
 **within the authorized chain**. Ambiguous names fail. A target is always required.
@@ -309,15 +341,15 @@ browser fields, MCP values or logs. It never leaves the local device.
 Chain ID and recovery phrase are gateway-independent. Migration verifies the
 local recovery root against the existing certificate, then root-signs fresh
 admission bound to the destination origin and challenge. It preserves the exact
-certificate, device private key, Device ID, role and Chain ID. Only after target
+certificate, device private key, Device ID, certificate role and Chain ID. Only after target
 admission and device registration succeed is the gateway URL atomically saved.
 Failures leave the old installation intact; target admission may already have
 succeeded if registration or local persistence fails. The TUI restarts its own
 temporary agent after success or failure; it does not stop an independently
 owned service. Start that service deliberately after CLI migration.
 
-Every other device migrates deliberately. Revocation and MCP/OAuth grant databases
-are not copied. Grants are gateway/resource-bound and require authorization at
+Every other device migrates deliberately. Delegations, revocations and MCP/OAuth
+grant databases are not copied. Grants are gateway/resource-bound and require authorization at
 the destination. Merely changing a URL or possessing a device certificate/key
 cannot bootstrap a fresh gateway. Possession of the recovery phrase is root
 authority and can authorize this existing device at a fresh destination, even if

@@ -133,7 +133,10 @@ async fn local_endpoint_registers_and_opens_exact_device_services() {
         (path_b.clone(), ib.clone(), apps_b.clone()),
     ] {
         let stop = stop.child_token();
-        tokio::spawn(async move { crate::session(&path, &i, &apps, stop).await });
+        tokio::spawn(async move {
+            let code = Arc::new(wayfinder_code::Manager::new(&path));
+            crate::session(&path, &i, &apps, &code, stop).await
+        });
     }
     let socket = runtime.join("wayfinder/app.sock");
     wait_for(|| socket.exists()).await;
@@ -249,7 +252,10 @@ async fn local_endpoint_registers_and_opens_exact_device_services() {
         (path_a.clone(), ia.clone(), apps_a.clone()),
     ] {
         let stop = stop2.child_token();
-        tokio::spawn(async move { crate::session(&path, &i, &apps, stop).await });
+        tokio::spawn(async move {
+            let code = Arc::new(wayfinder_code::Manager::new(&path));
+            crate::session(&path, &i, &apps, &code, stop).await
+        });
     }
     // The application re-registers on the rebound endpoint, exactly as Scala
     // does on daemon restart; the registering session must stay alive.

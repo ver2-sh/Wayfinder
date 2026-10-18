@@ -189,6 +189,8 @@ pub fn session_proof_for(
 pub enum Operation {
     Devices,
     RevokeDevice { device_id: String },
+    PromoteDevice { device_id: String },
+    DemoteDevice { device_id: String },
     Pending { code: String },
     Approve { code: String, request_hash: String },
     Grants,
@@ -208,6 +210,12 @@ pub fn operation_proof(
     cert: &Certificate,
     op: &Operation,
 ) -> anyhow::Result<Vec<u8>> {
+    if let Operation::PromoteDevice { device_id } | Operation::DemoteDevice { device_id } = op {
+        let key = device_id
+            .strip_prefix("wfd1_")
+            .ok_or_else(|| anyhow::anyhow!("Invalid device ID"))?;
+        crate::key_bytes(key)?;
+    }
     let mut b = b"wayfinder/administration/v1\0".to_vec();
     field(&mut b, gateway);
     field(&mut b, nonce);
@@ -219,7 +227,11 @@ pub fn operation_proof(
 pub struct Device {
     pub id: String,
     pub name: String,
+    /// Current gateway-local effective role.
     pub role: crate::identity::Role,
+    /// Immutable root-signed role; absent on older gateways.
+    #[serde(default)]
+    pub certificate_role: Option<crate::identity::Role>,
     pub platform: Option<String>,
     pub arch: Option<String>,
     pub last_seen: u64,
@@ -230,6 +242,52 @@ pub struct Device {
 #[cfg(test)]
 mod code_protocol_tests {
     use super::*;
+    #[test]
+    fn delegation_wire_vectors_match_typescript() -> anyhow::Result<()> {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/protocol/fixtures/administration.json"
+        ))?;
+        let cert: Certificate = serde_json::from_value(fixture["certificate"].clone())?;
+        cert.verify()?;
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let op: Operation = serde_json::from_value(vector["operation"].clone())?;
+            assert_eq!(
+                serde_json::to_string(&op)?,
+                vector["canonical"].as_str().unwrap()
+            );
+            let proof = operation_proof(
+                fixture["gateway"].as_str().unwrap(),
+                fixture["nonce"].as_str().unwrap(),
+                &cert,
+                &op,
+            )?;
+            assert_eq!(hex::encode(&proof), vector["proof"].as_str().unwrap());
+            crate::identity::verify(
+                &cert.device_public,
+                &proof,
+                vector["signature"].as_str().unwrap(),
+            )?;
+        }
+        for invalid in [
+            r#"{"operation":"promote_device"}"#,
+            r#"{"operation":"demote_device","device_id":"x","extra":true}"#,
+            r#"{"operation":"unknown_role","device_id":"x"}"#,
+        ] {
+            assert!(serde_json::from_str::<Operation>(invalid).is_err());
+        }
+        assert!(
+            operation_proof(
+                "gateway",
+                "nonce",
+                &cert,
+                &Operation::PromoteDevice {
+                    device_id: "invalid".into()
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
     #[test]
     fn code_capability_is_bound_to_the_signed_session_version() -> anyhow::Result<()> {
         let root = crate::identity::new_key();

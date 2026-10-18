@@ -108,10 +108,6 @@ pub async fn register(i: &Installation) -> Result<()> {
 }
 pub async fn operation(i: &Installation, op: Operation) -> Result<serde_json::Value> {
     i.validate()?;
-    ensure!(
-        matches!(&op, Operation::Devices) || i.certificate.role == Role::Admin,
-        "Administrative device required"
-    );
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
@@ -139,7 +135,7 @@ pub async fn operation(i: &Installation, op: Operation) -> Result<serde_json::Va
         &i.key()?,
         &operation_proof(&i.gateway, &nonce, &i.certificate, &op)?,
     );
-    Ok(client
+    let response = client
         .post(format!("{}/device/operation", i.gateway))
         .json(&SignedOperation {
             certificate: i.certificate.clone(),
@@ -148,15 +144,22 @@ pub async fn operation(i: &Installation, op: Operation) -> Result<serde_json::Va
             signature,
         })
         .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
+        .await?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await?;
+    ensure!(
+        status.is_success(),
+        "{}",
+        value["error"]
+            .as_str()
+            .unwrap_or("Gateway denied operation")
+    );
+    Ok(value)
 }
 fn status(path: &Path, i: &Installation, online: bool) -> Result<()> {
     atomic_write(
         &path.join("status.json"),
-        &serde_json::json!({"chain_id":i.certificate.chain_id,"device_id":i.certificate.device_id,"name":i.certificate.name,"role":i.certificate.role,"gateway":i.gateway,"online":online,"observed":now()}),
+        &serde_json::json!({"chain_id":i.certificate.chain_id,"device_id":i.certificate.device_id,"name":i.certificate.name,"role":null,"role_status":"unconfirmed","certificate_role":i.certificate.role,"gateway":i.gateway,"online":online,"observed":now()}),
     )
 }
 pub async fn run(path: &Path, i: &Installation, stop: CancellationToken) -> Result<()> {

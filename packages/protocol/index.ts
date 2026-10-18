@@ -213,6 +213,8 @@ export function operationJSON(op: Operation) {
   const fields: Record<string, string[]> = {
     devices: [],
     revoke_device: ["device_id"],
+    promote_device: ["device_id"],
+    demote_device: ["device_id"],
     pending: ["code"],
     approve: ["code", "request_hash"],
     grants: [],
@@ -226,6 +228,8 @@ export function operationJSON(op: Operation) {
     requireThat(typeof v === "string");
     canonical[k] = v;
   }
+  if (op.operation === "promote_device" || op.operation === "demote_device")
+    requireThat(typeof op.device_id === "string" && /^wfd1_[0-9a-f]{64}$/.test(op.device_id));
   return JSON.stringify(canonical);
 }
 export async function operationProof(

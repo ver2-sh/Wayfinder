@@ -97,7 +97,7 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
             tokio::pin!(runner);
             tokio::select! {r=&mut runner=>r?,_=stop_signal()=>{stop.cancel();runner.await?;}}
         }
-        Command::Status => show_status(data)?,
+        Command::Status => display(&confirmed_status(data).await?)?,
         Command::Tui => anyhow::bail!("TUI must run from the interactive entry point"),
         Command::Service { command } => service::manage(data, command)?,
         Command::Update { check } => {
@@ -141,6 +141,44 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
                 .await?,
             )?;
         }
+        Command::Device { command } => {
+            let (target, yes, promote) = match command {
+                DeviceCommand::Promote { id, yes } => (id, yes, true),
+                DeviceCommand::Demote { id, yes } => (id, yes, false),
+                DeviceCommand::Revoke { .. } => unreachable!(),
+            };
+            let i = load(data)?;
+            let devices = wayfinder_agent::operation(&i, Operation::Devices).await?;
+            let target = resolve_device(&devices, &target)?;
+            let id = target["id"]
+                .as_str()
+                .context("Invalid device ID")?
+                .to_owned();
+            if !yes {
+                confirm(&format!(
+                    "{} {} ({id}), currently {} at {}? Admins can delegate further Admin access.",
+                    if promote {
+                        "Promote to Admin:"
+                    } else {
+                        "Demote to Member:"
+                    },
+                    target["name"].as_str().unwrap_or("device"),
+                    target["role"],
+                    i.gateway
+                ))?;
+            }
+            display(
+                &wayfinder_agent::operation(
+                    &i,
+                    if promote {
+                        Operation::PromoteDevice { device_id: id }
+                    } else {
+                        Operation::DemoteDevice { device_id: id }
+                    },
+                )
+                .await?,
+            )?;
+        }
         Command::Auth { command } => {
             let op = match command {
                 AuthCommand::List => Operation::Grants,
@@ -155,10 +193,6 @@ pub async fn execute(data: &std::path::Path, command: Command) -> Result<()> {
         }
         Command::Authorize { code } => {
             let i = load(data)?;
-            ensure!(
-                i.certificate.role == Role::Admin,
-                "Administrative device required"
-            );
             let code = code.to_uppercase();
             let details =
                 wayfinder_agent::operation(&i, Operation::Pending { code: code.clone() }).await?;
@@ -212,9 +246,6 @@ pub(crate) async fn enroll(
     wayfinder_agent::register(&i).await.context("Identity saved; gateway registration failed. Run wayfinder daemon to reconnect with this same identity")?;
     Ok(())
 }
-pub fn show_status(data: &std::path::Path) -> Result<()> {
-    display(&status(data)?)
-}
 pub fn status(data: &std::path::Path) -> Result<serde_json::Value> {
     let i = load(data)?;
     let mut s: serde_json::Value = read_private(&data.join("status.json"))
@@ -232,7 +263,9 @@ pub fn status(data: &std::path::Path) -> Result<serde_json::Value> {
     s["device_id"] = serde_json::json!(i.certificate.device_id);
     s["gateway"] = serde_json::json!(i.gateway);
     s["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
-    s["role"] = serde_json::json!(i.certificate.role);
+    s["role"] = serde_json::Value::Null;
+    s["role_status"] = serde_json::json!("unconfirmed");
+    s["certificate_role"] = serde_json::json!(i.certificate.role);
     s["name"] = serde_json::json!(i.certificate.name);
     s["service_installed"] = serde_json::json!(service::installed(data)?);
     s["agent_running"] = serde_json::json!(service::agent_running(data)?);
@@ -242,6 +275,57 @@ pub fn status(data: &std::path::Path) -> Result<serde_json::Value> {
         s["online"] = serde_json::json!(false);
     }
     Ok(s)
+}
+/// Resolve only within the authenticated gateway roster, with exact IDs preferred.
+fn resolve_device<'a>(
+    devices: &'a serde_json::Value,
+    target: &str,
+) -> Result<&'a serde_json::Value> {
+    let devices = devices.as_array().context("Invalid device list")?;
+    let matches: Vec<_> = devices.iter().filter(|d| d["id"] == target).collect();
+    let matches = if matches.is_empty() {
+        devices.iter().filter(|d| d["name"] == target).collect()
+    } else {
+        matches
+    };
+    ensure!(!matches.is_empty(), "Device not found in this Sync Chain");
+    ensure!(
+        matches.len() == 1,
+        "Device name is ambiguous; use a Device ID"
+    );
+    ensure!(matches[0]["revoked"] == false, "Device is revoked");
+    Ok(matches[0])
+}
+pub(crate) fn confirm_role(
+    status: &mut serde_json::Value,
+    devices: &serde_json::Value,
+) -> Result<()> {
+    let device = devices
+        .as_array()
+        .context("Invalid device list")?
+        .iter()
+        .find(|d| d["id"] == status["device_id"] && d["revoked"] == false)
+        .context("This device is not active")?;
+    ensure!(
+        matches!(device["role"].as_str(), Some("admin" | "member")),
+        "Invalid effective role"
+    );
+    status["role"] = device["role"].clone();
+    status["role_status"] = serde_json::json!("confirmed");
+    status["role_observed"] = serde_json::json!(now());
+    Ok(())
+}
+async fn confirmed_status(data: &std::path::Path) -> Result<serde_json::Value> {
+    let mut status = status(data)?;
+    match wayfinder_agent::operation(&load(data)?, Operation::Devices).await {
+        Ok(devices) => {
+            confirm_role(&mut status, &devices)?;
+        }
+        Err(error) => {
+            status["role_error"] = serde_json::json!(error.to_string());
+        }
+    }
+    Ok(status)
 }
 pub async fn stop_signal() {
     #[cfg(unix)]
@@ -304,4 +388,28 @@ pub(crate) async fn migrate(
         .context("Target registration failed; local gateway unchanged")?;
     atomic_write(&data.join("installation.json"), &target)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+    #[test]
+    fn targets_and_status_use_gateway_roster_not_certificate_role() -> Result<()> {
+        let devices = serde_json::json!([
+            {"id":"a","name":"same","role":"admin","certificate_role":"member","revoked":false},
+            {"id":"b","name":"same","role":"member","revoked":false},
+            {"id":"c","name":"revoked","role":"admin","revoked":true}
+        ]);
+        assert!(resolve_device(&devices, "same").is_err());
+        assert!(resolve_device(&devices, "missing").is_err());
+        assert!(resolve_device(&devices, "revoked").is_err());
+        assert_eq!(resolve_device(&devices, "a")?["id"], "a");
+        let mut status =
+            serde_json::json!({"device_id":"a","certificate_role":"member","role":null});
+        confirm_role(&mut status, &devices)?;
+        assert_eq!(status["role"], "admin");
+        assert_eq!(status["certificate_role"], "member");
+        assert_eq!(status["role_status"], "confirmed");
+        Ok(())
+    }
 }

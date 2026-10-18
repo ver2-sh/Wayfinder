@@ -78,6 +78,8 @@ fn details(v: &Value) -> String {
 #[derive(Clone)]
 enum Task {
     RevokeDevice(String),
+    PromoteDevice(String),
+    DemoteDevice(String),
     RevokeGrant(String),
     Pending(String),
     Approve(String, String),
@@ -164,6 +166,34 @@ impl Ui {
     }
     fn is_admin(&self) -> bool {
         self.status["role"].as_str() == Some("admin")
+            && self.status["role_status"] == "confirmed"
+            && self.status["role_observed"]
+                .as_u64()
+                .is_some_and(|t| wayfinder_core::now().saturating_sub(t) <= 5)
+    }
+    fn role_action(&self, promote: bool) -> Option<String> {
+        if !self.is_admin() || self.section != 1 {
+            return None;
+        }
+        let row = self.rows.get(self.selected.selected().unwrap_or(0))?;
+        if row["revoked"] != false {
+            return None;
+        }
+        let valid = if promote {
+            row["role"] == "member"
+        } else {
+            row["role"] == "admin"
+                && row["certificate_role"] == "member"
+                && self
+                    .rows
+                    .iter()
+                    .filter(|d| d["revoked"] == false && d["role"] == "admin")
+                    .count()
+                    > 1
+        };
+        valid
+            .then(|| row["id"].as_str().map(str::to_owned))
+            .flatten()
     }
     fn section(&mut self, section: usize) -> bool {
         self.focus = false;
@@ -255,7 +285,20 @@ impl Ui {
         self.enrolled = data.join("installation.json").exists();
         self.owned = owned;
         match app::status(data) {
-            Ok(s) => self.status = s,
+            Ok(mut s) => {
+                if s["device_id"] == self.status["device_id"]
+                    && s["chain_id"] == self.status["chain_id"]
+                    && s["gateway"] == self.status["gateway"]
+                    && self.status["role_observed"]
+                        .as_u64()
+                        .is_some_and(|t| wayfinder_core::now().saturating_sub(t) <= 5)
+                {
+                    for key in ["role", "role_status", "role_observed"] {
+                        s[key] = self.status[key].clone();
+                    }
+                }
+                self.status = s;
+            }
             Err(e) if self.enrolled => self.message = format!("Identity/status unavailable: {e:#}"),
             _ => {}
         }
@@ -350,7 +393,25 @@ impl Ui {
             )]
         } else {
             match self.section {
-                1 | 2 => vec![(
+                1 => {
+                    let mut actions = vec![];
+                    if admin
+                        && self
+                            .rows
+                            .get(self.selected.selected().unwrap_or(0))
+                            .is_some_and(|r| r["revoked"] == false)
+                    {
+                        actions.push(("Revoke selected (D)", KeyCode::Char('d'), true));
+                    }
+                    if self.role_action(true).is_some() {
+                        actions.push(("Promote to Admin (P)", KeyCode::Char('p'), true));
+                    }
+                    if self.role_action(false).is_some() {
+                        actions.push(("Demote to Member (M)", KeyCode::Char('m'), true));
+                    }
+                    actions
+                }
+                2 => vec![(
                     "Revoke selected (D)",
                     KeyCode::Char('d'),
                     admin && !self.rows.is_empty(),
@@ -405,7 +466,7 @@ impl Ui {
             "Welcome to Wayfinder\n\nCreate a Sync Chain or join with your recovery phrase.\nUse a private, unrecorded terminal. Recovery words are never saved or copied.\n\nEnter to begin. Joining defaults to the member role.".into()
         } else {
             match self.section {
-                0 => format!("Device       {}\nRole         {}\nDevice ID    {}\nSync Chain   {}\nGateway      {}\nObserved     {}\n\n{}\n\n{}", value(&self.status["name"]), value(&self.status["role"]), value(&self.status["device_id"]), value(&self.status["chain_id"]), value(&self.status["gateway"]), self.status["observed"].as_u64().map(|t|format!("{} seconds ago",wayfinder_core::now().saturating_sub(t))).unwrap_or("Not yet observed".into()), if self.owned {"Temporary agent • stops when this TUI exits"} else {"Attached agent • this TUI does not own it"}, self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
+                0 => format!("Device       {}\nEffective role {}\nDevice ID    {}\nSync Chain   {}\nGateway      {}\nObserved     {}\n\n{}\n\n{}", value(&self.status["name"]), if self.status["role_status"] == "confirmed" { format!("{} (gateway confirmed)", value(&self.status["role"])) } else { "Unconfirmed (offline or awaiting gateway)".into() }, value(&self.status["device_id"]), value(&self.status["chain_id"]), value(&self.status["gateway"]), self.status["observed"].as_u64().map(|t|format!("{} seconds ago",wayfinder_core::now().saturating_sub(t))).unwrap_or("Not yet observed".into()), if self.owned {"Temporary agent • stops when this TUI exits"} else {"Attached agent • this TUI does not own it"}, self.update.as_ref().map(|s|s.message()).unwrap_or("Checking updates…".into())),
                 2 if !admin => "MCP grant management requires an administrative device.\n\nMembers can receive remote commands and list devices, but cannot inspect or revoke MCP grants.".into(),
                 3 if admin => "Approve a browser pairing request\n\nEnter the pairing code from your browser. Review the client, redirect URI and exact requested scopes before approving.\n\nClient names are self-reported. exec permits shell commands with each agent's OS privileges.\n\nEnter: look up code".into(),
                 3 => "Browser pairing approval requires an administrative device.\n\nMembers can receive remote commands but cannot inspect or approve pairing requests.".into(),
@@ -713,6 +774,12 @@ async fn perform(
         Task::RevokeDevice(id) => {
             remote(data, Operation::RevokeDevice { device_id: id }).await?;
         }
+        Task::PromoteDevice(id) => {
+            remote(data, Operation::PromoteDevice { device_id: id }).await?;
+        }
+        Task::DemoteDevice(id) => {
+            remote(data, Operation::DemoteDevice { device_id: id }).await?;
+        }
         Task::RevokeGrant(id) => {
             remote(data, Operation::RevokeGrant { grant_id: id }).await?;
         }
@@ -908,7 +975,7 @@ async fn session(
     check.spawn(async move { update::check(&path, false).await });
     let mut lists: tokio::task::JoinSet<(usize, Result<Value>)> = tokio::task::JoinSet::new();
     let mut refresh = Instant::now();
-    let mut fetch = false;
+    let mut fetch = true;
     let mut name = String::new();
     let mut gateway = String::new();
     let mut saved_phrase = Zeroizing::new(String::new());
@@ -916,6 +983,7 @@ async fn session(
         if refresh.elapsed() >= Duration::from_secs(2) {
             ui.refresh(data, owned.is_some());
             refresh = Instant::now();
+            fetch = true;
         }
         if let Some(result) = check.try_join_next() {
             match result {
@@ -924,6 +992,19 @@ async fn session(
             }
         }
         if let Some(result) = lists.try_join_next() {
+            match &result {
+                Ok((1, Ok(devices))) => {
+                    if app::confirm_role(&mut ui.status, devices).is_err() {
+                        ui.status["role"] = Value::Null;
+                        ui.status["role_status"] = serde_json::json!("unconfirmed");
+                    }
+                }
+                Ok((1, Err(_))) => {
+                    ui.status["role"] = Value::Null;
+                    ui.status["role_status"] = serde_json::json!("unconfirmed");
+                }
+                _ => {}
+            }
             match result {
                 Ok((section, Ok(v))) if section == ui.section => {
                     let selected_id = ui
@@ -958,29 +1039,18 @@ async fn session(
                 _ => {}
             }
         }
-        if fetch && ui.enrolled && matches!(ui.section, 1 | 2) {
-            lists.abort_all();
-            if ui.section == 2 && !ui.is_admin() {
-                ui.rows.clear();
-                ui.message = "Administrative device required to manage MCP grants.".into();
-            } else {
-                let path = data.to_owned();
-                let section = ui.section;
-                lists.spawn(async move {
-                    (
-                        section,
-                        remote(
-                            &path,
-                            if section == 1 {
-                                Operation::Devices
-                            } else {
-                                Operation::Grants
-                            },
-                        )
-                        .await,
-                    )
-                });
-                ui.message = "Loading from gateway… (navigation remains available)".into();
+        if fetch && ui.enrolled && lists.is_empty() {
+            // Poll the signed roster in every section so promotion/demotion also
+            // updates pairing and grant controls without restarting the TUI/agent.
+            let path = data.to_owned();
+            lists.spawn(async move { (1, remote(&path, Operation::Devices).await) });
+            if ui.section == 2 {
+                if ui.is_admin() {
+                    let path = data.to_owned();
+                    lists.spawn(async move { (2, remote(&path, Operation::Grants).await) });
+                } else {
+                    ui.rows.clear();
+                }
             }
         }
         fetch = false;
@@ -1083,6 +1153,30 @@ async fn session(
                 }
                 KeyCode::Enter if ui.section == 3 => {
                     ui.message = "Administrative device required for browser pairing.".into()
+                }
+                KeyCode::Char(c @ ('p' | 'm')) if ui.section == 1 => {
+                    let promote = c == 'p';
+                    if let Some(id) = ui.role_action(promote) {
+                        let row = &ui.rows[ui.selected.selected().unwrap_or(0)];
+                        let text = format!(
+                            "{} {} ({id})? Current gateway-confirmed role: {}. Admins can delegate further Admin access.",
+                            if promote {
+                                "Promote to Admin:"
+                            } else {
+                                "Demote to Member:"
+                            },
+                            value(&row["name"]),
+                            value(&row["role"])
+                        );
+                        ui.confirm(
+                            if promote {
+                                Task::PromoteDevice(id)
+                            } else {
+                                Task::DemoteDevice(id)
+                            },
+                            text,
+                        );
+                    }
                 }
                 KeyCode::Char('m') if ui.section == 4 => ui.prompt("Destination gateway URL"),
                 KeyCode::Char('d') if matches!(ui.section, 1 | 2) && ui.is_admin() => {
@@ -1315,6 +1409,10 @@ async fn session(
             if ui.quit {
                 break;
             }
+            lists.abort_all();
+            ui.status["role"] = Value::Null;
+            ui.status["role_status"] = serde_json::json!("unconfirmed");
+            fetch = true;
             ui.refresh(data, owned.is_some());
             if ui.enrolled && ui.section >= SECTIONS.len() {
                 ui.section = 0;
@@ -1367,6 +1465,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delegation_actions_require_fresh_effective_admin_and_valid_target() {
+        let mut ui = Ui::new();
+        ui.enrolled = true;
+        ui.section = 1;
+        ui.status = serde_json::json!({"device_id":"self","certificate_role":"member"});
+        ui.rows = vec![
+            serde_json::json!({"id":"self","role":"admin","certificate_role":"member","revoked":false}),
+            serde_json::json!({"id":"root","role":"admin","certificate_role":"admin","revoked":false}),
+            serde_json::json!({"id":"target","role":"member","certificate_role":"member","revoked":false}),
+        ];
+        assert!(!ui.is_admin());
+        app::confirm_role(&mut ui.status, &serde_json::json!(ui.rows)).unwrap();
+        assert!(ui.is_admin());
+        ui.select(2);
+        assert_eq!(ui.role_action(true).as_deref(), Some("target"));
+        assert!(ui.role_action(false).is_none());
+        ui.confirm(
+            Task::PromoteDevice("target".into()),
+            "Current role: member. Promote?".into(),
+        );
+        assert!(matches!(ui.mode, Mode::Confirm(Task::PromoteDevice(_), _)));
+        ui.select(1);
+        assert!(ui.role_action(false).is_none()); // root authority
+        ui.select(0);
+        assert_eq!(ui.role_action(false).as_deref(), Some("self"));
+        ui.rows[1]["revoked"] = serde_json::json!(true);
+        assert!(ui.role_action(false).is_none()); // last Admin
+        ui.rows[0]["role"] = serde_json::json!("member");
+        app::confirm_role(&mut ui.status, &serde_json::json!(ui.rows)).unwrap();
+        assert!(!ui.is_admin());
+        assert!(ui.role_action(true).is_none());
+        ui.status["role"] = serde_json::json!("admin");
+        ui.status["role_observed"] = serde_json::json!(wayfinder_core::now() - 6);
+        assert!(!ui.is_admin());
+        ui.status["role_status"] = serde_json::json!("unconfirmed");
+        assert!(!ui.is_admin());
+    }
     #[test]
     fn mouse_targets_follow_viewport_resize_and_modal_exclusivity() {
         let mut ui = Ui::new();

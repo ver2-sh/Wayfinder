@@ -6,6 +6,7 @@ Run the existing checks with current source:
 ./validate.sh
 cargo build --workspace
 python3 tests/sync_chain.py
+python3 tests/device_roles_tui.py
 python3 tests/tui_service.py
 ```
 
@@ -61,3 +62,27 @@ Do not treat local Worker emulation as proof of public transport behavior. Verif
 HTTP cancellation and proxy propagation against the public MCP origin, and
 verify the hosted service with the former private gateway/tunnel stopped. Keep
 live disposable credentials private and revoke their devices after validation.
+
+## Gateway-local role delegation
+
+Role validation uses local disposable identities, loopback gateways and SQLite
+Durable Objects; no production resources, deployment or real PVE-Lab installation
+are needed. `./validate.sh` covers strict Rust operation decoding, shared signed
+vectors, additive migration preserving identities/grants, effective role checks,
+independent delegations, replay, immutable root Admin authority and last-Admin
+protection. The protocol vectors are in
+`packages/protocol/fixtures/administration.json` and are verified by both languages.
+
+`tests/sync_chain.py` exercises confirmed CLI promotion/demotion by name/ID,
+unchanged installation data, connected-agent administration/OAuth approval,
+gateway restart persistence and stale signed request rejection.
+`tests/device_roles_tui.py` uses two open PTYs and running agents to verify
+confirmation, live device/pairing controls, demotion refresh and unconfirmed
+offline status. It installs no services.
+
+In Wayfinder-Cloudflare, `npm run check` runs static checking, local bundling
+(`wrangler deploy --dry-run` only) and synthetic Miniflare tests. The role suite
+uses the real chain and OAuth Durable Objects, signed admissions/operations,
+connected sockets, concurrent requests and a complete local runtime restart with
+persisted storage. Existing chains acquire the delegation table lazily on first
+successful role mutation. Public MCP tools and read/exec scopes remain unchanged.

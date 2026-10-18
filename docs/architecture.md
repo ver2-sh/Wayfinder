@@ -78,8 +78,11 @@ A revocation tombstone cannot be cleared by replaying or re-signing membership.
 A phrase holder can always enroll a **new** device, including an administrator.
 
 The first device is admin; joins default to member. Only admins can inspect and
-approve pairing requests, enumerate/revoke grants, or revoke devices. Members
-can list chain devices and receive commands. Role changes require fresh enrollment.
+approve pairing requests, enumerate/revoke grants, revoke devices, or delegate
+Admin access. Members can list chain devices and receive commands. Current
+administrative authorization is the active device's root-signed Admin role OR a
+persisted gateway-local Admin delegation. Delegations never alter certificates
+or confer root enrollment/signing authority.
 If all admins are lost, the phrase can enroll a new admin. Root compromise requires
 a new chain; no root rotation, QR encoding or revocation federation is implemented.
 
@@ -217,10 +220,14 @@ SQLite uses foreign keys, FULL synchronous commits, a rollback journal and an
 exclusive process directory lock. A single host owns the database; live sessions,
 nonces, pending OAuth requests and authorization codes stay in memory. Restart
 invalidates pending challenges/codes, while agents reconnect and grants survive.
-There is one current schema, no migration or obsolete-format reader.
+Existing registries acquire the additive delegation table on open; existing
+certificates, grants, revocations and IDs are retained.
 
 - `chains(id, root)` stores only public root identity.
 - `devices(chain, id, certificate, revoked, last_seen)` has composite primary key.
+- `delegated_admins(chain, id)` references that composite device key. Presence
+  grants Admin authority only while the admitted target is active; the record
+  carries no grantor dependency, hierarchy, root signature or private key.
 - `device_metadata(chain, id, platform, arch)` stores the latest connection descriptor,
   referencing the device composite key; preexisting devices need no metadata row.
 - `clients(id, info, secret_hash)` holds registered OAuth metadata.
@@ -256,8 +263,35 @@ UTF8("wayfinder/administration/v1\0")
 `operation` first, then fields in declaration order. Unknown fields are rejected;
 all operation fields are strings, so there are no numeric/map normalization rules.
 The registry requires the exact active certificate and a live session. Sensitive
-operations require admin role. Enrollment/session installation and administration
-are serialized to prevent an admin revocation/approval race.
+operations require the actor's current effective Admin role read from the
+registry at execution time. Enrollment/session installation and administration
+are serialized under the gateway administration mutex, including OAuth approval,
+to prevent revocation/demotion/approval races. A cached certificate or pre-signed
+request cannot retain demoted privileges. No session reconnect is required.
+
+Role operations use canonical `{"operation":"promote_device","device_id":"wfd1_…"}`
+and `{"operation":"demote_device","device_id":"wfd1_…"}` with a canonical lowercase
+Device ID. They use the same challenge, device signature and replay protection.
+Unknown operation tags/fields fail closed. Targets must be admitted, non-revoked
+and in the actor's chain. Duplicate changes fail. Promotion inserts a delegation;
+demotion deletes it transactionally and restores the underlying Member role.
+Root-certificate Admins cannot be demoted; revocation remains separate. Demotion
+also checks that another active effective Admin remains (including offline
+Admins). The role-change transaction never writes membership certificates.
+
+The device roster's `role` is effective authority; `certificate_role` records its
+immutable source role. Local status never substitutes the certificate role for
+an unconfirmed effective role. The TUI periodically reads the signed roster in
+every section, refreshes device and pairing/grant controls, and disables them
+when role observations fail or become stale. Client observations only control
+presentation: the gateway always makes the authorization decision.
+
+Delegations survive grantor disconnect, demotion or revocation and gateway
+restart. They terminate only through explicit target demotion or target
+revocation. They are independent entries, not cascading grants. Neither
+revocations nor delegations migrate to another gateway. A compromised Admin can
+create other Admins; remove each unwanted delegation/device and OAuth grant
+explicitly. Delegation does not allow root-signed enrollment or gateway admission.
 
 OAuth binds exact registered redirect, client ID, resource origin, S256 challenge,
 state, requested scopes and expiry into one pending request. An opaque display code identifies it; hosted codes include a public OAuth-client
@@ -340,8 +374,9 @@ Self-host if that operator trust is unacceptable. Device signatures do not make
 the gateway incapable of command injection.
 
 A compromised member key grants that device's membership and local OS access,
-not administrative approval authority. A compromised admin can approve grants
-and revoke devices; revoke its device **and** unwanted grants. A phrase holder
+and any delegated authority it currently has. A compromised admin can approve
+grants, delegate Admin access and revoke devices; revoke its device **and**
+review/remove unwanted delegations and grants. A phrase holder
 has root enrollment authority. Revocations are gateway-local and restore from
 backup can restore earlier trust state: protect current backups and do not treat
 a fresh gateway as carrying historical revocations. Protect machine backups,

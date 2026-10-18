@@ -306,13 +306,42 @@ def run():
     nodes=operation(ia,origin,dict(operation='devices'))[2]
     check('chain scoped device listing',len(nodes)==2 and all(n['online'] for n in nodes))
     check('member cannot administer',operation(ib,origin,dict(operation='grants'))[0]==403)
+    # Exercise real CLI, connected agents and unchanged installation files.
+    def role_cli(action,target,yes=True):
+        args=[str(BIN/'wayfinder'),'--data-dir',str(a),'device',action,target]
+        if yes: args.append('--yes')
+        return subprocess.run(args,input=b'',stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    check('role change requires explicit noninteractive confirmation',role_cli('promote',cb['device_id'],False).returncode!=0)
+    check('member cannot self-promote',operation(ib,origin,dict(operation='promote_device',device_id=cb['device_id']))[0]==403)
+    check('root-authorized Admin cannot be demoted',role_cli('demote',ca['device_id']).returncode!=0)
+    check('cross chain promotion denied',operation(ia,origin,dict(operation='promote_device',device_id=cc['device_id']))[0]==403)
+    check('CLI promotes unambiguous name',role_cli('promote',cb['name']).returncode==0)
+    check('duplicate promotion rejected',role_cli('promote',cb['device_id']).returncode!=0)
+    promoted=operation(ib,origin,dict(operation='devices'))[2]
+    check('live member is effective Admin with immutable certificate role',next(n for n in promoted if n['id']==cb['device_id'])['role']=='admin' and cb['role']=='member')
+    check('promoted device administers without reconnect',operation(ib,origin,dict(operation='grants'))[0]==200 and pb.poll() is None)
+    current=json.loads(subprocess.check_output([str(BIN/'wayfinder'),'--data-dir',str(b),'status']))
+    check('local status confirms delegated role',current['role']=='admin' and current['certificate_role']=='member' and current['role_status']=='confirmed')
+    check('promotion preserves installation key ID and certificate',json.loads((b/'installation.json').read_text())==ib)
+    if gateway:
+        gateway.terminate();gateway.wait(timeout=10)
+        gateway=spawn([BIN/'wayfinder-gateway','--listen',origin.removeprefix('http://'),'--public-url',origin,'--data-dir',root/'gateway'])
+        wait(lambda:operation(ib,origin,dict(operation='grants'))[0]==200 and operation(ia,origin,dict(operation='grants'))[0]==200)
+        check('delegation survives gateway process restart',operation(ib,origin,dict(operation='grants'))[0]==200)
     status,_,client=http(origin,'/oauth/register',dict(client_name='Validation MCP',redirect_uris=['http://127.0.0.1:19876/callback'],token_endpoint_auth_method='none'))
     assert status==201
     check('unknown redirect rejected',http(origin,'/oauth/authorize?'+urllib.parse.urlencode(dict(client_id=client['client_id'],redirect_uri='https://attacker.invalid')))[0]==400)
     check('pending authorization cannot fabricate code',http(origin,'/oauth/token',dict(grant_type='authorization_code',client_id=client['client_id'],code='unapproved',redirect_uri=client['redirect_uris'][0],resource=mcp_origin(origin),code_verifier='x'*43),form=True)[0]==400)
     cli_ticket,cli_code,_=start_auth(origin,client)
-    interactive([BIN/'wayfinder','--data-dir',a,'authorize',cli_code])
-    check('CLI displays and explicitly approves OAuth request',http(origin,cli_ticket)[0]==303)
+    interactive([BIN/'wayfinder','--data-dir',b,'authorize',cli_code])
+    check('promoted Member CLI explicitly approves OAuth request without restart',http(origin,cli_ticket)[0]==303)
+    # A request signed before demotion must be denied after it commits.
+    stale=signed(ib,origin,dict(operation='grants'))
+    check('CLI demotes by ID',role_cli('demote',cb['device_id']).returncode==0)
+    check('duplicate demotion rejected',role_cli('demote',cb['device_id']).returncode!=0)
+    check('demoted device immediately loses cached administrative authority',http(origin,'/device/operation',stale)[0]==403)
+    check('demoted device loses OAuth approval',operation(ib,origin,dict(operation='pending',code=cli_code))[0]==403)
+    check('demotion preserves connected Member function',pb.poll() is None and operation(ib,origin,dict(operation='devices'))[0]==200 and json.loads((b/'installation.json').read_text())==ib)
     tokens=finish_auth(origin,ia,client)
     token=tokens['access_token']
     status,nodes=tool(origin,token,'nodes')

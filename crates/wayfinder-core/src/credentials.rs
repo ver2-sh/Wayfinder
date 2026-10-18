@@ -1,7 +1,7 @@
 //! Single-host SQLite registry. All device and grant administration is chain-scoped.
 use crate::{
     digest,
-    identity::Certificate,
+    identity::{Certificate, Role},
     now,
     protocol::{Device, PlatformDescriptor},
     random_secret, secret_eq,
@@ -104,6 +104,7 @@ impl CredentialStore {
   CREATE TABLE IF NOT EXISTS chains(id TEXT PRIMARY KEY, root TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS admissions(nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS devices(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, certificate TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY(chain,id));
+  CREATE TABLE IF NOT EXISTS delegated_admins(chain TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(chain,id), FOREIGN KEY(chain,id) REFERENCES devices(chain,id));
   CREATE TABLE IF NOT EXISTS device_metadata(chain TEXT NOT NULL, id TEXT NOT NULL, platform TEXT NOT NULL, arch TEXT NOT NULL, PRIMARY KEY(chain,id), FOREIGN KEY(chain,id) REFERENCES devices(chain,id));
   CREATE TABLE IF NOT EXISTS clients(id TEXT PRIMARY KEY, info TEXT NOT NULL, secret_hash TEXT);
   CREATE TABLE IF NOT EXISTS grants(chain TEXT NOT NULL REFERENCES chains(id), id TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(chain,id));
@@ -249,7 +250,7 @@ impl CredentialStore {
     pub fn devices(&self, chain: &str) -> Result<Vec<Device>> {
         let db = self.db()?;
         let mut s = db.prepare(
-            "SELECT d.certificate,d.revoked,d.last_seen,m.platform,m.arch FROM devices d LEFT JOIN device_metadata m ON m.chain=d.chain AND m.id=d.id WHERE d.chain=?1 ORDER BY d.id",
+            "SELECT d.certificate,d.revoked,d.last_seen,m.platform,m.arch,a.id FROM devices d LEFT JOIN delegated_admins a ON a.chain=d.chain AND a.id=d.id LEFT JOIN device_metadata m ON m.chain=d.chain AND m.id=d.id WHERE d.chain=?1 ORDER BY d.id",
         )?;
         let rows = s.query_map([chain], |r| {
             Ok((
@@ -258,16 +259,22 @@ impl CredentialStore {
                 r.get::<_, u64>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = vec![];
         for r in rows {
-            let (c, revoked, last_seen, platform, arch) = r?;
+            let (c, revoked, last_seen, platform, arch, delegated) = r?;
             let c: Certificate = serde_json::from_str(&c)?;
             out.push(Device {
                 id: c.device_id,
                 name: c.name,
-                role: c.role,
+                role: if !revoked && delegated.is_some() {
+                    Role::Admin
+                } else {
+                    c.role
+                },
+                certificate_role: Some(c.role),
                 platform,
                 arch,
                 last_seen,
@@ -276,6 +283,69 @@ impl CredentialStore {
             });
         }
         Ok(out)
+    }
+    /// Read authority from this registry, never a session's cached role.
+    pub fn effective_role(&self, c: &Certificate) -> Result<Role> {
+        self.active(c)?;
+        let delegated: bool = self.db()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delegated_admins WHERE chain=?1 AND id=?2)",
+            params![c.chain_id, c.device_id],
+            |r| r.get(0),
+        )?;
+        Ok(if c.role == Role::Admin || delegated {
+            Role::Admin
+        } else {
+            Role::Member
+        })
+    }
+    /// Called under the gateway administration lock, including actor authorization.
+    /// One independent delegation per target; no grantor lineage or root key material.
+    pub fn delegate_admin(&self, chain: &str, id: &str, promote: bool) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let target: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT certificate,revoked FROM devices WHERE chain=?1 AND id=?2",
+                params![chain, id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (raw, revoked) =
+            target.ok_or_else(|| anyhow::anyhow!("Device not found in this Sync Chain"))?;
+        ensure!(!revoked, "Device is revoked");
+        let cert: Certificate = serde_json::from_str(&raw)?;
+        let delegated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delegated_admins WHERE chain=?1 AND id=?2)",
+            params![chain, id],
+            |r| r.get(0),
+        )?;
+        if promote {
+            ensure!(
+                cert.role != Role::Admin && !delegated,
+                "Device is already an Admin"
+            );
+            tx.execute(
+                "INSERT INTO delegated_admins VALUES(?1,?2)",
+                params![chain, id],
+            )?;
+        } else {
+            ensure!(
+                cert.role != Role::Admin,
+                "Root-authorized Admin cannot be demoted; revoke the device separately"
+            );
+            ensure!(delegated, "Device is already a Member");
+            let count: u64 = tx.query_row(
+                "SELECT count(*) FROM devices d WHERE d.chain=?1 AND d.revoked=0 AND (json_extract(d.certificate,'$.role')='admin' OR EXISTS(SELECT 1 FROM delegated_admins a WHERE a.chain=d.chain AND a.id=d.id))",
+                [chain], |r| r.get(0),
+            )?;
+            ensure!(count > 1, "Cannot demote the last effective Admin");
+            tx.execute(
+                "DELETE FROM delegated_admins WHERE chain=?1 AND id=?2",
+                params![chain, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
     pub fn revoke_device(&self, chain: &str, id: &str) -> Result<()> {
         ensure!(
@@ -560,6 +630,42 @@ mod tests {
             gateway,
             now() + 30,
         )
+    }
+    #[test]
+    fn additive_roles_migrate_existing_registry_without_changing_identity_or_grants() -> Result<()>
+    {
+        let dir =
+            std::env::temp_dir().join(format!("wayfinder-role-migration-{}", random_secret()));
+        let path = dir.join("registry.sqlite");
+        let store = CredentialStore::open(path.clone())?;
+        let root = new_key();
+        let cert = Certificate::issue(&root, &new_key(), "original".into(), Role::Member)?;
+        admit(&store, &root, &cert)?;
+        let (client, _) =
+            store.register_oauth_client("MCP".into(), "http://127.0.0.1/callback".into(), true)?;
+        let tokens = store.issue_oauth(
+            cert.chain_id.clone(),
+            "MCP".into(),
+            BTreeSet::from([Capability::Read]),
+            client.id,
+            "https://gateway.example.com".into(),
+        )?;
+        // Reproduce a pre-delegation DB using its unchanged tables and records.
+        store.db()?.execute("DROP TABLE delegated_admins", [])?;
+        drop(store);
+        let store = CredentialStore::open(path)?;
+        store.active(&cert)?;
+        assert_eq!(store.effective_role(&cert)?, Role::Member);
+        assert!(
+            store
+                .authenticate(&tokens.access_token, "https://gateway.example.com")?
+                .is_some()
+        );
+        store.delegate_admin(&cert.chain_id, &cert.device_id, true)?;
+        assert_eq!(store.effective_role(&cert)?, Role::Admin);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
     #[test]
     fn public_registrations_expire_and_approved_clients_persist() -> Result<()> {

@@ -100,6 +100,18 @@ enum GatewayCommand {
 }
 #[derive(Subcommand)]
 enum DeviceCommand {
+    /// Delegate Admin access at this gateway (device ID or unambiguous name).
+    Promote {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove delegated Admin access at this gateway.
+    Demote {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
     Revoke {
         id: String,
         #[arg(long)]
@@ -154,6 +166,8 @@ mod tests {
             vec!["wayfinder", "update", "--check"],
             vec!["wayfinder", "service", "install"],
             vec!["wayfinder", "device", "revoke", "id", "--yes"],
+            vec!["wayfinder", "device", "promote", "PVE-Lab", "--yes"],
+            vec!["wayfinder", "device", "demote", "id"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }

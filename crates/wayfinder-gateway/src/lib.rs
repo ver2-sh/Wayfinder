@@ -170,7 +170,10 @@ impl Gateway {
             "Administrative device must be connected"
         );
         if !matches!(s.operation, Operation::Devices) {
-            ensure!(c.role == Role::Admin, "Administrative device required");
+            ensure!(
+                self.store.effective_role(c)? == Role::Admin,
+                "Administrative device required"
+            );
         }
         // Only a verified, live device can allocate replay state. Keep it across
         // reconnects until expiry; clearing it on disconnect would permit replay.
@@ -198,6 +201,14 @@ impl Gateway {
                     session.stop.cancel();
                 }
                 Ok(serde_json::json!({"revoked":true}))
+            }
+            Operation::PromoteDevice { device_id } => {
+                self.store.delegate_admin(&c.chain_id, &device_id, true)?;
+                Ok(serde_json::json!({"role":"admin"}))
+            }
+            Operation::DemoteDevice { device_id } => {
+                self.store.delegate_admin(&c.chain_id, &device_id, false)?;
+                Ok(serde_json::json!({"role":"member"}))
             }
             Operation::Pending { code } => {
                 let mut limits = self.approvals.lock().unwrap();
@@ -746,7 +757,30 @@ async fn admit(
     }
 }
 async fn operation(State(g): State<Arc<Gateway>>, Json(s): Json<SignedOperation>) -> Response {
-    match g.operate(s){Ok(v)=>Json(v).into_response(),Err(_)=>(StatusCode::FORBIDDEN,Json(serde_json::json!({"error":"Operation denied: check device role, connection, challenge, request and revocation"}))).into_response()}
+    match g.operate(s) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            let message = e.to_string();
+            let message = match message.as_str() {
+                "Administrative device required"
+                | "Administrative device must be connected"
+                | "Device not found in this Sync Chain"
+                | "Device is revoked"
+                | "Device is already an Admin"
+                | "Device is already a Member"
+                | "Root-authorized Admin cannot be demoted; revoke the device separately"
+                | "Cannot demote the last effective Admin" => message.as_str(),
+                _ => {
+                    "Operation denied: check device role, connection, challenge, request and revocation"
+                }
+            };
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error":message})),
+            )
+                .into_response()
+        }
+    }
 }
 async fn edge_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let host = req
@@ -845,6 +879,199 @@ impl wayfinder_mcp::Routing for Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delegation_is_live_durable_independent_and_chain_scoped() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("wayfinder-roles-{}", random_secret()));
+        let path = dir.join("registry.sqlite");
+        let store = Arc::new(CredentialStore::open(path.clone())?);
+        let gateway = Gateway::new("http://127.0.0.1:12345".into(), store.clone())?;
+        let root = identity::new_key();
+        let keys = [
+            identity::new_key(),
+            identity::new_key(),
+            identity::new_key(),
+        ];
+        let certs = [
+            Certificate::issue(&root, &keys[0], "root".into(), Role::Admin)?,
+            Certificate::issue(&root, &keys[1], "promoted".into(), Role::Member)?,
+            Certificate::issue(&root, &keys[2], "subsequent".into(), Role::Member)?,
+        ];
+        for cert in &certs {
+            let nonce = gateway.challenge();
+            store.admit(
+                &security::Admission {
+                    certificate: cert.clone(),
+                    signature: identity::sign(
+                        &root,
+                        &security::admission_proof(cert, &gateway.issuer, &nonce)?,
+                    ),
+                    nonce,
+                },
+                &gateway.issuer,
+                now() + 30,
+            )?;
+            store.register(cert, None)?;
+            let (send, _) = mpsc::channel(1);
+            gateway.sessions.lock().unwrap().insert(
+                (cert.chain_id.clone(), cert.device_id.clone()),
+                Session {
+                    generation: random_secret(),
+                    code: false,
+                    send,
+                    stop: CancellationToken::new(),
+                },
+            );
+        }
+        let request = |actor: usize, op: Operation| -> Result<SignedOperation> {
+            let nonce = gateway.challenge();
+            Ok(SignedOperation {
+                signature: identity::sign(
+                    &keys[actor],
+                    &operation_proof(&gateway.issuer, &nonce, &certs[actor], &op)?,
+                ),
+                certificate: certs[actor].clone(),
+                nonce,
+                operation: op,
+            })
+        };
+        let promote = |target: usize| Operation::PromoteDevice {
+            device_id: certs[target].device_id.clone(),
+        };
+        let demote = |target: usize| Operation::DemoteDevice {
+            device_id: certs[target].device_id.clone(),
+        };
+        assert!(gateway.operate(request(1, promote(1))?).is_err());
+        assert!(
+            gateway
+                .operate(request(0, demote(0))?)
+                .unwrap_err()
+                .to_string()
+                .contains("Root-authorized")
+        );
+        assert!(
+            gateway
+                .operate(request(0, demote(1))?)
+                .unwrap_err()
+                .to_string()
+                .contains("already a Member")
+        );
+        let promotion = request(0, promote(1))?;
+        let replay: SignedOperation = serde_json::from_value(serde_json::to_value(&promotion)?)?;
+        gateway.operate(promotion)?;
+        assert!(gateway.operate(replay).is_err());
+        assert!(
+            gateway
+                .operate(request(0, promote(1))?)
+                .unwrap_err()
+                .to_string()
+                .contains("already an Admin")
+        );
+        assert_eq!(store.effective_role(&certs[1])?, Role::Admin);
+        assert_eq!(
+            store
+                .devices(&certs[1].chain_id)?
+                .iter()
+                .find(|d| d.id == certs[1].device_id)
+                .unwrap()
+                .certificate_role,
+            Some(Role::Member)
+        );
+        gateway.operate(request(1, Operation::Grants)?)?;
+        gateway.operate(request(1, promote(2))?)?;
+        gateway.operate(request(0, demote(1))?)?;
+        assert!(gateway.operate(request(1, Operation::Grants)?).is_err());
+        assert!(
+            gateway
+                .operate(request(
+                    1,
+                    Operation::Approve {
+                        code: "stale".into(),
+                        request_hash: "stale".into()
+                    }
+                )?)
+                .unwrap_err()
+                .to_string()
+                .contains("Administrative device")
+        );
+        gateway.operate(request(1, Operation::Devices)?)?;
+        assert_eq!(store.effective_role(&certs[2])?, Role::Admin); // no grantor dependency
+        // A nonexistent/cross-chain device cannot be a target.
+        let foreign = Certificate::issue(
+            &identity::new_key(),
+            &identity::new_key(),
+            "foreign".into(),
+            Role::Member,
+        )?;
+        assert!(
+            gateway
+                .operate(request(
+                    0,
+                    Operation::PromoteDevice {
+                        device_id: foreign.device_id
+                    }
+                )?)
+                .is_err()
+        );
+        gateway.operate(request(
+            0,
+            Operation::RevokeDevice {
+                device_id: certs[0].device_id.clone(),
+            },
+        )?)?;
+        assert!(
+            gateway
+                .operate(request(2, demote(2))?)
+                .unwrap_err()
+                .to_string()
+                .contains("last effective Admin")
+        );
+        assert!(
+            gateway
+                .operate(request(2, promote(0))?)
+                .unwrap_err()
+                .to_string()
+                .contains("revoked")
+        );
+        // Concurrent self-demotions are serialized with authorization and the
+        // last-Admin count: exactly one can commit.
+        gateway.operate(request(2, promote(1))?)?;
+        let first = request(1, demote(1))?;
+        let second = request(2, demote(2))?;
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| gateway.operate(first));
+            let second = scope.spawn(|| gateway.operate(second));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first.is_ok(), second.is_ok());
+        let survivor = if first.is_ok() { 2 } else { 1 };
+        let demoted = if first.is_ok() { 1 } else { 2 };
+        drop(gateway);
+        drop(store);
+        let reopened = CredentialStore::open(path)?;
+        assert_eq!(reopened.effective_role(&certs[survivor])?, Role::Admin);
+        assert_eq!(reopened.effective_role(&certs[demoted])?, Role::Member);
+        reopened.active(&certs[1])?; // exact original certificate and device key still admitted
+        let other = CredentialStore::open(dir.join("other.sqlite"))?;
+        assert!(other.effective_role(&certs[survivor]).is_err());
+        let nonce = random_secret();
+        other.admit(
+            &security::Admission {
+                certificate: certs[survivor].clone(),
+                signature: identity::sign(
+                    &root,
+                    &security::admission_proof(&certs[survivor], "http://127.0.0.1:12345", &nonce)?,
+                ),
+                nonce,
+            },
+            "http://127.0.0.1:12345",
+            now() + 30,
+        )?;
+        assert_eq!(other.effective_role(&certs[survivor])?, Role::Member); // delegation never migrates
+        drop(other);
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn challenges_allocate_only_after_authentication_and_survive_reconnect() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("wayfinder-challenge-{}", random_secret()));
